@@ -75,3 +75,29 @@ pub fn draw(f: &mut [u8], v: View, s: &Sprite) {
         }
     }
 }
+
+/// The rows where two frames (rows of `row_bytes`) differ, for backends that
+/// get no damage events and compare each capture with the last one.
+#[cfg_attr(target_os = "linux", allow(dead_code))] // X11 has DAMAGE
+pub fn diff_rows(old: &[u8], new: &[u8], row_bytes: usize) -> Option<Rows> {
+    let rows = || old.chunks_exact(row_bytes).zip(new.chunks_exact(row_bytes));
+    let y0 = rows().position(|(a, b)| a != b)?;
+    let y1 = rows().rposition(|(a, b)| a != b)? + 1;
+    Some((y0 as i32, y1 as i32))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diff_rows_finds_the_changed_band() {
+        let old = vec![0u8; 6 * 32]; // 6 rows of 8 BGRX pixels
+        let mut new = old.clone();
+        assert_eq!(diff_rows(&old, &new, 32), None);
+        new[2 * 32 + 5] = 1;
+        assert_eq!(diff_rows(&old, &new, 32), Some((2, 3)));
+        new[4 * 32] = 9;
+        assert_eq!(diff_rows(&old, &new, 32), Some((2, 5)));
+    }
+}
