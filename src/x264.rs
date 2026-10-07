@@ -40,7 +40,7 @@ impl Encoder {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|_| tr!("recording without a GPU needs ffmpeg (sudo apt install ffmpeg)", "grabar sin GPU necesita ffmpeg (sudo apt install ffmpeg)", "GPU なしの録画には ffmpeg が必要です (sudo apt install ffmpeg)"))?;
+            .map_err(|_| tr!("recording without a GPU needs ffmpeg ({})", "grabar sin GPU necesita ffmpeg ({})", "GPU なしの録画には ffmpeg が必要です ({})", crate::desktop::GET_FFMPEG))?;
         let (stdin, mut out) = (child.stdin.take(), child.stdout.take().ok_or(tr!("ffmpeg has no stdout", "ffmpeg sin stdout", "ffmpeg の stdout がありません"))?);
         let (tx, units) = channel();
         std::thread::spawn(move || {

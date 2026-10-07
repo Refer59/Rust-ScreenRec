@@ -6,6 +6,7 @@
 mod i18n;
 mod audio;
 mod capture;
+mod desktop;
 mod dylib;
 mod frame;
 mod mkv;
@@ -19,6 +20,7 @@ mod x264;
 
 use audio::Output;
 use capture::Capture;
+use desktop::notify;
 use frame::{Rect, Sprite, View};
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -650,7 +652,8 @@ fn to_mp4(src: &Path, dst: &Path) -> Res<PathBuf> {
     let mut ff = std::process::Command::new("ffmpeg");
     ff.args(["-v", "error", "-y", "-i"]).arg(src);
     ff.args(["-map", "0", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart"]).arg(dst);
-    if !ff.status().map_err(|_| tr!("MP4 needs ffmpeg (sudo apt install ffmpeg)", "MP4 necesita ffmpeg (sudo apt install ffmpeg)", "MP4 には ffmpeg が必要です (sudo apt install ffmpeg)"))?.success() {
+    let missing = |_| tr!("MP4 needs ffmpeg ({})", "MP4 necesita ffmpeg ({})", "MP4 には ffmpeg が必要です ({})", desktop::GET_FFMPEG);
+    if !ff.status().map_err(missing)?.success() {
         return Err(tr!("ffmpeg could not convert to MP4", "ffmpeg no pudo convertir a MP4", "ffmpeg で MP4 に変換できませんでした").into());
     }
     std::fs::remove_file(src)?;
@@ -664,7 +667,7 @@ fn record(cap: &mut Capture, path: &Path, opts: &RecOpts, mut pill: Option<ui::P
     for sig in [libc::SIGINT, libc::SIGTERM] {
         unsafe { libc::signal(sig, on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t) };
     }
-    unsafe { libc::nice(10) }; // whatever else runs comes first
+    desktop::lower_priority();
 
     let (Target::Area(r) | Target::Window(_, r)) = target;
     let (w, h) = (((r.2 - r.0) & !1) as usize, ((r.3 - r.1) & !1) as usize); // 4:2:0 needs even sizes
@@ -815,11 +818,6 @@ fn record(cap: &mut Capture, path: &Path, opts: &RecOpts, mut pill: Option<ui::P
     res
 }
 
-fn notify(title: &str, body: &str, icon: Option<&Path>) {
-    let icon = icon.map_or("media-record".into(), |p| p.display().to_string());
-    let _ = std::process::Command::new("notify-send").args(["-a", "screenrec", "-i", &icon, title, body]).spawn();
-}
-
 fn shot_prefix() -> String {
     tr!("screenshot", "captura", "スクリーンショット")
 }
@@ -829,17 +827,9 @@ fn rec_prefix() -> String {
 }
 
 fn default_path(xdg_dir: &str, prefix: &str, ext: &str) -> PathBuf {
-    let dir = std::process::Command::new("xdg-user-dir")
-        .arg(xdg_dir)
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-        .filter(|d| !d.is_empty())
-        .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+    let dir = desktop::user_dir(xdg_dir);
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    unsafe { libc::localtime_r(&(now.as_secs() as libc::time_t), &mut tm) };
-    let (y, mo, d, h, mi, s) = (tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+    let (y, mo, d, h, mi, s) = desktop::local_time(now.as_secs());
     let ms = now.subsec_millis(); // two shots in one second must not overwrite each other
-    PathBuf::from(dir).join(format!("{prefix}-{y}-{mo:02}-{d:02}_{h:02}-{mi:02}-{s:02}-{ms:03}.{ext}"))
+    dir.join(format!("{prefix}-{y}-{mo:02}-{d:02}_{h:02}-{mi:02}-{s:02}-{ms:03}.{ext}"))
 }
