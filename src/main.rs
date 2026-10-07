@@ -910,25 +910,50 @@ fn record(cap: &mut Capture, path: &Path, opts: &RecOpts, mut pill: Option<Pill>
     }
     // The area's rows come first in the capture buffer (same stride once the
     // region is set), so only that much is pinned for the GPU.
-    let mut enc = Video::new(&cap.frame()[..w * h * 4], w, h, opts.fps.unwrap_or(60), opts.gpu)?;
+    let (w32, h32, settle_pill) = (w as i32, h as i32, pill.is_some());
+    let setup = |cap: &mut Capture| -> Res<()> {
+        match target {
+            Target::Window(id, _) => {
+                cap.overlay = None; // our UI is never in another window's pixmap
+                cap.follow_window(id, (r.0, r.1, r.0 + w32, r.1 + h32))?;
+            }
+            Target::Area(_) => {
+                cap.screen_readable()?;
+                cap.track_changes()?;
+                if settle_pill {
+                    settle(cap, gone.as_ref())?;
+                }
+                cap.set_region(r.0, r.1, w32, h32);
+            }
+        }
+        Ok(())
+    };
+    // On X11 the capture's setup (tracking, and settling until the compositor shows the
+    // pill: ~30 ms) runs on a thread while this one builds the encoder (a CUDA context and
+    // an NVENC session: ~200 ms), so the recording starts that much sooner. Elsewhere
+    // there is no pill to wait for, so one after the other.
+    #[cfg(target_os = "linux")]
+    let mut enc = {
+        let (host, len) = (cap.frame().as_ptr() as usize, w * h * 4);
+        std::thread::scope(|s| -> Res<Video> {
+            let capture = s.spawn(|| setup(cap).map_err(|e| e.to_string())); // a String crosses threads, the error type doesn't
+            // SAFETY: the SHM mapping lives as long as `cap`; the encoder only pins these
+            // bytes now and reads them later, after the thread above is joined.
+            let host = unsafe { std::slice::from_raw_parts(host as *const u8, len) };
+            let enc = Video::new(host, w, h, opts.fps.unwrap_or(60), opts.gpu);
+            capture.join().map_err(|_| tr!("the capture could not be set up", "no se pudo preparar la captura", "キャプチャを準備できませんでした"))??;
+            enc
+        })?
+    };
+    #[cfg(not(target_os = "linux"))]
+    let mut enc = {
+        let enc = Video::new(&cap.frame()[..w * h * 4], w, h, opts.fps.unwrap_or(60), opts.gpu)?;
+        setup(cap)?;
+        enc
+    };
     let fps = opts.fps.unwrap_or(if matches!(enc, Video::Cpu(_)) { 30 } else { 60 });
     let tick = Duration::from_secs(1) / fps;
     cap.set_tick(tick);
-    let (w32, h32) = (w as i32, h as i32);
-    match target {
-        Target::Window(id, _) => {
-            cap.overlay = None; // our UI is never in another window's pixmap
-            cap.follow_window(id, (r.0, r.1, r.0 + w32, r.1 + h32))?;
-        }
-        Target::Area(_) => {
-            cap.screen_readable()?;
-            cap.track_changes()?;
-            if pill.is_some() {
-                settle(cap, gone.as_ref())?;
-            }
-            cap.set_region(r.0, r.1, w32, h32);
-        }
-    }
     // A video without sound beats no video: audio trouble only gets reported.
     let mut sound = opts.sound.and_then(|(output, mic, app)| {
         audio::Audio::start(output, mic, app).unwrap_or_else(|e| {

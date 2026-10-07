@@ -161,6 +161,10 @@ pub struct Capture {
     cursor_dirty: bool,  // the cursor image changed since the last probe
 }
 
+// SAFETY: nothing in a Capture is tied to a thread; the only non-Send field is
+// the SHM mapping's pointer, which is used through `&mut self` like the rest.
+unsafe impl Send for Capture {}
+
 impl Capture {
     pub fn new() -> Res<Self> {
         let (conn, screen) = x11rb::connect(None)?;
