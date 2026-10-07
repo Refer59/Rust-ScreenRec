@@ -8,11 +8,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, shot: true, wrap: "xvfb-run -a -s '-screen 0 1280x720x24'" }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, shot: true, ocr: true, wrap: "xvfb-run -a -s '-screen 0 1280x720x24'" }
           # Arm runners are free for public repositories only.
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc, shot: true }
-          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, ocr: true }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, shot: true, ocr: true }
+          - { os: macos-latest, target: aarch64-apple-darwin, ocr: true }
           # Built on the Apple Silicon runner: tests would need an Intel Mac.
           - { os: macos-latest, target: x86_64-apple-darwin, no_test: true }
     runs-on: ${{ matrix.os }}
@@ -30,9 +30,31 @@ jobs:
       - run: cargo test --target ${{ matrix.target }}
         if: ${{ !matrix.no_test }}
       # A real screenshot where the runner has a screen (Xvfb, Windows' desktop).
-      - run: sudo apt-get install -y xvfb
+      - run: sudo apt-get update && sudo apt-get install -y xvfb
         if: ${{ matrix.shot && runner.os == 'Linux' }}
       - run: |
           ${{ matrix.wrap }} target/${{ matrix.target }}/release/screenrec shot shot.png
           test -s shot.png
         if: ${{ matrix.shot }}
+      # OCR: the runtime and the models download on first use into
+      # screenrec's cache folder; keep them between runs.
+      - uses: actions/cache@v4
+        if: ${{ matrix.ocr }}
+        with:
+          path: |
+            ~/.cache/screenrec
+            ~/Library/Caches/screenrec
+            ~/AppData/Local/screenrec
+          key: ocr-${{ matrix.target }}-${{ hashFiles('src/**/*ocr*') }}
+      # Known text in, the same text out: the runtime loads and the models read it, no screen needed.
+      - run: cargo test --target ${{ matrix.target }} -- --ignored --test-threads 1 ocr
+        if: ${{ matrix.ocr }}
+      # The real thing on a screen: shot --ocr, --ocr --clip, --clip, three at once, rec --ocr (Linux).
+      - run: sudo apt-get install -y ffmpeg xclip fonts-ipafont-gothic
+        if: ${{ matrix.ocr && matrix.shot && runner.os == 'Linux' }}
+      - run: ${{ matrix.wrap }} bash .github/ocr-smoke.sh target/${{ matrix.target }}/release/screenrec ocr-smoke
+        if: ${{ matrix.ocr && matrix.shot }}
+      # Informational: the runner may not grant screen recording to the job.
+      - run: bash .github/ocr-smoke.sh target/${{ matrix.target }}/release/screenrec ocr-smoke
+        if: ${{ matrix.ocr && runner.os == 'macOS' }}
+        continue-on-error: true
