@@ -13,8 +13,9 @@ jobs:
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, ocr: true }
           - { os: windows-latest, target: x86_64-pc-windows-msvc, shot: true, ocr: true }
           - { os: macos-latest, target: aarch64-apple-darwin, ocr: true }
-          # Built on the Apple Silicon runner: tests would need an Intel Mac.
-          - { os: macos-latest, target: x86_64-apple-darwin, no_test: true }
+          # Built on the Apple Silicon runner; its tests (and the OCR's ONNX Runtime 1.23.2,
+          # the last with an Intel build) run under Rosetta 2 when the runner has it.
+          - { os: macos-latest, target: x86_64-apple-darwin, rosetta: true, ocr: true }
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -28,7 +29,9 @@ jobs:
       - run: cargo build --release --target ${{ matrix.target }}
       - run: cargo clippy --all-targets --target ${{ matrix.target }} -- -D warnings
       - run: cargo test --target ${{ matrix.target }}
-        if: ${{ !matrix.no_test }}
+        if: ${{ !matrix.rosetta }}
+      - run: if arch -x86_64 /usr/bin/true; then cargo test --target ${{ matrix.target }}; else echo "::warning::no Rosetta 2 on this runner, x86_64 tests not run"; fi
+        if: ${{ matrix.rosetta }}
       # A real screenshot where the runner has a screen (Xvfb, Windows' desktop).
       - run: sudo apt-get update && sudo apt-get install -y xvfb
         if: ${{ matrix.shot && runner.os == 'Linux' }}
@@ -48,7 +51,9 @@ jobs:
           key: ocr-${{ matrix.target }}-${{ hashFiles('src/**/*ocr*') }}
       # Known text in, the same text out: the runtime loads and the models read it, no screen needed.
       - run: cargo test --target ${{ matrix.target }} -- --ignored --test-threads 1 ocr
-        if: ${{ matrix.ocr }}
+        if: ${{ matrix.ocr && !matrix.rosetta }}
+      - run: if arch -x86_64 /usr/bin/true; then cargo test --target ${{ matrix.target }} -- --ignored --test-threads 1 ocr; else echo "::warning::no Rosetta 2 on this runner, x86_64 OCR not run"; fi
+        if: ${{ matrix.ocr && matrix.rosetta }}
       # The real thing on a screen: shot --ocr, --ocr --clip, --clip, three at once, rec --ocr (Linux).
       - run: sudo apt-get install -y ffmpeg xclip fonts-ipafont-gothic
         if: ${{ matrix.ocr && matrix.shot && runner.os == 'Linux' }}
@@ -56,5 +61,5 @@ jobs:
         if: ${{ matrix.ocr && matrix.shot }}
       # Informational: the runner may not grant screen recording to the job.
       - run: bash .github/ocr-smoke.sh target/${{ matrix.target }}/release/screenrec ocr-smoke
-        if: ${{ matrix.ocr && runner.os == 'macOS' }}
+        if: ${{ matrix.ocr && runner.os == 'macOS' && !matrix.rosetta }}
         continue-on-error: true
