@@ -37,12 +37,10 @@ fn overlaps(a: Rows, b: Rows) -> bool {
 }
 
 /// The compositor shows the pill `o`, drawn at (ox, oy), as o + under·(1 − a).
-/// Solve for `under` in place, but only if every pixel fits that model first:
-/// if the pill isn't on screen there as drawn (not composited yet, overview
-/// open, covered) the frame is left alone: Some(false). None if no part of it
-/// falls in the frame. Pixels under the cursor are skipped (on a
-/// software-cursor server they hold the cursor, not the pill).
-fn unblend(f: &mut [u8], v: View, o: &Sprite, (ox, oy): (i32, i32), cursor: Option<&Sprite>) -> Option<bool> {
+/// How well the frame fits that model: pixels checked, pixels that don't fit.
+/// Pixels under the cursor are skipped (on a software-cursor server they hold
+/// the cursor, not the pill).
+fn misfit(f: &[u8], v: View, o: &Sprite, (ox, oy): (i32, i32), cursor: Option<&Sprite>) -> (usize, usize) {
     let mine = |x, y| !cursor.is_some_and(|c| c.covers(x, y));
     let (mut n, mut bad) = (0, 0);
     for (p, x, y) in o.pixels_at(ox, oy).filter(|&(p, x, y)| p >> 24 >= 32 && mine(x, y)) {
@@ -54,12 +52,12 @@ fn unblend(f: &mut [u8], v: View, o: &Sprite, (ox, oy): (i32, i32), cursor: Opti
             c + 2 >= s && c <= s + (255 - a) + 2
         }) as usize;
     }
-    if n == 0 {
-        return None;
-    }
-    if bad * 100 > n {
-        return Some(false);
-    }
+    (n, bad)
+}
+
+/// Solve the model for `under`, in place.
+fn apply(f: &mut [u8], v: View, o: &Sprite, (ox, oy): (i32, i32), cursor: Option<&Sprite>) {
+    let mine = |x, y| !cursor.is_some_and(|c| c.covers(x, y));
     for (p, x, y) in o.pixels_at(ox, oy).filter(|&(p, x, y)| p >> 24 < 255 && mine(x, y)) {
         let Some(i) = v.at(x, y) else { continue };
         let a = 255 - (p >> 24);
@@ -67,29 +65,52 @@ fn unblend(f: &mut [u8], v: View, o: &Sprite, (ox, oy): (i32, i32), cursor: Opti
             *d = (((*d as u32).saturating_sub(p >> (8 * k) & 255) * 255 + a / 2) / a).min(255) as u8;
         }
     }
-    Some(true)
 }
 
-/// Remove the pill from `f`: `cur` at its position or the trail first, then,
-/// if the compositor still shows the look before `set_overlay` (`prev`), that.
-/// Whether `cur` itself was seen (or is not in the frame at all).
+/// Un-blend the pill if the frame fits it (all but 1% of its pixels): if
+/// it isn't on screen there as drawn (not composited yet, overview open,
+/// covered) the frame is left alone: Some(false). None if no part of it falls
+/// in the frame.
+#[cfg(test)]
+fn unblend(f: &mut [u8], v: View, o: &Sprite, at: (i32, i32), cursor: Option<&Sprite>) -> Option<bool> {
+    match misfit(f, v, o, at, cursor) {
+        (0, _) => None,
+        (n, bad) if bad * 100 > n => Some(false),
+        _ => {
+            apply(f, v, o, at, cursor);
+            Some(true)
+        }
+    }
+}
+
+/// Remove the pill from `f`: the look (`cur`, or `prev` before `set_overlay`:
+/// the compositor can be a repaint behind) and spot (its position or the
+/// trail) that fit the frame best. Two timer looks differ in fewer pixels
+/// than the 1% tolerance, so the first one that passes isn't good enough.
+/// Whether `cur` was seen (or is not in the frame at all).
 fn unblend_any(f: &mut [u8], v: View, cur: &Sprite, prev: Option<&Sprite>, trail: &[(i32, i32)], cursor: Option<&Sprite>) -> bool {
-    let now = unblend(f, v, cur, (cur.x, cur.y), cursor);
-    let (mut seen, mut failed) = (now == Some(true), now == Some(false));
-    for &p in trail {
-        if seen {
-            break;
-        }
-        match unblend(f, v, cur, p, cursor) {
-            Some(true) => seen = true,
-            Some(false) => failed = true,
-            None => {}
+    let spots = || std::iter::once((cur.x, cur.y)).chain(trail.iter().copied());
+    let mut best: Option<(usize, &Sprite, (i32, i32))> = None;
+    'search: for o in std::iter::once(cur).chain(prev) {
+        for at in spots() {
+            let (n, bad) = misfit(f, v, o, at, cursor);
+            if n > 0 && bad * 100 <= n && best.is_none_or(|b| bad < b.0) {
+                best = Some((bad, o, at));
+                if bad == 0 {
+                    break 'search; // an exact fit: the usual case, one pass
+                }
+            }
         }
     }
-    if let (false, true, Some(pv)) = (seen, failed, prev) {
-        let _ = std::iter::once((cur.x, cur.y)).chain(trail.iter().copied()).any(|p| unblend(f, v, pv, p, cursor) == Some(true));
+    let absent = || misfit(f, v, cur, (cur.x, cur.y), cursor).0 == 0; // not in this frame: nothing to remove
+    match best {
+        Some((_, o, at)) => {
+            let seen = std::ptr::eq(o, cur) || absent();
+            apply(f, v, o, at, cursor);
+            seen
+        }
+        None => absent(),
     }
-    seen || now.is_none()
 }
 
 /// The window being recorded, read from its own pixmap.
@@ -493,17 +514,17 @@ mod tests {
 
     #[test]
     fn unblend_any_handles_a_repaint_in_flight() {
-        let (old, new) = (0xCC_40_20_10u32, 0xCC_10_50_30u32);
-        let sprite = |p| Sprite { x: 5, y: 7, w: 1, h: 1, argb: vec![p] };
-        let v = View { w: 1, h: 1, x0: 5, y0: 7 };
-        let show = |p: u32, under: u32| [0, 8, 16].map(|s| ((p >> s & 255) + (under as f32 * 0.2).round() as u32) as u8);
-        for (shown, seen) in [(old, false), (new, true)] {
-            let mut f = [0; 4];
-            f[..3].copy_from_slice(&show(shown, 100));
-            // `old` was replaced by `new`; the frame may still show either.
-            assert_eq!(unblend_any(&mut f, v, &sprite(new), Some(&sprite(old)), &[], None), seen);
-            for c in &f[..3] {
-                assert!((*c as i32 - 100).abs() <= 3, "{c}");
+        // Two 200 px looks that differ in one pixel (under the 1% tolerance),
+        // like two timer readings: whichever the frame shows comes out clean.
+        let (n, under) = (200usize, 100u32);
+        let look = |odd: u32| Sprite { x: 0, y: 0, w: n as i32, h: 1, argb: (0..n).map(|i| if i == 7 { odd } else { 0xCC_10_10_10 }).collect() };
+        let (old, new) = (look(0xCC_80_80_80), look(0xCC_10_10_10));
+        let v = View { w: n, h: 1, x0: 0, y0: 0 };
+        for (shown, seen) in [(&old, false), (&new, true)] {
+            let mut f: Vec<u8> = shown.argb.iter().flat_map(|p| [0, 8, 16, 24].map(|s| ((p >> s & 255) + under * 51 / 255) as u8)).collect();
+            assert_eq!(unblend_any(&mut f, v, &new, Some(&old), &[], None), seen);
+            for (i, c) in f.iter().enumerate().filter(|(i, _)| i % 4 < 3) {
+                assert!((*c as i32 - under as i32).abs() <= 3, "pixel {}: {c}", i / 4);
             }
         }
     }
