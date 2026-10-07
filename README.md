@@ -40,3 +40,5 @@ screenrec install                          # set up the GNOME shortcut
 `rec` records until Ctrl+C or SIGTERM. Max FPS is 60 on the GPU and 30 on the CPU; `--cpu` forces CPU encoding. Files go to your Pictures and Videos folders by default.
 
 In the launcher, press Enter or Space to capture and Esc to cancel.
+
+The interface is in English, Spanish or Japanese. Pick one in the launcher's ⚙ settings; until you do, it follows your locale (`LANG`).
