@@ -1,0 +1,788 @@
+//! screenrec: fast X11 screenshots and screen recording (H.264 on the GPU with
+//! NVENC, or on the CPU with x264; MKV or MP4), from the command line or a
+//! launcher modelled on GNOME 42's screenshot UI.
+
+mod audio;
+mod capture;
+mod mkv;
+mod nvenc;
+#[allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code, unused_imports, clippy::all)]
+mod nvenc_sys;
+mod select;
+mod shortcut;
+mod ui;
+mod x264;
+
+use audio::Output;
+use capture::{Capture, Sprite, View};
+use select::Rect;
+use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use ui::{Hit, Mode, PillEvent, SetHit};
+use x11rb::CURRENT_TIME;
+use x11rb::connection::Connection;
+use x11rb::protocol::Event;
+use x11rb::protocol::xproto::{ConnectionExt as _, EventMask, GrabMode, GrabStatus};
+
+pub type Res<T> = Result<T, Box<dyn std::error::Error>>;
+
+const USAGE: &str = "uso:
+  screenrec                             interfaz: captura o grabación (selección, pantalla o ventana)
+  screenrec shot [archivo.png|.jpg]     captura de pantalla completa
+  screenrec rec [archivo.mkv|.mp4] [-r FPS] [--window ID] [--cpu]
+                                        graba la pantalla (o una ventana) hasta Ctrl+C / SIGTERM
+                                        (máx. FPS: 60 con GPU, 30 sin ella; --cpu: sin GPU aunque haya)
+  screenrec install                     atajo de teclado para la interfaz ('-' si aún no tiene)";
+
+/// Wall time between forced keyframes (seek granularity).
+const KEYINT_MS: u64 = 5000;
+
+static STOP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_signal(_: libc::c_int) {
+    STOP.store(true, Relaxed);
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let res = match args.first().map(String::as_str) {
+        None => gui(),
+        Some("shot") => shot(args.get(1)),
+        Some("rec") => rec(&args[1..]),
+        Some("install") => install(),
+        _ => {
+            eprintln!("{USAGE}");
+            std::process::exit(2);
+        }
+    };
+    if let Err(e) = res {
+        eprintln!("error: {e}");
+        if args.is_empty() {
+            notify("screenrec: error", &e.to_string(), None); // the GUI has no terminal
+        }
+        std::process::exit(1);
+    }
+}
+
+/// Point our GNOME shortcut at this executable; '-' unless one was already picked.
+fn install() -> Res<()> {
+    let accel = shortcut::get().unwrap_or_else(|| "minus".into());
+    shortcut::set(&accel)?;
+    println!("atajo de la interfaz: {}", shortcut::pretty(&accel));
+    Ok(())
+}
+
+fn shot(out: Option<&String>) -> Res<()> {
+    let mut cap = Capture::new()?;
+    let (screen, _) = freeze(&mut cap)?;
+    let path = out.map(PathBuf::from).unwrap_or_else(|| default_path("PICTURES", "captura", "png"));
+    save_image(&screen, cap.sw, (0, 0, cap.sw as i32, cap.sh as i32), None, &path)?;
+    println!("{}", path.display());
+    Ok(())
+}
+
+fn rec(args: &[String]) -> Res<()> {
+    let (mut opts, mut path, mut window) = (RecOpts { fps: None, gpu: true, sound: None }, None, None);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-r" => opts.fps = Some(it.next().and_then(|v| v.parse().ok()).filter(|f| (1..=240).contains(f)).ok_or("-r espera 1..240")?),
+            "--cpu" => opts.gpu = false,
+            "--window" => {
+                let id = it.next().ok_or("--window espera el id de la ventana")?;
+                let id = id.strip_prefix("0x").map_or_else(|| id.parse().ok(), |h| u32::from_str_radix(h, 16).ok());
+                window = Some(id.ok_or("id de ventana inválido")?);
+            }
+            p => path = Some(PathBuf::from(p)),
+        }
+    }
+    let path = path.unwrap_or_else(|| default_path("VIDEOS", "grabacion", "mkv"));
+    let mp4 = match path.extension().and_then(|e| e.to_str()) {
+        Some("mp4") => true,
+        Some("mkv") => false,
+        _ => return Err("se graba en .mkv o .mp4".into()),
+    };
+    let rec_path = if mp4 { path.with_extension("rec.mkv") } else { path.clone() }; // MP4 comes out of the MKV at the end
+    let mut cap = Capture::new()?;
+    let target = match window {
+        Some(w) => Target::Window(w, select::Ewmh::new(&cap).visible(&cap, w).ok_or("esa ventana no se ve en pantalla")?),
+        None => Target::Area((0, 0, cap.sw as i32, cap.sh as i32)),
+    };
+    record(&mut cap, &rec_path, &opts, None, None, target)?;
+    if mp4 {
+        to_mp4(&rec_path, &path)?;
+    }
+    Ok(())
+}
+
+/// How to record: frame rate cap (default: 60 on the GPU, 30 on the CPU,
+/// where encoding is what costs), GPU or not, and the sound (output,
+/// microphone, the pid whose sound "Window" means).
+struct RecOpts {
+    fps: Option<u32>,
+    gpu: bool,
+    sound: Option<(Output, bool, Option<u32>)>,
+}
+
+/// What a recording captures: part of the screen, or one window (client id,
+/// where it shows), which keeps recording while covered or moved.
+#[derive(Clone, Copy)]
+enum Target {
+    Area(Rect),
+    Window(u32, Rect),
+}
+
+/// The whole screen as it is now, without the pointer (returned apart, to be
+/// drawn back in on request). X11 has no "leave the cursor out" here, so hide
+/// it and grab until it is verifiably gone.
+fn freeze(cap: &mut Capture) -> Res<(Vec<u8>, Sprite)> {
+    let (cursor, _) = cap.query_cursor()?;
+    let hidden = cap.hide_pointer()?;
+    let give_up = Instant::now() + Duration::from_millis(500);
+    loop {
+        cap.grab((0, cap.sh as i32))?;
+        if !(hidden && cap.shows(&cursor)) || Instant::now() > give_up {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(4));
+    }
+    cap.show_pointer()?;
+    Ok((cap.frame().to_vec(), cursor))
+}
+
+/// Cut `r` out of the BGRX `screen` and save it as PNG, or JPG if the path says so.
+fn save_image(screen: &[u8], sw: usize, r: Rect, cursor: Option<&Sprite>, path: &Path) -> Res<()> {
+    let (w, h) = ((r.2 - r.0) as usize, (r.3 - r.1) as usize);
+    let mut img = Vec::with_capacity(w * h * 4);
+    for y in r.1..r.3 {
+        img.extend_from_slice(&screen[(y as usize * sw + r.0 as usize) * 4..][..w * 4]);
+    }
+    if let Some(c) = cursor {
+        capture::draw(&mut img, View { w, h, x0: r.0, y0: r.1 }, c);
+    }
+    if path.extension().is_some_and(|e| e == "jpg" || e == "jpeg") {
+        let jpg = jpeg_encoder::Encoder::new_file(path, 90)?;
+        jpg.encode(&img, w as u16, h as u16, jpeg_encoder::ColorType::Bgra)?; // the 4th byte is ignored
+        return Ok(());
+    }
+    let rgb: Vec<u8> = img.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]).collect();
+    let mut png = png::Encoder::new(std::fs::File::create(path)?, w as u32, h as u32);
+    png.set_color(png::ColorType::Rgb);
+    png.set_compression(png::Compression::Fast);
+    let mut wr = png.write_header()?;
+    wr.write_image_data(&rgb)?;
+    wr.finish()?;
+    Ok(())
+}
+
+/// What the launcher remembers between runs.
+struct Last {
+    mode: Mode,
+    record: bool,
+    pointer: bool,
+    sel: Rect,
+    output: Output,
+    mic: bool,
+    mp4: bool,
+    jpg: bool,
+    gpu: bool,
+}
+
+fn last_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let config = std::env::var("XDG_CONFIG_HOME").unwrap_or(home + "/.config");
+    Path::new(&config).join("screenrec/last")
+}
+
+impl Last {
+    fn load(sw: i32, sh: i32) -> Self {
+        let text = std::fs::read_to_string(last_path()).unwrap_or_default();
+        let f: Vec<&str> = text.split_whitespace().collect();
+        let n = |i: usize| f.get(i).and_then(|v| v.parse().ok());
+        let named = |i: usize, name: String| f.get(i) == Some(&name.as_str());
+        let mode = ui::MODES.into_iter().find(|m| named(0, format!("{m:?}")));
+        let sel = match (n(3), n(4), n(5), n(6)) {
+            (Some(x0), Some(y0), Some(x1), Some(y1)) if x0 < x1 && y0 < y1 && x1 <= sw && y1 <= sh => (x0, y0, x1, y1),
+            _ => (sw / 4, sh / 4, sw * 3 / 4, sh * 3 / 4),
+        };
+        let output = audio::OUTPUTS.into_iter().find(|o| named(7, format!("{o:?}"))).unwrap_or(Output::None);
+        let flag = |i: usize| f.get(i) == Some(&"true");
+        let gpu = f.get(11) != Some(&"false"); // the GPU when there is one, unless told otherwise
+        let mode = mode.unwrap_or(Mode::Selection);
+        Last { mode, record: flag(1), pointer: flag(2), sel, output, mic: flag(8), mp4: flag(9), jpg: flag(10), gpu }
+    }
+
+    fn save(&self) {
+        let path = last_path();
+        let (m, (x0, y0, x1, y1), o) = (self.mode, self.sel, self.output);
+        let _ = std::fs::create_dir_all(path.parent().unwrap());
+        let (rec, ptr, mic, mp4, jpg, gpu) = (self.record, self.pointer, self.mic, self.mp4, self.jpg, self.gpu);
+        let _ = std::fs::write(path, format!("{m:?} {rec} {ptr} {x0} {y0} {x1} {y1} {o:?} {mic} {mp4} {jpg} {gpu}\n"));
+    }
+}
+
+/// One launcher at a time: launching again (the shortcut pressed twice)
+/// closes the first one, or stops its recording, and exits.
+fn single_instance() -> Res<Option<std::fs::File>> {
+    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+    let path = Path::new(&dir).join("screenrec.lock");
+    let mut f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        if let Ok(pid) = std::fs::read_to_string(&path)?.trim().parse::<i32>() {
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+        }
+        return Ok(None);
+    }
+    f.set_len(0)?;
+    write!(f, "{}", std::process::id())?;
+    Ok(Some(f))
+}
+
+/// Keycode -> unshifted keysym.
+struct Keymap {
+    min: u8,
+    per: usize,
+    syms: Vec<u32>,
+}
+
+impl Keymap {
+    fn new(cap: &Capture) -> Res<Self> {
+        let (min, max) = (cap.conn.setup().min_keycode, cap.conn.setup().max_keycode);
+        let map = cap.conn.get_keyboard_mapping(min, max - min + 1)?.reply()?;
+        Ok(Keymap { min, per: map.keysyms_per_keycode as usize, syms: map.keysyms })
+    }
+
+    fn sym(&self, code: u8) -> u32 {
+        self.syms.get((code.saturating_sub(self.min)) as usize * self.per).copied().unwrap_or(0)
+    }
+}
+
+const KEY_ESCAPE: u32 = 0xff1b;
+const KEY_ENTERS: [u32; 3] = [0xff0d, 0xff8d, 0x20]; // Return, KP_Enter, space
+
+/// Grab the keyboard so the launcher gets its keys. Best effort: the
+/// shortcut that launched us may hold a grab for a moment.
+fn grab_keyboard(cap: &Capture, win: u32) -> Res<()> {
+    for _ in 0..20 {
+        if cap.conn.grab_keyboard(false, win, CURRENT_TIME, GrabMode::ASYNC, GrabMode::ASYNC)?.reply()?.status == GrabStatus::SUCCESS {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
+}
+
+/// The launcher, like GNOME's: the screen freezes, pick Selection / Screen /
+/// Window and screenshot or screencast, then the shutter (or Enter). The gear
+/// opens the settings: sound, pointer, shortcut.
+fn gui() -> Res<()> {
+    let Some(_lock) = single_instance()? else { return Ok(()) };
+    let mut cap = Capture::new()?;
+    let (screen, cursor) = freeze(&mut cap)?; // screenshots come from this: our UI is never in them
+    let (sw, sh) = (cap.sw as i32, cap.sh as i32);
+    let ewmh = select::Ewmh::new(&cap);
+    let wins = ewmh.windows(&cap);
+    let window_at = |x: i32, y: i32| wins.iter().copied().find(|&(r, _)| select::contains(r, x, y));
+    let mut last = Last::load(sw, sh);
+    let font = ui::load_font();
+    let pointer = cap.conn.query_pointer(cap.root)?.reply()?;
+    let (mut hovered, mut picked) = (window_at(pointer.root_x as i32, pointer.root_y as i32), None);
+    let area = |last: &Last, w: Option<(Rect, u32)>| match last.mode {
+        Mode::Selection => Some(last.sel),
+        Mode::Screen => Some((0, 0, sw, sh)),
+        Mode::Window => w.map(|(r, _)| r),
+    };
+
+    let mut ov = select::Overlay::new(&cap, screen, area(&last, hovered), last.mode == Mode::Selection)?;
+    let name_of = |cap: &Capture, w: Option<(Rect, u32)>| w.and_then(|(_, id)| ewmh.name(cap, id));
+    let mut st = ui::PanelState {
+        mode: last.mode,
+        record: last.record,
+        window: name_of(&cap, hovered),
+        hover: None,
+        settings_open: false,
+        font: font.as_ref(),
+    };
+    let (px, py) = ((sw - ui::PANEL_W as i32) / 2, sh - ui::PANEL_H as i32 - 48);
+    let mask = EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::POINTER_MOTION | EventMask::LEAVE_WINDOW;
+    let mut panel = ui::Win::new(&cap, px, py, ui::panel(&st), mask)?;
+    let shortcut_now = || shortcut::get().map_or("none".into(), |a| shortcut::pretty(&a));
+    let mut set = ui::SettingsState {
+        output: audio::OUTPUTS.iter().position(|&o| o == last.output).unwrap_or(0),
+        mic: last.mic,
+        pointer: last.pointer,
+        shortcut: shortcut_now(),
+        capturing: false,
+        mp4: last.mp4,
+        jpg: last.jpg,
+        gpu: last.gpu,
+        gpu_found: nvenc::available(),
+        hover: None,
+        font: font.as_ref(),
+    };
+    let (mx, my) = ((sw - ui::SET_W as i32) / 2, py + ui::PANEL_TOP - ui::SET_H as i32 - 14);
+    let mut modal = ui::Win::new(&cap, mx, my, ui::settings(&set), mask)?; // mapped by the gear
+    ov.show(&cap.conn)?;
+    panel.show(&cap.conn)?;
+    let keys = Keymap::new(&cap)?;
+    grab_keyboard(&cap, ov.win)?;
+
+    let mut grip: Option<(select::Grip, Rect)> = None; // dragging, and the selection before it
+    loop {
+        cap.wait(Duration::from_millis(50))?;
+        let (mut redraw, mut reshape, mut restyle) = (false, false, false); // panel, overlay, settings
+        for ev in cap.take_events()? {
+            let shoot = match ev {
+                Event::Expose(e) if e.window == panel.id || e.window == modal.id => {
+                    let w = if e.window == panel.id { &panel } else { &modal };
+                    w.draw(&cap.conn)?;
+                    false
+                }
+                Event::MotionNotify(e) if e.event == panel.id => {
+                    let h = ui::panel_hit(e.event_x, e.event_y);
+                    (redraw, st.hover) = (redraw || h != st.hover, h);
+                    false
+                }
+                Event::MotionNotify(e) if e.event == modal.id => {
+                    let h = ui::settings_hit(e.event_x, e.event_y);
+                    (restyle, set.hover) = (restyle || h != set.hover, h);
+                    false
+                }
+                Event::LeaveNotify(e) if e.event == panel.id => {
+                    (redraw, st.hover) = (redraw || st.hover.is_some(), None);
+                    false
+                }
+                Event::LeaveNotify(e) if e.event == modal.id => {
+                    (restyle, set.hover) = (restyle || set.hover.is_some(), None);
+                    false
+                }
+                Event::ButtonPress(e) if e.event == panel.id && e.detail == 1 => {
+                    redraw = true;
+                    let hit = ui::panel_hit(e.event_x, e.event_y);
+                    match hit {
+                        Some(Hit::Close) => return Ok(()),
+                        Some(Hit::Mode(m)) => (st.mode, reshape) = (m, true),
+                        Some(Hit::Shot) => st.record = false,
+                        Some(Hit::Cast) => st.record = true,
+                        Some(Hit::Settings) if st.settings_open => {
+                            (st.settings_open, set.capturing) = (false, false);
+                            cap.conn.unmap_window(modal.id)?;
+                        }
+                        Some(Hit::Settings) => {
+                            (st.settings_open, set.shortcut, set.capturing) = (true, shortcut_now(), false);
+                            modal.redraw(&cap.conn, ui::settings(&set))?;
+                            cap.conn.map_window(modal.id)?;
+                        }
+                        Some(Hit::Shutter) | None => {}
+                    }
+                    hit == Some(Hit::Shutter)
+                }
+                Event::ButtonPress(e) if e.event == modal.id && e.detail == 1 => {
+                    restyle = true;
+                    match ui::settings_hit(e.event_x, e.event_y) {
+                        Some(SetHit::Close) => {
+                            (st.settings_open, set.capturing, redraw) = (false, false, true);
+                            cap.conn.unmap_window(modal.id)?;
+                        }
+                        Some(SetHit::Output(i)) => set.output = i,
+                        Some(SetHit::Mic) => set.mic = !set.mic,
+                        Some(SetHit::Pointer) => set.pointer = !set.pointer,
+                        Some(SetHit::VideoFormat(i)) => set.mp4 = i == 1,
+                        Some(SetHit::Gpu) => set.gpu = !set.gpu,
+                        Some(SetHit::ImageFormat(i)) => set.jpg = i == 1,
+                        Some(SetHit::Shortcut) => set.capturing = true,
+                        None => {}
+                    }
+                    // Settings stick at once, also when the launcher is then closed.
+                    (last.pointer, last.output, last.mic) = (set.pointer, audio::OUTPUTS[set.output], set.mic);
+                    (last.mp4, last.jpg, last.gpu) = (set.mp4, set.jpg, set.gpu);
+                    last.save();
+                    false
+                }
+                Event::ButtonPress(e) if e.event == ov.win && e.detail == 1 && st.settings_open => {
+                    // A click outside closes the settings, like a popover.
+                    (st.settings_open, set.capturing, redraw) = (false, false, true);
+                    cap.conn.unmap_window(modal.id)?;
+                    false
+                }
+                Event::ButtonPress(e) if e.event == ov.win && e.detail == 1 => {
+                    let (x, y) = (e.event_x as i32, e.event_y as i32);
+                    match st.mode {
+                        Mode::Selection => grip = Some((select::grip(last.sel, x, y), last.sel)),
+                        Mode::Window => {
+                            (picked, reshape, redraw) = (window_at(x, y), true, true);
+                            st.window = name_of(&cap, picked);
+                        }
+                        Mode::Screen => {}
+                    }
+                    false
+                }
+                Event::MotionNotify(e) if e.event == ov.win => {
+                    let (x, y) = (e.event_x as i32, e.event_y as i32);
+                    match (st.mode, grip) {
+                        (Mode::Selection, Some((g, _))) => (last.sel, reshape) = (select::drag(g, x, y, (sw, sh)), true),
+                        (Mode::Selection, None) => ov.set_cursor(&cap.conn, select::grip_cursor(last.sel, x, y))?,
+                        (Mode::Window, _) if picked.is_none() && window_at(x, y) != hovered => {
+                            (hovered, reshape, redraw) = (window_at(x, y), true, true);
+                            st.window = name_of(&cap, hovered);
+                        }
+                        _ => {}
+                    }
+                    false
+                }
+                Event::ButtonRelease(e) if e.event == ov.win && e.detail == 1 => {
+                    if let Some((_, before)) = grip.take()
+                        && (last.sel.2 - last.sel.0 < 4 || last.sel.3 - last.sel.1 < 4)
+                    {
+                        (last.sel, reshape) = (before, true); // a click, not a selection
+                    }
+                    false
+                }
+                Event::KeyPress(e) => {
+                    let sym = keys.sym(e.detail);
+                    if set.capturing {
+                        if sym == KEY_ESCAPE {
+                            (set.capturing, restyle) = (false, true);
+                        } else if let Some(a) = shortcut::accel(sym, e.state.into()) {
+                            if let Err(err) = shortcut::set(&a) {
+                                notify("screenrec: no se pudo cambiar el atajo", &err.to_string(), None);
+                            }
+                            (set.shortcut, set.capturing, restyle) = (shortcut_now(), false, true);
+                        }
+                        false
+                    } else if sym == KEY_ESCAPE && st.settings_open {
+                        (st.settings_open, redraw) = (false, true);
+                        cap.conn.unmap_window(modal.id)?;
+                        false
+                    } else if sym == KEY_ESCAPE {
+                        return Ok(());
+                    } else {
+                        KEY_ENTERS.contains(&sym)
+                    }
+                }
+                _ => false,
+            };
+            if shoot {
+                (last.mode, last.record) = (st.mode, st.record);
+                let target = match (last.mode, picked.or(hovered)) {
+                    (Mode::Window, Some((r, id))) => Some(Target::Window(id, r)),
+                    (Mode::Window, None) => None, // no window picked
+                    _ => area(&last, None).map(Target::Area),
+                };
+                // Whose sound "Window" records: that window, else the one in the middle of the area.
+                let app = match target {
+                    Some(Target::Window(id, _)) => Some(id),
+                    Some(Target::Area(r)) => window_at((r.0 + r.2) / 2, (r.1 + r.3) / 2).map(|(_, id)| id),
+                    None => None,
+                };
+                let app = app.and_then(|id| ewmh.pid(&cap, id));
+                return shutter(cap, &ov, &[&panel, &modal], target, &last, &cursor, app);
+            }
+        }
+        if reshape {
+            last.mode = st.mode;
+            if st.mode != Mode::Selection {
+                ov.set_cursor(&cap.conn, select::CURSOR_ARROW)?;
+            }
+            ov.set(&cap.conn, area(&last, picked.or(hovered)), st.mode == Mode::Selection)?;
+        }
+        if redraw {
+            panel.redraw(&cap.conn, ui::panel(&st))?;
+        }
+        if restyle && st.settings_open {
+            modal.redraw(&cap.conn, ui::settings(&set))?;
+        }
+    }
+}
+
+/// Screenshot: cut the target out of the frozen screen. Screencast: take the
+/// UI down and record the target live, with the sound picked in the settings
+/// (`app`: the process whose sound "Window" means).
+fn shutter(mut cap: Capture, ov: &select::Overlay, windows: &[&ui::Win], target: Option<Target>, last: &Last, cursor: &Sprite, app: Option<u32>) -> Res<()> {
+    let Some(target) = target else { return Ok(()) }; // Window mode with no window picked
+    let (Target::Area(r) | Target::Window(_, r)) = target;
+    last.save();
+    if !last.record {
+        let path = default_path("PICTURES", "captura", if last.jpg { "jpg" } else { "png" });
+        save_image(ov.frozen(), cap.sw, r, last.pointer.then_some(cursor), &path)?;
+        notify("Captura guardada", &path.display().to_string(), Some(&path));
+        return Ok(());
+    }
+    cap.conn.unmap_window(ov.win)?;
+    for w in windows {
+        cap.conn.unmap_window(w.id)?;
+    }
+    cap.conn.ungrab_keyboard(CURRENT_TIME)?;
+    let pill = ui::Pill::new(&cap)?;
+    cap.overlay = Some(pill.win.sprite());
+    cap.draw_pointer = last.pointer;
+    let path = default_path("VIDEOS", "grabacion", "mkv");
+    let opts = RecOpts { fps: None, gpu: last.gpu, sound: Some((last.output, last.mic, app)) };
+    record(&mut cap, &path, &opts, Some(pill), Some(windows[0].sprite()), target)?;
+    let path = match last.mp4 {
+        true => to_mp4(&path, &path.with_extension("mp4")).unwrap_or_else(|e| {
+            notify("screenrec: quedó en MKV", &e.to_string(), None);
+            path
+        }),
+        false => path,
+    };
+    notify("Grabación guardada", &path.display().to_string(), None);
+    Ok(())
+}
+
+/// Grab until `gone` is off screen and the pill, if any, is composited as
+/// drawn: from then on frames hold none of our UI. Gives up after a second.
+fn settle(cap: &mut Capture, gone: Option<&Sprite>) -> Res<()> {
+    let give_up = Instant::now() + Duration::from_secs(1);
+    loop {
+        cap.changed()?; // keeps the cursor current: the pill check skips its pixels
+        cap.grab((0, cap.view.h as i32))?;
+        let done = !gone.is_some_and(|s| cap.shows(s)) && (cap.overlay.is_none() || cap.overlay_seen);
+        if done || Instant::now() > give_up {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(4));
+    }
+    cap.invalidate(); // the encoder hasn't seen these grabs
+    Ok(())
+}
+
+/// The H.264 encoder: NVENC on the GPU, or x264 on the CPU.
+enum Video {
+    Gpu(Box<nvenc::Encoder>), // boxed: NVENC's function table is 2.6 KB
+    Cpu(x264::Encoder),
+}
+
+/// An encoded frame: (timestamp ms, keyframe, Annex B).
+type Unit = (u64, bool, Vec<u8>);
+
+impl Video {
+    /// The GPU if wanted and it works, else the CPU (saying why).
+    fn new(host: &[u8], w: usize, h: usize, fps: u32, gpu: bool) -> Res<Self> {
+        if gpu && nvenc::available() {
+            match nvenc::Encoder::new(host, w, h, fps) {
+                Ok(e) => return Ok(Video::Gpu(Box::new(e))),
+                Err(e) => notify("screenrec: la GPU falló, grabando con el CPU", &e.to_string(), None),
+            }
+        }
+        Ok(Video::Cpu(x264::Encoder::new(w, h, fps)?))
+    }
+
+    fn upload(&mut self, host: &[u8], stride: usize, rows: (i32, i32)) -> Res<()> {
+        match self {
+            Video::Gpu(e) => e.upload(host, stride, rows),
+            Video::Cpu(e) => {
+                e.upload(host, stride, rows);
+                Ok(())
+            }
+        }
+    }
+
+    /// Encode the frame stamped `ts`; returns the frames finished meanwhile
+    /// (NVENC: this one; x264 runs a frame or so behind). `idr` only steers NVENC.
+    fn encode(&mut self, ts: u64, idr: bool) -> Res<Vec<Unit>> {
+        match self {
+            Video::Gpu(e) => {
+                let mut unit = vec![];
+                let key = e.encode(idr, &mut unit)?;
+                Ok(vec![(ts, key, unit)])
+            }
+            Video::Cpu(e) => Ok(e.encode(ts)?.into_iter().map(|(t, u)| (t, mkv::is_keyframe(&u), u)).collect()),
+        }
+    }
+
+    /// What is still in the encoder at the end.
+    fn finish(&mut self) -> Vec<Unit> {
+        match self {
+            Video::Gpu(_) => vec![],
+            Video::Cpu(e) => e.finish().into_iter().map(|(t, u)| (t, mkv::is_keyframe(&u), u)).collect(),
+        }
+    }
+}
+
+/// Remux a finished MKV to MP4 with the installed ffmpeg: video copied as is,
+/// audio to AAC (Apple devices don't play Opus in MP4). Removes the MKV.
+fn to_mp4(src: &Path, dst: &Path) -> Res<PathBuf> {
+    let mut ff = std::process::Command::new("ffmpeg");
+    ff.args(["-v", "error", "-y", "-i"]).arg(src);
+    ff.args(["-map", "0", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart"]).arg(dst);
+    if !ff.status().map_err(|_| "MP4 necesita ffmpeg (sudo apt install ffmpeg)")?.success() {
+        return Err("ffmpeg no pudo convertir a MP4".into());
+    }
+    std::fs::remove_file(src)?;
+    Ok(dst.to_owned())
+}
+
+/// Record `target` until STOP (or until the recorded window closes). In GUI
+/// mode the pill is on screen (pause / stop / drag) and `gone` must be off
+/// screen first.
+fn record(cap: &mut Capture, path: &Path, opts: &RecOpts, mut pill: Option<ui::Pill>, gone: Option<Sprite>, target: Target) -> Res<()> {
+    for sig in [libc::SIGINT, libc::SIGTERM] {
+        unsafe { libc::signal(sig, on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t) };
+    }
+    unsafe { libc::nice(10) }; // whatever else runs comes first
+
+    let (Target::Area(r) | Target::Window(_, r)) = target;
+    let (w, h) = (((r.2 - r.0) & !1) as usize, ((r.3 - r.1) & !1) as usize); // 4:2:0 needs even sizes
+    if w < 64 || h < 64 {
+        return Err("el área es muy pequeña para grabar (mínimo 64×64)".into());
+    }
+    let mut enc = Video::new(cap.frame(), w, h, opts.fps.unwrap_or(60), opts.gpu)?; // whole screen buffer: covers any area
+    let fps = opts.fps.unwrap_or(if matches!(enc, Video::Gpu(_)) { 60 } else { 30 });
+    let (w32, h32) = (w as i32, h as i32);
+    match target {
+        Target::Window(id, _) => {
+            cap.overlay = None; // our UI is never in another window's pixmap
+            cap.follow_window(id, (r.0, r.1, r.0 + w32, r.1 + h32))?;
+        }
+        Target::Area(_) => {
+            cap.track_changes()?;
+            if pill.is_some() {
+                settle(cap, gone.as_ref())?;
+            }
+            cap.set_region(r.0, r.1, w32, h32);
+        }
+    }
+    // A video without sound beats no video: audio trouble only gets reported.
+    let mut sound = opts.sound.and_then(|(output, mic, app)| {
+        audio::Audio::start(output, mic, app).unwrap_or_else(|e| {
+            notify("screenrec: grabando sin sonido", &e.to_string(), None);
+            None
+        })
+    });
+    let mut mkv: Option<mkv::Mkv> = None;
+    let (mut frames, mut last_ts, mut last_key) = (0u64, 0u64, 0u64);
+    // Write a frame; the first one (with SPS/PPS) creates the file.
+    let opus = sound.as_ref().map(|a| (a.opus_head(), a.pre_skip()));
+    let put = |mkv: &mut Option<mkv::Mkv>, last_key: &mut u64, (t, key, unit): Unit| -> Res<()> {
+        if key {
+            *last_key = t;
+        }
+        match mkv {
+            Some(m) => m.frame(t, key, &unit)?,
+            None => {
+                let mut m = mkv::Mkv::create(path, w, h, &unit, opus.clone())?;
+                m.frame(t, key, &unit)?;
+                *mkv = Some(m);
+            }
+        }
+        Ok(())
+    };
+    let tick = Duration::from_secs(1) / fps;
+    eprintln!("grabando {w}x{h} a {fps} fps máx. en {} (Ctrl+C para terminar)", path.display());
+
+    let t0 = Instant::now();
+    let mut last = t0 - tick;
+    let (mut paused, mut paused_for) = (None::<Instant>, Duration::ZERO);
+    // Audio frame (48 kHz) on the recording's timeline: wall clock minus pauses.
+    let frame_of = |at: Instant, paused_for: Duration| {
+        (at.saturating_duration_since(t0).as_micros() as i64 - paused_for.as_micros() as i64) * audio::RATE / 1_000_000
+    };
+    let res = (|| -> Res<()> {
+        while !STOP.load(Relaxed) {
+            for ev in cap.take_events()? {
+                let Some(p) = pill.as_mut() else { continue };
+                match p.event(&cap.conn, &ev)? {
+                    PillEvent::TogglePause if paused.is_some() => {
+                        paused_for += paused.take().unwrap().elapsed();
+                        p.set_paused(&cap.conn, false)?;
+                        cap.overlay = Some(p.win.sprite());
+                        settle(cap, None)?; // compositor must show this look before we remove it
+                    }
+                    PillEvent::TogglePause => {
+                        paused = Some(Instant::now());
+                        p.set_paused(&cap.conn, true)?;
+                    }
+                    PillEvent::Stop => {
+                        cap.conn.unmap_window(p.win.id)?;
+                        STOP.store(true, Relaxed);
+                    }
+                    PillEvent::None => {}
+                }
+            }
+            if let Some(p) = pill.as_mut() {
+                p.animate(&cap.conn)?;
+                cap.move_overlay(p.win.x, p.win.y);
+            }
+            if let (Some(a), Some(m)) = (sound.as_mut(), mkv.as_mut()) {
+                let until = frame_of(paused.unwrap_or_else(Instant::now), paused_for);
+                for (ts, packet) in a.pump(|at| frame_of(at, paused_for), until, paused.is_some(), false)? {
+                    m.audio(ts, &packet)?;
+                }
+            }
+            if STOP.load(Relaxed) || cap.window_gone() {
+                break;
+            }
+            if paused.is_some() {
+                cap.conn.flush()?;
+                std::thread::sleep(tick);
+                continue;
+            }
+            // At most `fps`, but otherwise capture the moment something changes:
+            // every frame of content up to `fps` gets caught, none twice. Waking
+            // at least once per tick re-checks the cursor, which moves without damage.
+            if let Some(d) = (last + tick).checked_duration_since(Instant::now()) {
+                std::thread::sleep(d);
+            }
+            cap.wait(tick)?;
+            // Nothing changed -> no capture, no encode: a still screen costs ~0.
+            let Some(rows) = cap.changed()? else { continue };
+            last = Instant::now();
+            let ts = (last - t0 - paused_for).as_millis() as u64;
+            cap.grab(rows)?;
+            enc.upload(cap.frame(), cap.view.w * 4, rows)?;
+            for unit in enc.encode(ts, mkv.is_none() || ts - last_key >= KEYINT_MS)? {
+                put(&mut mkv, &mut last_key, unit)?;
+            }
+            (frames, last_ts) = (frames + 1, ts);
+        }
+        Ok(())
+    })();
+
+    // Finalize even after an error: what got recorded is the user's data.
+    let paused_now = paused.map_or(Duration::ZERO, |t| t.elapsed());
+    let end = (t0.elapsed() - paused_for - paused_now).as_millis() as u64;
+    // Repeat the last frame at the stop time so the video lasts until then,
+    // and take what the encoder still holds.
+    let mut tail = if end > last_ts && frames > 0 { enc.encode(end, false).unwrap_or_default() } else { vec![] };
+    tail.extend(enc.finish());
+    for unit in tail {
+        put(&mut mkv, &mut last_key, unit)?;
+    }
+    if let Some(mut m) = mkv {
+        if let Some(a) = sound.as_mut() {
+            std::thread::sleep(Duration::from_millis(60)); // the last chunks still in parec
+            for (ts, packet) in a.pump(|at| frame_of(at, paused_for), end as i64 * audio::RATE / 1000, paused.is_some(), true)? {
+                m.audio(ts, &packet)?;
+            }
+        }
+        m.finish(end)?;
+        let mb = std::fs::metadata(path).map(|m| m.len() as f64 / 1e6).unwrap_or(0.0);
+        eprintln!("{frames} frames, {:.1} s, {mb:.1} MB -> {}", end as f64 / 1000.0, path.display());
+    }
+    res
+}
+
+fn notify(title: &str, body: &str, icon: Option<&Path>) {
+    let icon = icon.map_or("media-record".into(), |p| p.display().to_string());
+    let _ = std::process::Command::new("notify-send").args(["-a", "screenrec", "-i", &icon, title, body]).spawn();
+}
+
+fn default_path(xdg_dir: &str, prefix: &str, ext: &str) -> PathBuf {
+    let dir = std::process::Command::new("xdg-user-dir")
+        .arg(xdg_dir)
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&(now.as_secs() as libc::time_t), &mut tm) };
+    let (y, mo, d, h, mi, s) = (tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+    let ms = now.subsec_millis(); // two shots in one second must not overwrite each other
+    PathBuf::from(dir).join(format!("{prefix}-{y}-{mo:02}-{d:02}_{h:02}-{mi:02}-{s:02}-{ms:03}.{ext}"))
+}
