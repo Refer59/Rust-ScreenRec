@@ -177,18 +177,17 @@ impl Encoder {
 }
 
 /// BGRX rows (from `src`, `stride` apart) into the I420 planes `ys`, `us`,
-/// `vs`, which cover the same row pairs. Pixels are read as u32 and the
-/// chroma math fits i16, so it vectorizes with plain SSE2 (~3 ms per 1080p).
+/// `vs`, which cover the same row pairs. Pixels are read as u32 so the loops
+/// vectorize with plain SSE2: luma walks both rows of a pair in one loop (two
+/// independent streams), chroma sums each 2x2 block with red and blue side by
+/// side in one u32 and does the matrix in i16.
 fn convert(src: &[u8], stride: usize, w: usize, ys: &mut [u8], us: &mut [u8], vs: &mut [u8]) {
     let rows = ys.chunks_exact_mut(2 * w).zip(us.chunks_exact_mut(w / 2)).zip(vs.chunks_exact_mut(w / 2));
     for (((ypair, ur), vr), j) in rows.zip((0..).step_by(2)) {
         let (top, bot) = (&src[j * stride..][..w * 4], &src[(j + 1) * stride..][..w * 4]);
         let (ya, yb) = ypair.split_at_mut(w);
-        for (row, out) in [(top, ya), (bot, yb)] {
-            for (p, y) in row.as_chunks::<4>().0.iter().zip(out) {
-                let p = u32::from_le_bytes(*p);
-                *y = ((47 * (p >> 16 & 0xFF) + 157 * (p >> 8 & 0xFF) + 16 * (p & 0xFF) + 128) >> 8) as u8 + 16;
-            }
+        for (((p, q), y), z) in top.as_chunks::<4>().0.iter().zip(bot.as_chunks::<4>().0).zip(ya).zip(yb) {
+            (*y, *z) = (luma(*p), luma(*q));
         }
         for (((a, b), u), v) in top.as_chunks::<8>().0.iter().zip(bot.as_chunks::<8>().0).zip(ur).zip(vr) {
             let px = |s: &[u8; 8], i: usize| u32::from_le_bytes([s[i], s[i + 1], s[i + 2], s[i + 3]]);
@@ -201,6 +200,14 @@ fn convert(src: &[u8], stride: usize, w: usize, ys: &mut [u8], us: &mut [u8], vs
             *v = ((112 * r - 102 * g - 10 * bl + 128) >> 8) as u8 ^ 0x80;
         }
     }
+}
+
+/// (47R + 157G + 16B + 128) / 256 + 16, the +16 folded into the rounding term.
+#[inline(always)]
+fn luma(p: [u8; 4]) -> u8 {
+    let p = u32::from_le_bytes(p);
+    let br = p & 0xFF00FF;
+    ((47 * (br >> 16) + 157 * (p >> 8 & 0xFF) + 16 * (br & 0xFFFF) + 4224) >> 8) as u8
 }
 
 impl Drop for Encoder {
@@ -223,6 +230,89 @@ mod tests {
         assert_eq!(e.yuv, [63, 63, 63, 63, 102, 240]);
         e.upload(&[255; 16], 8, (0, 2));
         assert_eq!(e.yuv, [235, 235, 235, 235, 128, 128]);
+    }
+
+    /// The implementation before the luma/chroma loops were reworked.
+    fn convert_ref(src: &[u8], stride: usize, w: usize, ys: &mut [u8], us: &mut [u8], vs: &mut [u8]) {
+        let rows = ys.chunks_exact_mut(2 * w).zip(us.chunks_exact_mut(w / 2)).zip(vs.chunks_exact_mut(w / 2));
+        for (((ypair, ur), vr), j) in rows.zip((0..).step_by(2)) {
+            let (top, bot) = (&src[j * stride..][..w * 4], &src[(j + 1) * stride..][..w * 4]);
+            let (ya, yb) = ypair.split_at_mut(w);
+            for (row, out) in [(top, ya), (bot, yb)] {
+                for (p, y) in row.as_chunks::<4>().0.iter().zip(out) {
+                    let p = u32::from_le_bytes(*p);
+                    *y = ((47 * (p >> 16 & 0xFF) + 157 * (p >> 8 & 0xFF) + 16 * (p & 0xFF) + 128) >> 8) as u8 + 16;
+                }
+            }
+            for (((a, b), u), v) in top.as_chunks::<8>().0.iter().zip(bot.as_chunks::<8>().0).zip(ur).zip(vr) {
+                let px = |s: &[u8; 8], i: usize| u32::from_le_bytes([s[i], s[i + 1], s[i + 2], s[i + 3]]);
+                let (p0, p1, q0, q1) = (px(a, 0), px(a, 4), px(b, 0), px(b, 4));
+                // 2x2 averages; red and blue summed side by side in one u32
+                let rb = (p0 & 0xFF00FF) + (p1 & 0xFF00FF) + (q0 & 0xFF00FF) + (q1 & 0xFF00FF) + 0x20002;
+                let g = ((p0 >> 8 & 0xFF) + (p1 >> 8 & 0xFF) + (q0 >> 8 & 0xFF) + (q1 >> 8 & 0xFF) + 2) >> 2;
+                let (r, g, bl) = ((rb >> 18) as i16, g as i16, (rb >> 2 & 0x3FFF) as i16);
+                *u = ((-26 * r - 86 * g + 112 * bl + 128) >> 8) as u8 ^ 0x80; // ^0x80: +128
+                *v = ((112 * r - 102 * g - 10 * bl + 128) >> 8) as u8 ^ 0x80;
+            }
+        }
+    }
+
+    #[test]
+    fn convert_matches_reference() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        for (w, h, pad) in [(64, 8, 0), (130, 6, 12), (2, 2, 4), (1920, 4, 64)] {
+            let stride = w * 4 + pad;
+            let src: Vec<u8> = (0..stride * h)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    (seed >> 56) as u8
+                })
+                .collect();
+            let planes = |f: fn(&[u8], usize, usize, &mut [u8], &mut [u8], &mut [u8])| {
+                let (mut y, mut u, mut v) = (vec![0; w * h], vec![0; w * h / 4], vec![0; w * h / 4]);
+                f(&src, stride, w, &mut y, &mut u, &mut v);
+                (y, u, v)
+            };
+            assert!(planes(convert) == planes(convert_ref), "{w}x{h} stride {stride}");
+        }
+    }
+
+    // TEMPORARY: old vs new, same binary, back to back.
+    #[test]
+    fn tmp_time_convert() {
+        let (w, h) = (std::hint::black_box(1920usize), 1080usize);
+        let mut seed = 1u64;
+        let host: Vec<u8> = (0..w * h * 4)
+            .map(|_| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (seed >> 56) as u8
+            })
+            .collect();
+        let mut e = Encoder { child: Command::new("true").spawn().unwrap(), stdin: None, units: channel().1, pending: VecDeque::new(), yuv: vec![0; w * h * 3 / 2], w, h };
+        let mut yuv = vec![0u8; w * h * 3 / 2];
+        let mut old = |host: &[u8]| {
+            let (ys, uv) = yuv.split_at_mut(w * h);
+            let (us, vs) = uv.split_at_mut(w * h / 4);
+            convert_ref(host, w * 4, w, ys, us, vs);
+        };
+        old(&host);
+        e.upload(&host, w * 4, (0, h as i32));
+        let (mut ta, mut tb) = (vec![], vec![]);
+        for _ in 0..10 {
+            let t = std::time::Instant::now();
+            for _ in 0..20 {
+                old(std::hint::black_box(&host));
+            }
+            ta.push(t.elapsed().as_secs_f64() * 1e3 / 20.0);
+            let t = std::time::Instant::now();
+            for _ in 0..20 {
+                e.upload(std::hint::black_box(&host), w * 4, (0, h as i32));
+            }
+            tb.push(t.elapsed().as_secs_f64() * 1e3 / 20.0);
+        }
+        ta.sort_by(f64::total_cmp);
+        tb.sort_by(f64::total_cmp);
+        println!("TIMING old med {:.3} best {:.3} | new med {:.3} best {:.3} ms/upload", ta[5], ta[0], tb[5], tb[0]);
     }
 
     #[test]
