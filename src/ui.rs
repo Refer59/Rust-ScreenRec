@@ -1643,3 +1643,75 @@ mod preview {
         assert!(dotless.px.iter().all(|p| p >> 24 <= 230));
     }
 }
+
+/// Live check on a real compositor: the pill, redrawn every 150 ms (the
+/// timer's worst case, times seven), never shows up in captured frames.
+/// `cargo test --release pill_never_in_frames -- --ignored --nocapture`;
+/// puts two small windows in the bottom-right corner for ~3 s, no grabs.
+#[cfg(test)]
+mod live {
+    use super::*;
+
+    #[test]
+    #[ignore = "needs an X display with a compositor"]
+    fn pill_never_in_frames() {
+        let mut cap = Capture::new().unwrap();
+        let (font, scale) = (load_font(false), 1.25);
+        let (sw, sh) = (cap.sw as i32, cap.sh as i32);
+        // An opaque backdrop with known pixels under the pill.
+        let (bw, bh) = (320usize, 110usize);
+        let mut back = Canvas::new(bw, bh, 1.0);
+        for (i, p) in back.px.iter_mut().enumerate() {
+            let (x, y) = ((i % bw) as u32, (i / bw) as u32);
+            *p = 255 << 24 | (x * 255 / bw as u32) << 16 | (y * 255 / bh as u32) << 8 | if (x / 6 + y / 6) % 2 == 0 { 40 } else { 220 };
+        }
+        let (bx, by) = (sw - bw as i32, sh - bh as i32);
+        let backdrop = Win::new(&cap, bx, by, back, EventMask::EXPOSURE).unwrap();
+        backdrop.show(&cap.conn).unwrap();
+        let mut pill = Pill::new(&cap, font.as_ref(), scale).unwrap();
+        cap.overlay = Some(pill.win.sprite());
+        cap.draw_pointer = false;
+        cap.track_changes().unwrap();
+        crate::settle(&mut cap, None).unwrap();
+        cap.set_region(bx, by, bw as i32, bh as i32);
+        let expect = |x: i32, y: i32| backdrop.canvas.px[((y - by) as usize) * bw + (x - bx) as usize];
+        let (mut frames, mut worst, mut bad_frames) = (0, 0u32, 0);
+        let t0 = Instant::now();
+        let mut next = t0;
+        let mut secs = 0;
+        while t0.elapsed() < Duration::from_secs(3) {
+            if Instant::now() >= next {
+                secs += 1;
+                pill.win.redraw(&cap.conn, pill_canvas(secs, font.as_ref(), scale)).unwrap();
+                cap.set_overlay(pill.win.sprite());
+                next += Duration::from_millis(150);
+            }
+            cap.wait(Duration::from_millis(2)).unwrap();
+            let rows = (0, bh as i32);
+            cap.grab(rows).unwrap();
+            frames += 1;
+            let (v, f) = (cap.view, cap.frame());
+            let (px, py, pw, ph) = (pill.win.x, pill.win.y, pill.win.canvas.w as i32, pill.win.canvas.h as i32);
+            let mut bad = 0;
+            for y in py..py + ph {
+                for x in px..px + pw {
+                    let i = (((y - v.y0) as usize) * v.w + (x - v.x0) as usize) * 4;
+                    let e = expect(x, y).to_le_bytes();
+                    let d = (0..3).map(|k| (f[i + k] as i32 - e[k] as i32).unsigned_abs()).max().unwrap();
+                    worst = worst.max(d);
+                    bad += (d > 8) as u32;
+                }
+            }
+            bad_frames += (bad > 0) as u32;
+        }
+        cap.conn.unmap_window(pill.win.id).unwrap();
+        cap.conn.unmap_window(backdrop.id).unwrap();
+        cap.conn.flush().unwrap();
+        eprintln!("{frames} frames, {secs} pill redraws: {bad_frames} frames with pill pixels left, worst error {worst} levels");
+        assert_eq!(bad_frames, 0);
+    }
+
+    fn pill_canvas(secs: u64, font: Option<&FontVec>, scale: f32) -> Canvas {
+        pill(false, secs * 7, font, scale) // a new look every time
+    }
+}
