@@ -91,6 +91,7 @@ pub struct Capture {
     fresh: bool,       // `changed` just filled staging: `grab` copies from it
     full: bool,        // the next `changed` reports every row
     still: bool,       // the last `changed` found nothing: `wait` sleeps
+    tick: Duration, // the recording's frame interval (`set_tick`)
 }
 
 impl Capture {
@@ -133,6 +134,7 @@ impl Capture {
             fresh: false,
             full: true,
             still: false,
+            tick: Duration::from_millis(16),
         })
     }
 
@@ -245,6 +247,17 @@ impl Capture {
 
     pub fn window_gone(&self) -> bool {
         false
+    }
+
+    /// The recording's frame interval.
+    pub fn set_tick(&mut self, tick: Duration) {
+        self.tick = tick;
+    }
+
+    /// How long the recording loop may sleep when nothing happens: there are
+    /// no change events here, so one tick.
+    pub fn poll_interval(&self) -> Duration {
+        self.tick
     }
 
     /// No damage events: after a still screen, wait `timeout` before looking

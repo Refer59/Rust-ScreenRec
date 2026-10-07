@@ -13,17 +13,24 @@ use crate::Res;
 use crate::frame::{Rect, Rows, View, draw, shows};
 pub use crate::frame::Sprite;
 use std::os::fd::AsRawFd;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use x11rb::connection::{Connection, RequestConnection as _};
 use x11rb::protocol::Event;
 use x11rb::protocol::composite::{ConnectionExt as _, Redirect};
 use x11rb::protocol::damage::{ConnectionExt as _, ReportLevel};
 use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::shm::ConnectionExt as _;
-use x11rb::protocol::xfixes::ConnectionExt as _;
+use x11rb::protocol::xfixes::{ConnectionExt as _, CursorNotifyMask};
+use x11rb::protocol::xinput::{ConnectionExt as _, Device, EventMask as XiEventMask, XIEventMask};
 use x11rb::protocol::xproto::{ChangeWindowAttributesAux, ConnectionExt as _, CreateGCAux, EventMask, GrabMode, GrabStatus, ImageFormat, Rectangle};
 use x11rb::rust_connection::RustConnection;
 use x11rb::{CURRENT_TIME, NONE};
+
+/// With pointer events on, the cursor is still looked at this often: a warped
+/// pointer, or a window raised under it, leaves no event behind.
+const SAFETY: Duration = Duration::from_secs(1);
+/// Pointer input is looked at no more often than the tick, or this at low frame rates.
+const PACE: Duration = Duration::from_millis(50);
 
 fn union(a: Option<Rows>, b: Option<Rows>) -> Option<Rows> {
     match (a, b) {
@@ -146,6 +153,12 @@ pub struct Capture {
     /// Blend the cursor in when the server leaves it out of the image.
     pub draw_pointer: bool,
     follow: Option<Follow>,
+    tick: Duration,      // the recording's frame interval: pointer input is looked at no more often
+    probed: Instant,     // when the cursor was last queried
+    xi2: Option<bool>,   // whether the server has XInput2 >= 2.1 (None: not asked yet)
+    events_on: bool,     // raw motion and cursor changes arrive as events (else the cursor is polled)
+    motion: bool,        // the pointer moved since the last probe
+    cursor_dirty: bool,  // the cursor image changed since the last probe
 }
 
 impl Capture {
@@ -184,6 +197,12 @@ impl Capture {
             overlay_seen: false,
             draw_pointer: true,
             follow: None,
+            tick: Duration::from_millis(16),
+            probed: Instant::now(),
+            xi2: None,
+            events_on: false,
+            motion: false,
+            cursor_dirty: false,
         })
     }
 
@@ -321,6 +340,12 @@ impl Capture {
             self.conn.damage_destroy(self.damage)?;
             self.damage = 0;
         }
+        if self.events_on {
+            let none = [XiEventMask { deviceid: Device::ALL_MASTER.into(), mask: vec![] }];
+            self.conn.xinput_xi_select_events(self.root, &none)?;
+            self.conn.xfixes_select_cursor_input(self.root, CursorNotifyMask::from(0u8))?;
+            self.events_on = false;
+        }
         self.pending = None;
         Ok(())
     }
@@ -335,7 +360,39 @@ impl Capture {
         self.conn.damage_query_version(1, 1)?.reply()?;
         self.damage = self.conn.generate_id()?;
         self.conn.damage_create(self.damage, drawable, ReportLevel::RAW_RECTANGLES)?;
+        self.select_input()
+    }
+
+    /// Ask for pointer motion (XInput2 raw events, which XI 2.1 delivers during
+    /// grabs too) and cursor-image changes (XFixes) as events, so an idle
+    /// recording can sleep until something happens instead of polling the
+    /// cursor every tick. Without XI2 the poll stays.
+    fn select_input(&mut self) -> Res<()> {
+        let c = &self.conn;
+        if self.xi2.is_none() {
+            let v = c.xinput_xi_query_version(2, 2).ok().and_then(|k| k.reply().ok());
+            self.xi2 = Some(v.is_some_and(|v| (v.major_version, v.minor_version) >= (2, 1)));
+        }
+        if self.xi2 == Some(true) {
+            let mask = [XiEventMask { deviceid: Device::ALL_MASTER.into(), mask: vec![XIEventMask::RAW_MOTION] }];
+            self.events_on = c.xinput_xi_select_events(self.root, &mask)?.check().is_ok();
+            if self.events_on {
+                c.xfixes_select_cursor_input(self.root, CursorNotifyMask::DISPLAY_CURSOR)?;
+            }
+        }
+        (self.motion, self.cursor_dirty) = (false, false);
         Ok(())
+    }
+
+    /// The recording's frame interval: pointer input is looked at no more often.
+    pub fn set_tick(&mut self, tick: Duration) {
+        self.tick = tick;
+    }
+
+    /// How long the recording loop may sleep when nothing happens: a tick when
+    /// the cursor has to be polled, else the safety interval.
+    pub fn poll_interval(&self) -> Duration {
+        if self.events_on { SAFETY } else { self.tick }
     }
 
     /// Record window `client` (showing at `visible`) from its own pixmap
@@ -402,6 +459,8 @@ impl Capture {
                     }
                 }
                 Event::DamageNotify(_) => {} // from a tracker destroyed by `untrack`
+                Event::XinputRawMotion(_) => self.motion = true,
+                Event::XfixesCursorNotify(_) => self.cursor_dirty = true,
                 Event::ConfigureNotify(e) if self.follow.as_ref().is_some_and(|f| f.top == e.window) => {
                     let f = self.follow.as_mut().unwrap();
                     (self.view.x0, self.view.y0) = (e.x as i32 + f.crop.0, e.y as i32 + f.crop.1);
@@ -436,18 +495,38 @@ impl Capture {
         Ok(std::mem::take(&mut self.events))
     }
 
-    /// Sleep until the screen changes, an event arrives, or `timeout` passes
-    /// (a Duration, or an Option of one: None means no limit).
+    /// Sleep until the screen changes, an event arrives, the pointer has moved
+    /// (looked at once per tick at most), or `timeout` passes (a Duration, or an
+    /// Option of one: None means no limit).
     pub fn wait(&mut self, timeout: impl Into<Option<Duration>>) -> Res<()> {
-        self.conn.flush()?; // small requests (moves, repaints) sit in a buffer until then
-        self.drain_events()?;
-        if self.pending.is_none() && self.events.is_empty() {
-            let ms = timeout.into().map_or(-1, |t| t.as_millis().min(i32::MAX as u128) as i32);
-            let mut fd = libc::pollfd { fd: self.conn.stream().as_raw_fd(), events: libc::POLLIN, revents: 0 };
-            unsafe { libc::poll(&mut fd, 1, ms) };
+        let deadline = timeout.into().map(|t| Instant::now() + t);
+        loop {
+            self.conn.flush()?; // small requests (moves, repaints) sit in a buffer until then
             self.drain_events()?;
+            if self.pending.is_some() || !self.events.is_empty() {
+                return Ok(());
+            }
+            // A mouse reports up to 1000 times a second: its input is worth a look once per
+            // tick. Until then nothing is urgent (a frame can't come sooner either), so sleep
+            // instead of polling: the reports queue up in the socket without waking us.
+            let now = Instant::now();
+            let input = (self.motion || self.cursor_dirty).then(|| self.probed + self.tick.min(PACE));
+            if input.is_some_and(|at| at <= now) {
+                return Ok(());
+            }
+            let until = [deadline, input].into_iter().flatten().min();
+            if let (Some(_), Some(until)) = (input, until) {
+                std::thread::sleep(until - now);
+            } else {
+                let ms = until.map_or(-1, |t| t.saturating_duration_since(now).as_micros().div_ceil(1000).min(i32::MAX as u128) as i32);
+                let mut fd = libc::pollfd { fd: self.conn.stream().as_raw_fd(), events: libc::POLLIN, revents: 0 };
+                unsafe { libc::poll(&mut fd, 1, ms) };
+            }
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                self.drain_events()?;
+                return Ok(());
+            }
         }
-        Ok(())
     }
 
     /// Make the next `changed` report the whole area.
@@ -468,18 +547,25 @@ impl Capture {
             // Raw rectangles still pile up in the server-side region; keep it empty.
             self.conn.damage_subtract(self.damage, NONE, NONE)?;
         }
-        let (c, serial) = self.query_cursor()?;
-        // Following a window, the pointer is drawn only while it is over that window.
-        let shown = match &self.follow {
-            Some(f) => self.conn.query_pointer(self.root)?.reply()?.child == f.top,
-            None => true,
-        };
-        let was = self.cursor.as_ref();
-        if was.is_none_or(|(o, s, sh)| (o.x, o.y, *s, *sh) != (c.x, c.y, serial, shown)) {
-            rows = union(rows, was.filter(|w| w.2).map(|(o, ..)| (o.y, o.y + o.h)));
-            rows = union(rows, shown.then_some((c.y, c.y + c.h)));
+        // The cursor moves without damage. Polling: look every call. With input
+        // events: when one arrived (once per tick at most), and once a second anyway.
+        let now = Instant::now();
+        let due = (self.motion || self.cursor_dirty) && now >= self.probed + self.tick.min(PACE);
+        if !self.events_on || self.cursor.is_none() || due || now >= self.probed + SAFETY {
+            (self.motion, self.cursor_dirty, self.probed) = (false, false, now);
+            let (c, serial) = self.query_cursor()?;
+            // Following a window, the pointer is drawn only while it is over that window.
+            let shown = match &self.follow {
+                Some(f) => self.conn.query_pointer(self.root)?.reply()?.child == f.top,
+                None => true,
+            };
+            let was = self.cursor.as_ref();
+            if was.is_none_or(|(o, s, sh)| (o.x, o.y, *s, *sh) != (c.x, c.y, serial, shown)) {
+                rows = union(rows, was.filter(|w| w.2).map(|(o, ..)| (o.y, o.y + o.h)));
+                rows = union(rows, shown.then_some((c.y, c.y + c.h)));
+            }
+            self.cursor = Some((c, serial, shown));
         }
-        self.cursor = Some((c, serial, shown));
         let mut spots = vec![];
         if let Some((c, _, true)) = &self.cursor {
             spots.push((c.y, c.y + c.h));

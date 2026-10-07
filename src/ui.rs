@@ -1358,6 +1358,11 @@ impl<'a> Pill<'a> {
         spots.into_iter().min_by_key(|s| s.0).unwrap().1
     }
 
+    /// Whether a glide is under way (then it needs a step every tick).
+    pub fn gliding(&self) -> bool {
+        self.glide.is_some()
+    }
+
     /// Step the glide to the edge (ease-out, a quarter second).
     pub fn animate(&mut self, conn: &impl Connection) -> Res<()> {
         let Some((t0, (x0, y0), (x1, y1))) = self.glide else { return Ok(()) };

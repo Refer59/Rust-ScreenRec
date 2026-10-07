@@ -15,7 +15,7 @@ png = "0.18"
 # Capture, the launcher and its keyboard shortcut are X11 code.
 [target.'cfg(target_os = "linux")'.dependencies]
 ab_glyph = "0.2"
-x11rb = { version = "0.14", features = ["composite", "damage", "randr", "shm", "xfixes"] }
+x11rb = { version = "0.14", features = ["composite", "damage", "randr", "shm", "xfixes", "xinput"] }
 xkeysym = "0.2"
 
 [target.'cfg(windows)'.dependencies]

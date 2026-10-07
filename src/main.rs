@@ -788,6 +788,13 @@ fn pump_pill(cap: &mut Capture, pill: &mut Option<Pill>, paused: &mut Option<Ins
 enum Pill {}
 
 #[cfg(not(target_os = "linux"))]
+impl Pill {
+    fn gliding(&self) -> bool {
+        match *self {}
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
 fn pump_pill(_: &mut Capture, _: &mut Option<Pill>, _: &mut Option<Instant>, _: &mut Duration) -> Res<()> {
     Ok(())
 }
@@ -905,6 +912,8 @@ fn record(cap: &mut Capture, path: &Path, opts: &RecOpts, mut pill: Option<Pill>
     // region is set), so only that much is pinned for the GPU.
     let mut enc = Video::new(&cap.frame()[..w * h * 4], w, h, opts.fps.unwrap_or(60), opts.gpu)?;
     let fps = opts.fps.unwrap_or(if matches!(enc, Video::Cpu(_)) { 30 } else { 60 });
+    let tick = Duration::from_secs(1) / fps;
+    cap.set_tick(tick);
     let (w32, h32) = (w as i32, h as i32);
     match target {
         Target::Window(id, _) => {
@@ -945,7 +954,6 @@ fn record(cap: &mut Capture, path: &Path, opts: &RecOpts, mut pill: Option<Pill>
         }
         Ok(())
     };
-    let tick = Duration::from_secs(1) / fps;
     eprintln!(
         "{}",
         tr!(
@@ -980,12 +988,20 @@ fn record(cap: &mut Capture, path: &Path, opts: &RecOpts, mut pill: Option<Pill>
                 continue;
             }
             // At most `fps`, but otherwise capture the moment something changes:
-            // every frame of content up to `fps` gets caught, none twice. Waking
-            // at least once per tick re-checks the cursor, which moves without damage.
+            // every frame of content up to `fps` gets caught, none twice. Idle, the
+            // loop sleeps as long as the capture allows (a tick while it has to poll
+            // the cursor); a gliding pill needs every tick, audio a pump now and then.
             if let Some(d) = (last + tick).checked_duration_since(Instant::now()) {
                 std::thread::sleep(d);
             }
-            cap.wait(Some(tick))?;
+            let mut idle = cap.poll_interval();
+            if pill.as_ref().is_some_and(|p| p.gliding()) {
+                idle = idle.min(tick);
+            }
+            if sound.is_some() {
+                idle = idle.min(Duration::from_millis(100));
+            }
+            cap.wait(Some(idle))?;
             // Nothing changed -> no capture, no encode: a still screen costs ~0.
             let Some(rows) = cap.changed()? else { continue };
             last = Instant::now();

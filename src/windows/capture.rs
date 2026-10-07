@@ -135,6 +135,7 @@ pub struct Capture {
     tracking: bool,     // recording: the pointer goes into frames
     hot: (HCURSOR, i32, i32), // last cursor seen, with its hotspot
     follow: Option<Follow>,
+    tick: Duration, // the recording's frame interval (`set_tick`)
 }
 
 impl Capture {
@@ -171,6 +172,7 @@ impl Capture {
             tracking: false,
             hot: (null_mut(), 0, 0),
             follow: None,
+            tick: Duration::from_millis(16),
         })
     }
 
@@ -272,6 +274,17 @@ impl Capture {
     /// The followed window was closed.
     pub fn window_gone(&self) -> bool {
         self.follow.as_ref().is_some_and(|f| unsafe { IsWindow(f.hwnd) } == 0)
+    }
+
+    /// The recording's frame interval.
+    pub fn set_tick(&mut self, tick: Duration) {
+        self.tick = tick;
+    }
+
+    /// How long the recording loop may sleep when nothing happens: there are
+    /// no change events here, so one tick.
+    pub fn poll_interval(&self) -> Duration {
+        self.tick
     }
 
     /// No damage events: after a capture that found nothing, sleep `timeout`
