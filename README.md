@@ -1,24 +1,31 @@
 # Rust-ScreenRec
 
-Fast screenshots and screen recording for X11, written in Rust. Use it from the command line or from a launcher modelled on GNOME 42's screenshot UI.
+Fast screenshots and screen recording, written in Rust. On Linux (X11) use it from the command line or from a launcher modelled on GNOME 42's screenshot UI; Windows and macOS builds have the command line.
 
 ## Features
 
 - Capture a selection, the whole screen or a single window (a window keeps recording even while covered or moved)
-- H.264 video, encoded on the GPU with NVENC or on the CPU with x264
+- H.264 video, encoded on the GPU (NVENC, else VAAPI, Media Foundation or VideoToolbox through ffmpeg) or on the CPU with x264
 - Audio: system output, the recorded app only, and/or the microphone (Opus)
 - MKV or MP4 output, PNG or JPG screenshots
 - Only changed screen regions are processed, so CPU usage stays low
 
 ## Requirements
 
-- Linux with X11 (Wayland is not supported)
 - Rust (edition 2024)
+- Linux with X11. In a Wayland session only X11 apps' windows can be recorded (`rec --window`); screenshots and screen recordings say so instead of coming out black.
 - Optional, depending on what you use:
-  - NVIDIA driver for GPU encoding (falls back to the CPU if missing)
+  - NVIDIA driver for NVENC; otherwise `ffmpeg` with VAAPI (Intel, AMD) for the GPU, or the CPU
   - `ffmpeg` for CPU encoding and MP4 output
   - PulseAudio/PipeWire tools (`parec`, `pactl`) and `libopus` for audio
   - GNOME for the keyboard shortcut
+
+## Other systems
+
+- Windows 10/11: `shot` and `rec` (GDI capture of every monitor, `--window` with an HWND), NVENC or `ffmpeg` (Media Foundation, x264). No launcher or sound yet.
+- macOS 11+: `shot` and `rec` of the main display (no pointer yet), `ffmpeg` (VideoToolbox, x264). Allow your terminal in System Settings › Privacy & Security › Screen Recording. No launcher, window recording or sound yet.
+
+Neither has been tried on a real Windows PC or Mac yet: treat them as previews.
 
 ## Install
 
