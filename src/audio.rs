@@ -89,7 +89,7 @@ fn parec(target: &str, lag: i64) -> Res<Source> {
     std::thread::spawn(move || {
         let mut b = [0u8; FRAME * 4];
         while out.read_exact(&mut b).is_ok() {
-            let pcm = b.chunks_exact(2).map(|s| i16::from_le_bytes([s[0], s[1]])).collect();
+            let pcm = b.as_chunks::<2>().0.iter().map(|s| i16::from_le_bytes([s[0], s[1]])).collect();
             if tx.send((Instant::now(), pcm)).is_err() {
                 break;
             }

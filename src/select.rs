@@ -126,7 +126,7 @@ impl Overlay {
         let dim = |v: u8| (v as u16 * 140 / 255) as u8;
         for y in y0..y1 {
             let row = &self.frozen[(y as usize * self.w + x0 as usize) * 4..][..rw * 4];
-            for (x, p) in (x0..).zip(row.chunks_exact(4)) {
+            for (x, p) in (x0..).zip(row.as_chunks::<4>().0) {
                 match area {
                     Some(a) if contains(a, x, y) => out.extend_from_slice(p),
                     Some(a) if contains((a.0 - BORDER, a.1 - BORDER, a.2 + BORDER, a.3 + BORDER), x, y) => {

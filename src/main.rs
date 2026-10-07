@@ -210,7 +210,7 @@ fn save_image(screen: &[u8], sw: usize, r: Rect, cursor: Option<&Sprite>, path: 
         jpg.encode(&img, w as u16, h as u16, jpeg_encoder::ColorType::Bgra)?; // the 4th byte is ignored
         return Ok(());
     }
-    let rgb: Vec<u8> = img.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]).collect();
+    let rgb: Vec<u8> = img.as_chunks::<4>().0.iter().flat_map(|p| [p[2], p[1], p[0]]).collect();
     let mut png = png::Encoder::new(std::fs::File::create(path)?, w as u32, h as u32);
     png.set_color(png::ColorType::Rgb);
     png.set_compression(png::Compression::Fast);
