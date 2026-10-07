@@ -1,6 +1,6 @@
 //! The frozen screen behind the launcher, as in GNOME: the screen as it was
 //! when we started, dimmed except for the area being picked (a selection with
-//! a border and corner handles, the window under the pointer, or all of it).
+//! viewfinder brackets at its corners, the window under the pointer, or all of it).
 //! Screenshots are cut from this same image, so our UI is never in them.
 
 use crate::Res;
@@ -11,12 +11,16 @@ use x11rb::wrapper::ConnectionExt as _;
 
 pub use crate::frame::Rect;
 
-const HANDLE: i32 = 11; // corner handle radius
-const ACCENT: [u8; 3] = [0x4D, 0x7A, 0xFF]; // tangerine #FF7A4D, BGR
+const HANDLE: i32 = 14; // a press this near a corner (plus 4 px) grabs it
 
-/// Border width in device pixels.
-fn border(scale: f32) -> i32 {
-    ((2.0 * scale).round() as i32).max(1)
+/// Border width in device pixels: a hairline round a selection, 2 px round a window.
+fn border(scale: f32, handles: bool) -> i32 {
+    (((if handles { 1.0 } else { 2.0 }) * scale).round() as i32).max(1)
+}
+
+/// The corner brackets' thickness and arm length in device pixels.
+fn bracket(scale: f32) -> (i32, i32) {
+    (((3.0 * scale).round() as i32).max(2), (24.0 * scale).round() as i32)
 }
 
 fn union(a: Option<Rect>, b: Option<Rect>) -> Option<Rect> {
@@ -93,7 +97,7 @@ impl Overlay {
             return Ok(());
         }
         let reach = |(a, hd): (Option<Rect>, bool)| {
-            let m = if hd { (11.0 * self.scale).ceil() as i32 + 3 } else { border(self.scale) + 2 };
+            let m = if hd { bracket(self.scale).0 } else { border(self.scale, false) } + 2;
             a.map(|r| (r.0 - m, r.1 - m, r.2 + m, r.3 + m))
         };
         let dirty = union(reach(self.shown), reach((area, handles)));
@@ -129,35 +133,40 @@ impl Overlay {
     fn render(&self, (x0, y0, x1, y1): Rect) -> Vec<u8> {
         let (area, handles) = self.shown;
         let (rw, sc) = ((x1 - x0) as usize, self.scale);
-        let bw = border(sc);
+        let bw = border(sc, handles);
         let mut out = Vec::with_capacity(rw * (y1 - y0) as usize * 4);
         let dim = |v: u8| (v as u16 * 140 / 255) as u8;
         let edge = |v: u8| (dim(v) as u16 * 65 / 100) as u8; // black at 35% over the dim
+        let lift = if handles { 55 } else { 90 }; // the border: white at this % over the dim
+        let white = |v: u8| (dim(v) as u16 + (255 - dim(v) as u16) * lift / 100) as u8;
         let grow = |a: Rect, m: i32| (a.0 - m, a.1 - m, a.2 + m, a.3 + m);
         for y in y0..y1 {
             let row = &self.frozen[(y as usize * self.w + x0 as usize) * 4..][..rw * 4];
             for (x, p) in (x0..).zip(row.as_chunks::<4>().0) {
                 match area {
                     Some(a) if contains(a, x, y) => out.extend_from_slice(p),
-                    Some(a) if contains(grow(a, bw), x, y) => out.extend_from_slice(&[ACCENT[0], ACCENT[1], ACCENT[2], 0]),
+                    Some(a) if contains(grow(a, bw), x, y) => out.extend_from_slice(&[white(p[0]), white(p[1]), white(p[2]), 0]),
                     Some(a) if contains(grow(a, bw + 1), x, y) => out.extend_from_slice(&[edge(p[0]), edge(p[1]), edge(p[2]), 0]),
                     _ => out.extend_from_slice(&[dim(p[0]), dim(p[1]), dim(p[2]), 0]),
                 }
             }
         }
+        // Viewfinder brackets just outside the corners, nudged inside where the screen ends.
         if let (Some(a), true) = (area, handles) {
-            let reach = (11.0 * sc).ceil() as i32 + 3;
-            let disc = |d: f32, r: f32, soft: f32| ((r + soft / 2.0 - d) / soft).clamp(0.0, 1.0);
-            for (cx, cy) in [(a.0, a.1), (a.2, a.1), (a.0, a.3), (a.2, a.3)] {
-                for y in (cy - reach).max(y0)..(cy + reach).min(y1) {
-                    for x in (cx - reach).max(x0)..(cx + reach).min(x1) {
-                        let d = ((x - cx) as f32 + 0.5).hypot((y - cy) as f32 + 0.5);
-                        let (shadow, ring, fill) = (0.28 * disc(d, 10.5 * sc, 1.5), disc(d, 9.0 * sc, 1.0), disc(d, 6.5 * sc, 1.0));
-                        let i = ((y - y0) as usize * rw + (x - x0) as usize) * 4;
-                        for (v, acc) in out[i..i + 3].iter_mut().zip(ACCENT) {
-                            let c = *v as f32 * (1.0 - shadow);
-                            let c = c + (acc as f32 - c) * ring;
-                            *v = (c + (255.0 - c) * fill).round() as u8;
+            let (t, l) = bracket(sc);
+            let span = |c: i32, dir: i32, len: i32, lim: i32| match dir {
+                1 => ((c - t).max(0), (c - t).max(0) + len),
+                _ => ((c + t).min(lim) - len, (c + t).min(lim)),
+            };
+            let (w, h) = (self.w as i32, self.h as i32);
+            for (cx, cy, dx, dy) in [(a.0, a.1, 1, 1), (a.2, a.1, -1, 1), (a.0, a.3, 1, -1), (a.2, a.3, -1, -1)] {
+                let across = (span(cx, dx, l, w), span(cy, dy, t, h));
+                let down = (span(cx, dx, t, w), span(cy, dy, l, h));
+                for ((bx0, bx1), (by0, by1)) in [across, down] {
+                    for y in by0.max(y0)..by1.min(y1) {
+                        for x in bx0.max(x0)..bx1.min(x1) {
+                            let i = ((y - y0) as usize * rw + (x - x0) as usize) * 4;
+                            out[i..i + 3].fill(255);
                         }
                     }
                 }
