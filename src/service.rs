@@ -185,11 +185,14 @@ pub fn download(url: &str, dest: &Path) -> Res<()> {
     Ok(std::fs::rename(&part, dest)?)
 }
 
-/// Unpack the .tgz or .zip `archive` into `dir` with the system's tar (GNU
-/// tar on Linux, bsdtar on macOS and Windows 10+, which reads .zip too).
-pub fn unpack(archive: &Path, dir: &Path) -> Res<()> {
+/// Unpack `members` (their names exactly as the archive lists them; all of it
+/// if none) of the .tgz or .zip `archive` into `dir`, with the system's tar
+/// (GNU tar on Linux, bsdtar on macOS and Windows 10+, which reads .zip too).
+/// Name only what is needed: ONNX Runtime's Windows zip holds a 420 MB .pdb
+/// next to its 16 MB DLL, its macOS tgz a 73 MB dSYM.
+pub fn unpack(archive: &Path, dir: &Path, members: &[&str]) -> Res<()> {
     std::fs::create_dir_all(dir)?;
-    let st = tar().arg("-xf").arg(archive).arg("-C").arg(dir).stdin(Stdio::null()).status();
+    let st = tar().arg("-xf").arg(archive).arg("-C").arg(dir).args(members).stdin(Stdio::null()).status();
     if st.map_err(|_| tr!("unpacking needs tar", "para descomprimir hace falta tar", "展開には tar が必要です"))?.success() {
         Ok(())
     } else {
@@ -241,10 +244,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let file_url = |p: &Path| format!("file:///{}", p.display().to_string().replace('\\', "/").trim_start_matches('/'));
         std::fs::write(dir.join("model.bin"), "ñ 日本語").unwrap();
-        assert!(tar().arg("-cf").arg(dir.join("a.tar")).arg("-C").arg(&dir).arg("model.bin").status().unwrap().success());
+        std::fs::write(dir.join("symbols.pdb"), "big").unwrap();
+        assert!(tar().arg("-cf").arg(dir.join("a.tar")).arg("-C").arg(&dir).args(["model.bin", "symbols.pdb"]).status().unwrap().success());
         download(&file_url(&dir.join("a.tar")), &dir.join("got.tar")).unwrap();
-        unpack(&dir.join("got.tar"), &dir.join("out")).unwrap();
+        unpack(&dir.join("got.tar"), &dir.join("out"), &["model.bin"]).unwrap();
         assert_eq!(std::fs::read_to_string(dir.join("out/model.bin")).unwrap(), "ñ 日本語");
+        assert!(!dir.join("out/symbols.pdb").exists(), "only the members asked for");
         assert!(download(&file_url(&dir.join("missing")), &dir.join("no.bin")).is_err());
         assert!(!dir.join("no.bin").exists() && !dir.join("no.bin.part").exists());
         std::fs::remove_dir_all(&dir).unwrap();
