@@ -150,7 +150,7 @@ fn rec(args: &[String]) -> Res<()> {
     let rec_path = if mp4 { path.with_extension("rec.mkv") } else { path.clone() }; // MP4 comes out of the MKV at the end
     let mut cap = Capture::new()?;
     let target = match window {
-        Some(w) => Target::Window(w, cap.window_area(w).ok_or(tr!("that window is not visible on screen", "esa ventana no se ve en pantalla", "そのウィンドウは画面に表示されていません"))?),
+        Some(w) => Target::Window(w, cap.window_area(w)?),
         None => Target::Area((0, 0, cap.sw as i32, cap.sh as i32)),
     };
     record(&mut cap, &rec_path, &opts, None, None, target)?;

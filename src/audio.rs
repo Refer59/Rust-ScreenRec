@@ -29,6 +29,7 @@ pub enum Output {
     Window,
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // the launcher's sound picker
 pub const OUTPUTS: [Output; 3] = [Output::None, Output::System, Output::Window];
 
 /// libopus, loaded at run time: without it we record without sound.

@@ -294,9 +294,10 @@ impl Capture {
         Ok(())
     }
 
-    /// Where window `id` shows on screen (frame included, shadows not), if it does.
-    pub fn window_area(&self, id: u32) -> Option<Rect> {
-        crate::select::Ewmh::new(self).visible(self, id)
+    /// Where window `id` shows on screen (frame included, shadows not).
+    pub fn window_area(&self, id: u32) -> Res<Rect> {
+        let hidden = || tr!("that window is not visible on screen", "esa ventana no se ve en pantalla", "そのウィンドウは画面に表示されていません").into();
+        crate::select::Ewmh::new(self).visible(self, id).ok_or_else(hidden)
     }
 
     /// The followed window was closed.

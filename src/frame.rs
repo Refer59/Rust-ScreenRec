@@ -24,6 +24,7 @@ impl Sprite {
             .filter(|(p, ..)| p >> 24 != 0)
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // X11 un-blending
     pub fn covers(&self, x: i32, y: i32) -> bool {
         let (x, y) = (x - self.x, y - self.y);
         x >= 0 && y >= 0 && x < self.w && y < self.h && self.argb[(y * self.w + x) as usize] >> 24 != 0
@@ -47,6 +48,7 @@ impl View {
     }
 
     /// Screen rows this frame covers.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // X11 damage tracking
     pub fn rows(&self) -> Rows {
         (self.y0, self.y0 + self.h as i32)
     }

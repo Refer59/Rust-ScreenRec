@@ -70,8 +70,8 @@ impl Capture {
         Err(tr!("recording a single window isn't available on this system yet", "grabar una sola ventana aún no está disponible en este sistema", "この環境ではまだ単一ウィンドウを録画できません").into())
     }
 
-    pub fn window_area(&self, _id: u32) -> Option<Rect> {
-        None
+    pub fn window_area(&self, _id: u32) -> Res<Rect> {
+        Err(tr!("recording a single window isn't available on this system yet", "grabar una sola ventana aún no está disponible en este sistema", "この環境ではまだ単一ウィンドウを録画できません").into())
     }
 
     pub fn window_gone(&self) -> bool {
