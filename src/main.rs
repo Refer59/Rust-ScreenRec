@@ -102,7 +102,7 @@ fn main() {
     if let Err(e) = res {
         eprintln!("error: {e}");
         if args.is_empty() {
-            notify("screenrec: error", &e.to_string(), None); // the GUI has no terminal
+            notify(&tr!("screenrec ran into a problem", "screenrec tuvo un problema", "screenrec で問題が発生しました"), &e.to_string(), None); // the GUI has no terminal
         }
         std::process::exit(1);
     }
@@ -516,7 +516,7 @@ fn gui() -> Res<()> {
                             (set.capturing, restyle) = (false, true);
                         } else if let Some(a) = shortcut::accel(sym, e.state.into()) {
                             if let Err(err) = shortcut::set(&a) {
-                                notify(&tr!("screenrec: could not change the shortcut", "screenrec: no se pudo cambiar el atajo", "screenrec: ショートカットを変更できませんでした"), &err.to_string(), None);
+                                notify(&tr!("Couldn't change the shortcut", "No se pudo cambiar el atajo", "ショートカットを変更できませんでした"), &err.to_string(), None);
                             }
                             (set.shortcut, set.capturing, restyle) = (shortcut_now(), false, true);
                         }
@@ -577,7 +577,7 @@ fn shutter(mut cap: Capture, ov: &select::Overlay, windows: &[&ui::Win], target:
     if !last.record {
         let path = default_path("PICTURES", &shot_prefix(), if last.jpg { "jpg" } else { "png" });
         save_image(ov.frozen(), cap.sw, r, last.pointer.then_some(cursor), &path)?;
-        notify(&tr!("Screenshot saved", "Captura guardada", "スクリーンショットを保存しました"), &path.display().to_string(), Some(&path));
+        notify(&tr!("Screenshot saved", "Captura guardada", "スクリーンショットを保存しました"), &tilde(&path), Some(&path));
         return Ok(());
     }
     cap.conn.unmap_window(ov.win)?;
@@ -593,12 +593,12 @@ fn shutter(mut cap: Capture, ov: &select::Overlay, windows: &[&ui::Win], target:
     record(&mut cap, &path, &opts, Some(pill), Some(windows[0].sprite()), target)?;
     let path = match last.mp4 {
         true => to_mp4(&path, &path.with_extension("mp4")).unwrap_or_else(|e| {
-            notify(&tr!("screenrec: kept as MKV", "screenrec: quedó en MKV", "screenrec: MKV のまま保存しました"), &e.to_string(), None);
+            notify(&tr!("Saved as MKV instead", "Se guardó como MKV", "MKV のまま保存しました"), &e.to_string(), None);
             path
         }),
         false => path,
     };
-    notify(&tr!("Recording saved", "Grabación guardada", "録画を保存しました"), &path.display().to_string(), None);
+    notify(&tr!("Recording saved", "Grabación guardada", "録画を保存しました"), &tilde(&path), None);
     Ok(())
 }
 
@@ -704,7 +704,7 @@ impl Video {
         let other = if gpu { x264::gpu(w, h, fps) } else { None };
         if let Some(e) = failed {
             let with = other.map_or_else(|| tr!("the CPU", "el CPU", "CPU"), |c| c.name.to_owned());
-            notify(&tr!("screenrec: NVENC failed, recording with {}", "screenrec: NVENC falló, grabando con {}", "screenrec: NVENC が失敗したため {} で録画します", with), &e.to_string(), None);
+            notify(&tr!("NVENC unavailable, recording with {}", "NVENC no disponible: grabando con {}", "NVENC が使えないため {} で録画しています", with), &e.to_string(), None);
         }
         Ok(match other {
             Some(c) => Video::GpuFfmpeg(x264::Encoder::new(c, w, h, fps)?),
@@ -792,7 +792,7 @@ fn record(cap: &mut Capture, path: &Path, opts: &RecOpts, mut pill: Option<Pill>
     // A video without sound beats no video: audio trouble only gets reported.
     let mut sound = opts.sound.and_then(|(output, mic, app)| {
         audio::Audio::start(output, mic, app).unwrap_or_else(|e| {
-            notify(&tr!("screenrec: recording without sound", "screenrec: grabando sin sonido", "screenrec: 音声なしで録画します"), &e.to_string(), None);
+            notify(&tr!("Recording without sound", "Grabando sin sonido", "音声なしで録画しています"), &e.to_string(), None);
             None
         })
     });
@@ -892,6 +892,15 @@ fn record(cap: &mut Capture, path: &Path, opts: &RecOpts, mut pill: Option<Pill>
         eprintln!("{frames} frames, {:.1} s, {mb:.1} MB -> {}", end as f64 / 1000.0, path.display());
     }
     res
+}
+
+/// `path` with the home folder written `~`, for messages.
+fn tilde(path: &Path) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    match path.strip_prefix(&home) {
+        Ok(rest) if !home.is_empty() => format!("~/{}", rest.display()),
+        _ => path.display().to_string(),
+    }
 }
 
 fn shot_prefix() -> String {
