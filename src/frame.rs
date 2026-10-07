@@ -78,6 +78,26 @@ pub fn draw(f: &mut [u8], v: View, s: &Sprite) {
     }
 }
 
+/// The w×h BGRX image whose rows are `stride` bytes apart, as a PNG file
+/// (RGB, fast compression), for clipboards that take one.
+#[cfg(not(windows))] // Windows' clipboard takes a DIB
+pub fn png(bgrx: &[u8], w: usize, h: usize, stride: usize) -> crate::Res<Vec<u8>> {
+    let mut rgb = Vec::with_capacity(w * h * 3);
+    for y in 0..h {
+        for p in bgrx[y * stride..][..w * 4].as_chunks::<4>().0 {
+            rgb.extend_from_slice(&[p[2], p[1], p[0]]);
+        }
+    }
+    let mut out = Vec::new();
+    let mut png = png::Encoder::new(&mut out, w as u32, h as u32);
+    png.set_color(png::ColorType::Rgb);
+    png.set_compression(png::Compression::Fast);
+    let mut wr = png.write_header()?;
+    wr.write_image_data(&rgb)?;
+    wr.finish()?;
+    Ok(out)
+}
+
 /// The rows where two frames (rows of `row_bytes`) differ, for backends that
 /// get no damage events and compare each capture with the last one.
 #[cfg_attr(target_os = "linux", allow(dead_code))] // X11 has DAMAGE

@@ -94,6 +94,8 @@ fn main() {
         Some("shot") => shot(args.get(1)),
         Some("rec") => rec(&args[1..]),
         Some("install") => install(),
+        #[cfg(target_os = "linux")]
+        Some(desktop::CLIP_OWNER) => desktop::own_clipboard(args.get(1)),
         _ => {
             eprintln!("{}", usage());
             std::process::exit(2);
