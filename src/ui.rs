@@ -506,10 +506,10 @@ fn icon_gear(c: &mut Canvas, cx: f32, cy: f32, col: Rgba, bg: Rgba) {
     c.paint(bg, circle(cx, cy, 4.2));
 }
 
-type ShadowKey = (usize, usize, u32, u32, u32);
+type ShadowKey = (usize, usize, u32, u32, u32, u32);
 
 thread_local! {
-    /// Rendered shadows (alpha only), by canvas size and card: they never change, so frames just copy them.
+    /// Rendered shadows (alpha only), by canvas size, card and scale: they never change, so frames just copy them.
     static SHADOWS: std::cell::RefCell<Vec<(ShadowKey, Vec<u8>)>> = const { std::cell::RefCell::new(Vec::new()) };
     /// Settled cards (shadow, body and hairline, opaque and at rest), by canvas size, card
     /// and scale: every frame after the appear animation starts from a copy of one.
@@ -520,7 +520,7 @@ type CardKey = (usize, usize, u32, u32, u32, u32);
 /// The soft shadow under a `w`×`h` body of radius `r`, drawn first on a still empty canvas.
 fn shadow(c: &mut Canvas, w_: f32, h_: f32, r: f32) {
     let (w, h) = (w_, h_);
-    let key = (c.w, c.h, w.to_bits(), h.to_bits(), c.scale.to_bits());
+    let key = (c.w, c.h, w.to_bits(), h.to_bits(), r.to_bits(), c.scale.to_bits());
     SHADOWS.with_borrow_mut(|cache| {
         if !cache.iter().any(|e| e.0 == key) {
             let mut t = Canvas { w: c.w, h: c.h, px: vec![0; c.w * c.h], scale: c.scale, alpha: 1.0, origin: (M, M) };
@@ -617,21 +617,26 @@ pub const PANEL_ORDER: [Hit; 8] = [Hit::Mode(Mode::Selection), Hit::Mode(Mode::S
 
 // Panel geometry, in logical px. The body sits in a transparent margin for its shadow.
 const M: f32 = 24.0;
-const BODY: (f32, f32) = (400.0, 164.0);
-const BODY_R: f32 = 32.0;
-const PW: usize = 448;
-const PH: usize = 212;
+const BODY: (f32, f32) = (320.0, 147.0); // PAD + the strip + 3 + the shutter's hit (68) + 2 PAD under it
+const BODY_R: f32 = 16.0;
+/// The body's inner padding around the controls (their hit areas): twice that under the shutter.
+const PAD: f32 = 12.0;
+const PW: usize = 368;
+const PH: usize = 195;
 const SBODY: (f32, f32) = (340.0, 478.0);
-const SBODY_R: f32 = 28.0;
+const SBODY_R: f32 = 14.0;
 pub const SW: usize = 388; // the settings popover, logical px
 pub const SH: usize = 526;
-/// Each mode word's cell: a third of the strip, 75 tall (as big as the old 110×88 tiles).
-const CELL: (f32, f32) = ((BODY.0 - 12.0) / 3.0, 75.0);
-const ROW: f32 = 118.0; // the bottom row's centre: photo|video, shutter, gear
+/// Each mode word's cell: a third of the strip, 40 tall.
+const CELL: (f32, f32) = ((BODY.0 - 2.0 * PAD) / 3.0, 40.0);
+const ROW: f32 = 89.0; // the bottom row's centre: photo|video, shutter, gear
 const SHUTTER: (f32, f32) = (BODY.0 / 2.0, ROW);
+/// photo|video and the gear sit under the outer mode words.
+const SEG: f32 = SHUTTER.0 - CELL.0;
+const GEAR: f32 = SHUTTER.0 + CELL.0;
 
 fn cell_x(i: usize) -> f32 {
-    6.0 + CELL.0 * i as f32
+    PAD + CELL.0 * i as f32
 }
 
 /// What a control looks like (and where its focus ring goes).
@@ -639,12 +644,12 @@ fn shape_of(h: Hit) -> Geo {
     match h {
         Hit::Mode(m) => {
             let x = cell_x(MODES.iter().position(|&n| n == m).unwrap());
-            Geo::Rect(x, 6.0, x + CELL.0, 6.0 + CELL.1, 22.0)
+            Geo::Rect(x, PAD, x + CELL.0, PAD + CELL.1, 11.0)
         }
-        Hit::Shot => Geo::Rect(39.0, ROW - 17.0, 82.0, ROW + 17.0, 17.0),
-        Hit::Cast => Geo::Rect(82.0, ROW - 17.0, 125.0, ROW + 17.0, 17.0),
+        Hit::Shot => Geo::Rect(SEG - 43.0, ROW - 17.0, SEG, ROW + 17.0, 7.0),
+        Hit::Cast => Geo::Rect(SEG, ROW - 17.0, SEG + 43.0, ROW + 17.0, 7.0),
         Hit::Shutter => Geo::Disc(SHUTTER.0, SHUTTER.1, 31.0),
-        Hit::Settings => Geo::Disc(BODY.0 - 82.0, ROW, 20.0),
+        Hit::Settings => Geo::Disc(GEAR, ROW, 20.0),
         Hit::Close => Geo::Disc(BODY.0 - 4.0, 4.0, 14.0),
     }
 }
@@ -652,10 +657,10 @@ fn shape_of(h: Hit) -> Geo {
 /// Where a control answers clicks: its look, a little bigger for the small ones.
 fn hit_of(h: Hit) -> Geo {
     match h {
-        Hit::Shot => Geo::Rect(34.0, ROW - 22.0, 82.0, ROW + 22.0, 22.0),
-        Hit::Cast => Geo::Rect(82.0, ROW - 22.0, 130.0, ROW + 22.0, 22.0),
+        Hit::Shot => Geo::Rect(SEG - 48.0, ROW - 22.0, SEG, ROW + 22.0, 11.0),
+        Hit::Cast => Geo::Rect(SEG, ROW - 22.0, SEG + 48.0, ROW + 22.0, 11.0),
         Hit::Shutter => Geo::Disc(SHUTTER.0, SHUTTER.1, 34.0),
-        Hit::Settings => Geo::Disc(BODY.0 - 82.0, ROW, 25.0),
+        Hit::Settings => Geo::Disc(GEAR, ROW, 25.0),
         Hit::Close => Geo::Disc(BODY.0 - 4.0, 4.0, 18.0),
         _ => shape_of(h),
     }
@@ -663,14 +668,15 @@ fn hit_of(h: Hit) -> Geo {
 
 /// Canvas size in device px, and the canvas's top-left for the panel and the
 /// settings popover on a `sw`×`sh` screen: the panel body 48 px above the
-/// bottom, the popover body 36 px above it (its transparent margin then
-/// clears the panel's overhanging close button), both centred.
+/// bottom, the popover body 18 px above it, both centred. The popover's
+/// transparent margin then overhangs the panel's close button; main.rs passes
+/// what lands there on to the panel.
 pub fn place(sw: i32, sh: i32, scale: f32) -> ((i32, i32), (i32, i32)) {
     let s = |v: f32| v * scale;
     let px = (sw as f32 - s(BODY.0)) / 2.0 - s(M);
     let body_top = sh as f32 - s(48.0) - s(BODY.1);
     let mx = (sw as f32 - s(SBODY.0)) / 2.0 - s(M);
-    let my = body_top - s(36.0) - s(SBODY.1) - s(M);
+    let my = body_top - s(18.0) - s(SBODY.1) - s(M);
     ((px.round() as i32, (body_top - s(M)).round() as i32), (mx.round() as i32, my.round() as i32))
 }
 
@@ -763,17 +769,17 @@ pub fn panel(s: &PanelState) -> Canvas {
         c.paint(fade(WHITE, 0.06 * h), rrect(x0, y0, x1, y1, r));
         if let Some(f) = s.bold.or(s.font) {
             let (word, px, track) = caps(&mode_name(m), 13.0);
-            c.spaced(f, &word, px, (mid(i as f32), 44.0), 0.5, (track, false), mix(mix(TEXT2, TEXT, h), YELLOW, sel));
+            c.spaced(f, &word, px, (mid(i as f32), PAD + 18.0), 0.5, (track, false), mix(mix(TEXT2, TEXT, h), YELLOW, sel));
         }
     }
-    c.paint(YELLOW, circle(mid(idx), 55.0, 2.5));
+    c.paint(YELLOW, circle(mid(idx), PAD + 29.0, 2.5)); // word and dot centred in the cell
 
     // photo | video
-    c.paint(WELL, rrect(36.0, ROW - 20.0, 128.0, ROW + 20.0, 20.0));
-    c.paint(THUMB, rrect(39.0 + 43.0 * rec, ROW - 17.0, 82.0 + 43.0 * rec, ROW + 17.0, 17.0));
+    c.paint(WELL, rrect(SEG - 46.0, ROW - 20.0, SEG + 46.0, ROW + 20.0, 10.0));
+    c.paint(THUMB, rrect(SEG - 43.0 + 43.0 * rec, ROW - 17.0, SEG + 43.0 * rec, ROW + 17.0, 7.0)); // concentric: the well's 10 less its 3 px inset
     let on = |h: Hit, w: f32| mix(mix(TEXT2, TEXT, hv(h)), TEXT, w);
-    icon_camera(&mut c, 60.5, ROW, on(Hit::Shot, 1.0 - rec), mix(WELL, THUMB, 1.0 - rec));
-    c.scaled((103.5, ROW), 0.9, |c| icon_video(c, 0.0, 0.0, on(Hit::Cast, rec)));
+    icon_camera(&mut c, SEG - 21.5, ROW, on(Hit::Shot, 1.0 - rec), mix(WELL, THUMB, 1.0 - rec));
+    c.scaled((SEG + 21.5, ROW), 0.9, |c| icon_video(c, 0.0, 0.0, on(Hit::Cast, rec)));
 
     // the shutter: white for a photo, red for video; the disc draws in a little under the pointer
     let (sx, sy) = SHUTTER;
@@ -836,11 +842,11 @@ const ROW_POINTER: f32 = 318.0;
 const ROW_KEY: f32 = 366.0;
 const SEG_LANG: (f32, f32) = (426.0, 458.0);
 
-/// Cell `i` of `n` across x0..x1 and y0..y1; `inset` 3 gives the thumb.
+/// Cell `i` of `n` across x0..x1 and y0..y1; `inset` 3 gives the thumb, its corners concentric with the well's.
 fn cell(x0: f32, x1: f32, (y0, y1): (f32, f32), n: usize, i: usize, inset: f32) -> Geo {
     let w = (x1 - x0) / n as f32;
     let (l, t) = (x0 + w * i as f32 + inset, y0 + inset);
-    Geo::Rect(l, t, l + w - 2.0 * inset, y1 - inset, (y1 - y0) / 2.0 - inset)
+    Geo::Rect(l, t, l + w - 2.0 * inset, y1 - inset, (y1 - y0) / 4.0 - inset)
 }
 
 fn pick_y(cy: f32) -> (f32, f32) {
@@ -848,7 +854,7 @@ fn pick_y(cy: f32) -> (f32, f32) {
 }
 
 fn row_rect(cy: f32) -> Geo {
-    Geo::Rect(8.0, cy - 18.0, 332.0, cy + 18.0, 12.0)
+    Geo::Rect(8.0, cy - 18.0, 332.0, cy + 18.0, 6.0)
 }
 
 fn switch_geo(cy: f32) -> Geo {
@@ -866,7 +872,7 @@ fn set_shape(h: SetHit) -> Geo {
         SetHit::Mic => switch_geo(ROW_MIC),
         SetHit::Gpu => switch_geo(ROW_GPU),
         SetHit::Pointer => switch_geo(ROW_POINTER),
-        SetHit::Shortcut => Geo::Rect(196.0, 350.0, 320.0, 382.0, 16.0),
+        SetHit::Shortcut => Geo::Rect(196.0, 350.0, 320.0, 382.0, 8.0),
     }
 }
 
@@ -1516,9 +1522,16 @@ mod preview {
                 ("screen-gear", panel_state(Mode::Screen, false, Some(Hit::Mode(Mode::Window)), true, None)),
                 ("focus", panel_state(Mode::Selection, true, None, false, Some(Hit::Mode(Mode::Screen)))),
                 ("focus-shutter", panel_state(Mode::Screen, false, None, false, Some(Hit::Shutter))),
+                ("focus-window", panel_state(Mode::Screen, false, Some(Hit::Close), false, Some(Hit::Mode(Mode::Window)))),
                 ("mid", mid),
                 ("appear", fresh),
             ];
+            // Every mode word fits its cell with room to spare.
+            for m in MODES {
+                let (word, px, track) = caps(&mode_name(m), 13.0);
+                let w = spaced_width(fonts.1.or(font).unwrap(), &word, px, track, false);
+                assert!(w <= CELL.0 - 16.0, "{word}: {w} of {}", CELL.0);
+            }
             for (name, s) in &panels {
                 let c = panel(s);
                 save(&dir, &format!("panel-{name}-{tag}"), c.w, c.h, &c.px, bg);
@@ -1580,13 +1593,21 @@ mod preview {
                 save(&dir, &format!("badge-{w}x{h}-{tag}"), c.w, c.h, &c.px, bg);
             }
         }
+        // At 1x too: the panel at rest and with the focus by the close button, and the settings.
+        for (lang, tag) in [(Lang::En, "en"), (Lang::Es, "es"), (Lang::Ja, "ja")] {
+            i18n::set(lang);
+            let fonts = if lang == Lang::Ja { (ja.as_ref(), ja.as_ref()) } else { (latin.as_ref(), bold.as_ref()) };
+            for (name, focus) in [("shot", None), ("focus-window", Some(Hit::Mode(Mode::Window)))] {
+                let mut s = PanelState::new(Mode::Selection, false, fonts, 1.0);
+                s.focus = focus;
+                s.settle();
+                let c = panel(&s);
+                save(&dir, &format!("panel-{name}-{tag}-1x"), c.w, c.h, &c.px, bg);
+            }
+            let c = settings(&set_state(fonts, if lang == Lang::Ja { None } else { ja.as_ref() }, 1.0));
+            save(&dir, &format!("settings-default-{tag}-1x"), c.w, c.h, &c.px, bg);
+        }
         i18n::set(Lang::En);
-        let c = panel(&{
-            let mut s = PanelState::new(Mode::Selection, false, (latin.as_ref(), bold.as_ref()), 1.0);
-            s.settle();
-            s
-        });
-        save(&dir, "panel-shot-en-1x", c.w, c.h, &c.px, bg);
     }
 
     /// `cargo test --release timing -- --ignored --nocapture`
@@ -1610,6 +1631,18 @@ mod preview {
             }).fold(f64::MAX, f64::min) // best of ten: the machine is shared
         };
         println!("panel {:.2} ms, settings {:.2} ms", time(&|| panel(&p)), time(&|| settings(&s)));
+    }
+
+    #[test]
+    fn settled_cards_are_copied_exactly() {
+        for scale in [1.0, 1.25] {
+            let mut p = PanelState::new(Mode::Selection, false, (None, None), scale);
+            p.settle();
+            let s = set_state((None, None), None, scale);
+            // The first frame paints each card and keeps it, the second copies it.
+            assert!(panel(&p).px == panel(&p).px && settings(&s).px == settings(&s).px);
+            CARDS.with_borrow(|cache| assert_eq!(cache.iter().filter(|e| e.0.5 == scale.to_bits()).count(), 2));
+        }
     }
 
     #[test]
