@@ -319,7 +319,20 @@ impl Keymap {
 #[cfg(target_os = "linux")]
 const KEY_ESCAPE: u32 = 0xff1b;
 #[cfg(target_os = "linux")]
+const KEY_TAB: u32 = 0xff09;
+#[cfg(target_os = "linux")]
+const KEYS_PREV: [u32; 5] = [0xfe20, 0xff51, 0xff52, 0xff96, 0xff97]; // ISO_Left_Tab, Left, Up, KP_Left, KP_Up
+#[cfg(target_os = "linux")]
+const KEYS_NEXT: [u32; 4] = [0xff53, 0xff54, 0xff98, 0xff99]; // Right, Down, KP_Right, KP_Down
+#[cfg(target_os = "linux")]
 const KEY_ENTERS: [u32; 3] = [0xff0d, 0xff8d, 0x20]; // Return, KP_Enter, space
+
+/// A control being activated: a click and Enter on the focus ring do the same.
+#[cfg(target_os = "linux")]
+enum Press {
+    Panel(Hit),
+    Settings(SetHit),
+}
 
 /// The desktop's UI scale: Xft.dpi / 96 (GNOME's text scaling sets it), else 1.
 #[cfg(target_os = "linux")]
@@ -381,7 +394,16 @@ fn gui() -> Res<()> {
     st.window = name_of(&cap, hovered);
     st.reveal();
     let ((px, py), (mx, my)) = ui::place(sw, sh, scale);
-    let mask = EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::POINTER_MOTION | EventMask::LEAVE_WINDOW;
+    let mask = EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION | EventMask::LEAVE_WINDOW;
+    // The size badge sits under the panel in the stack (made first); only Selection shows it.
+    let gap = (14.0 * scale).round() as i32; // clear of the corner handle
+    let badge_for = |r: Rect| {
+        let c = ui::badge(r.2 - r.0, r.3 - r.1, font(), scale);
+        (ui::badge_pos(r, (c.w as i32, c.h as i32), (sw, sh), gap), c)
+    };
+    let ((bx, by), bc) = badge_for(last.sel);
+    let mut badge = ui::Win::new(&cap, bx, by, bc, EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION)?;
+    let mut badge_at = (last.mode == Mode::Selection).then_some(last.sel); // what it shows, if mapped
     let mut panel = ui::Win::new(&cap, px, py, ui::panel(&st), mask)?;
     let shortcut_now = || shortcut::get().map_or(tr!("none", "ninguno", "なし"), |a| shortcut::pretty(&a));
     let mut set = ui::SettingsState::new(font(), None, scale);
@@ -390,20 +412,51 @@ fn gui() -> Res<()> {
     set.settle();
     let mut modal = ui::Win::new(&cap, mx, my, ui::settings(&set), mask)?; // mapped by the gear
     ov.show(&cap.conn)?;
+    if badge_at.is_some() {
+        badge.show(&cap.conn)?;
+    }
     panel.show(&cap.conn)?;
     let keys = Keymap::new(&cap)?;
     grab_keyboard(&cap, ov.win)?;
 
     let mut grip: Option<(select::Grip, Rect)> = None; // dragging, and the selection before it
     let (mut moving, mut moving_set) = (true, false); // animating: the next frame is due
+    let (mut pfocus, mut sfocus, mut ring) = (Hit::Shutter, ui::SETTINGS_ORDER[0], false); // keyboard focus; the ring shows once a key moves it
+    let (pid, mid, bid) = (panel.id, modal.id, badge.id);
+    let mut thru = false; // a press began in a transparent margin: the drag belongs to the overlay
     loop {
         cap.wait(Duration::from_millis(if moving || moving_set { 8 } else { 50 }))?;
         let (mut redraw, mut reshape, mut restyle) = (false, false, false); // panel, overlay, settings
-        for ev in cap.take_events()? {
-            let shoot = match ev {
-                Event::Expose(e) if e.window == panel.id || e.window == modal.id => {
-                    let w = if e.window == panel.id { &panel } else { &modal };
-                    w.draw(&cap.conn)?;
+        macro_rules! close_settings {
+            () => {
+                (st.settings_open, set.capturing, redraw, pfocus) = (false, false, true, Hit::Settings);
+                cap.conn.unmap_window(mid)?;
+            };
+        }
+        for mut ev in cap.take_events()? {
+            // The panels' transparent margins and the badge are click-through: the overlay gets those events.
+            let body = |id: u32, x: i16, y: i16| id != bid && (id != pid || ui::panel_body_has(scale, x, y)) && (id != mid || ui::settings_body_has(scale, x, y));
+            match &mut ev {
+                Event::ButtonPress(e) => {
+                    ring = false;
+                    if !body(e.event, e.event_x, e.event_y) {
+                        (thru, e.event, e.event_x, e.event_y) = (true, ov.win, e.root_x, e.root_y);
+                    }
+                }
+                Event::ButtonRelease(e) if thru || !body(e.event, e.event_x, e.event_y) => {
+                    (thru, e.event, e.event_x, e.event_y) = (false, ov.win, e.root_x, e.root_y);
+                }
+                Event::MotionNotify(e) if thru || !body(e.event, e.event_x, e.event_y) => {
+                    (redraw, st.hover) = (redraw || (e.event == pid && st.hover.is_some()), if e.event == pid { None } else { st.hover });
+                    (restyle, set.hover) = (restyle || (e.event == mid && set.hover.is_some()), if e.event == mid { None } else { set.hover });
+                    (e.event, e.event_x, e.event_y) = (ov.win, e.root_x, e.root_y);
+                }
+                _ => {}
+            }
+            let mut press = None; // a control to activate, and whether by key
+            let mut shoot = match ev {
+                Event::Expose(e) if e.window == pid || e.window == mid || e.window == bid => {
+                    [&panel, &modal, &badge].into_iter().find(|w| w.id == e.window).unwrap().draw(&cap.conn)?;
                     false
                 }
                 Event::MotionNotify(e) if e.event == panel.id => {
@@ -424,60 +477,17 @@ fn gui() -> Res<()> {
                     (restyle, set.hover) = (restyle || set.hover.is_some(), None);
                     false
                 }
-                Event::ButtonPress(e) if e.event == panel.id && e.detail == 1 => {
-                    redraw = true;
-                    let hit = ui::panel_hit(scale, e.event_x, e.event_y);
-                    match hit {
-                        Some(Hit::Close) => return Ok(()),
-                        Some(Hit::Mode(m)) => (st.mode, reshape) = (m, true),
-                        Some(Hit::Shot) => st.record = false,
-                        Some(Hit::Cast) => st.record = true,
-                        Some(Hit::Settings) if st.settings_open => {
-                            (st.settings_open, set.capturing) = (false, false);
-                            cap.conn.unmap_window(modal.id)?;
-                        }
-                        Some(Hit::Settings) => {
-                            (st.settings_open, set.shortcut, set.capturing, set.cjk) = (true, shortcut_now(), false, cjk());
-                            (set.hover, set.focus) = (None, None);
-                            set.settle();
-                            set.reveal();
-                            modal.redraw(&cap.conn, ui::settings(&set))?;
-                            cap.conn.map_window(modal.id)?;
-                        }
-                        Some(Hit::Shutter) | None => {}
-                    }
-                    hit == Some(Hit::Shutter)
+                Event::ButtonPress(e) if e.event == pid && e.detail == 1 => {
+                    press = ui::panel_hit(scale, e.event_x, e.event_y).map(|h| (Press::Panel(h), false));
+                    false
                 }
-                Event::ButtonPress(e) if e.event == modal.id && e.detail == 1 => {
-                    restyle = true;
-                    match ui::settings_hit(scale, e.event_x, e.event_y) {
-                        Some(SetHit::Close) => {
-                            (st.settings_open, set.capturing, redraw) = (false, false, true);
-                            cap.conn.unmap_window(modal.id)?;
-                        }
-                        Some(SetHit::Output(i)) => set.output = i,
-                        Some(SetHit::Mic) => set.mic = !set.mic,
-                        Some(SetHit::Pointer) => set.pointer = !set.pointer,
-                        Some(SetHit::VideoFormat(i)) => set.mp4 = i == 1,
-                        Some(SetHit::Gpu) => set.gpu = !set.gpu,
-                        Some(SetHit::ImageFormat(i)) => set.jpg = i == 1,
-                        Some(SetHit::Shortcut) => set.capturing = true,
-                        Some(SetHit::Lang(i)) => {
-                            i18n::set(i18n::LANGS[i]);
-                            (st.font, set.font, set.cjk, set.shortcut, redraw) = (font(), font(), cjk(), shortcut_now(), true);
-                        }
-                        None => {}
-                    }
-                    // Settings stick at once, also when the launcher is then closed.
-                    (last.pointer, last.output, last.mic) = (set.pointer, audio::OUTPUTS[set.output], set.mic);
-                    (last.mp4, last.jpg, last.gpu) = (set.mp4, set.jpg, set.gpu);
-                    last.save();
+                Event::ButtonPress(e) if e.event == mid && e.detail == 1 => {
+                    press = ui::settings_hit(scale, e.event_x, e.event_y).map(|h| (Press::Settings(h), false));
                     false
                 }
                 Event::ButtonPress(e) if e.event == ov.win && e.detail == 1 && st.settings_open => {
                     // A click outside closes the settings, like a popover.
-                    (st.settings_open, set.capturing, redraw) = (false, false, true);
-                    cap.conn.unmap_window(modal.id)?;
+                    close_settings!();
                     false
                 }
                 Event::ButtonPress(e) if e.event == ov.win && e.detail == 1 => {
@@ -526,17 +536,80 @@ fn gui() -> Res<()> {
                         }
                         false
                     } else if sym == KEY_ESCAPE && st.settings_open {
-                        (st.settings_open, redraw) = (false, true);
-                        cap.conn.unmap_window(modal.id)?;
+                        close_settings!();
                         false
                     } else if sym == KEY_ESCAPE {
                         return Ok(());
+                    } else if sym == KEY_TAB || KEYS_PREV.contains(&sym) || KEYS_NEXT.contains(&sym) {
+                        let back = if sym == KEY_TAB { u16::from(e.state) & 1 != 0 } else { KEYS_PREV.contains(&sym) }; // Shift is bit 1
+                        if ring && st.settings_open {
+                            sfocus = ui::step(&ui::SETTINGS_ORDER, sfocus, back, |h| h == SetHit::Gpu && !set.gpu_found);
+                        } else if ring {
+                            pfocus = ui::step(&ui::PANEL_ORDER, pfocus, back, |_| false);
+                        }
+                        ring = true; // the first press only shows where the focus is
+                        false
+                    } else if !KEY_ENTERS.contains(&sym) {
+                        false
+                    } else if ring {
+                        press = Some((if st.settings_open { Press::Settings(sfocus) } else { Press::Panel(pfocus) }, true));
+                        false
                     } else {
-                        KEY_ENTERS.contains(&sym)
+                        true
                     }
                 }
                 _ => false,
             };
+            match press {
+                Some((Press::Panel(h), key)) => {
+                    redraw = true;
+                    match h {
+                        Hit::Close => return Ok(()),
+                        Hit::Mode(m) => (st.mode, reshape) = (m, true),
+                        Hit::Shot => st.record = false,
+                        Hit::Cast => st.record = true,
+                        Hit::Settings if st.settings_open => {
+                            close_settings!();
+                        }
+                        Hit::Settings => {
+                            (st.settings_open, set.shortcut, set.capturing, set.cjk, sfocus) = (true, shortcut_now(), false, cjk(), ui::SETTINGS_ORDER[0]);
+                            (set.hover, set.focus) = (None, ring.then_some(sfocus));
+                            set.settle();
+                            set.reveal();
+                            modal.redraw(&cap.conn, ui::settings(&set))?;
+                            cap.conn.map_window(mid)?;
+                        }
+                        Hit::Shutter => shoot = true,
+                    }
+                    if key && matches!(h, Hit::Mode(_) | Hit::Shot | Hit::Cast) {
+                        pfocus = Hit::Shutter; // pick, then Enter again captures
+                    }
+                }
+                Some((Press::Settings(h), _)) => {
+                    restyle = true;
+                    match h {
+                        SetHit::Close => {
+                            close_settings!();
+                        }
+                        SetHit::Output(i) => set.output = i,
+                        SetHit::Mic => set.mic = !set.mic,
+                        SetHit::Pointer => set.pointer = !set.pointer,
+                        SetHit::VideoFormat(i) => set.mp4 = i == 1,
+                        SetHit::Gpu => set.gpu = !set.gpu,
+                        SetHit::ImageFormat(i) => set.jpg = i == 1,
+                        SetHit::Shortcut => set.capturing = true,
+                        SetHit::Lang(i) => {
+                            i18n::set(i18n::LANGS[i]);
+                            (st.font, set.font, set.cjk, set.shortcut, redraw) = (font(), font(), cjk(), shortcut_now(), true);
+                        }
+                    }
+                    // Settings stick at once, also when the launcher is then closed.
+                    (last.pointer, last.output, last.mic) = (set.pointer, audio::OUTPUTS[set.output], set.mic);
+                    (last.mp4, last.jpg, last.gpu) = (set.mp4, set.jpg, set.gpu);
+                    last.save();
+                }
+                None => {}
+            }
             if shoot {
                 (last.mode, last.record) = (st.mode, st.record);
                 let target = match (last.mode, picked.or(hovered)) {
@@ -551,7 +624,7 @@ fn gui() -> Res<()> {
                     None => None,
                 };
                 let app = app.and_then(|id| ewmh.pid(&cap, id));
-                return shutter(cap, &ov, &[&panel, &modal], target, &last, &cursor, app, (font(), scale));
+                return shutter(cap, &ov, &[&panel, &modal, &badge], target, &last, &cursor, app, (font(), scale));
             }
         }
         if reshape {
@@ -560,7 +633,27 @@ fn gui() -> Res<()> {
                 ov.set_cursor(&cap.conn, select::CURSOR_ARROW)?;
             }
             ov.set(&cap.conn, area(&last, picked.or(hovered)), st.mode == Mode::Selection)?;
+            let want = (st.mode == Mode::Selection).then_some(last.sel);
+            if want != badge_at {
+                match want {
+                    Some(r) => {
+                        let ((x, y), c) = badge_for(r);
+                        badge.reset(&cap.conn, x, y, c)?;
+                        if badge_at.is_none() {
+                            cap.conn.map_window(bid)?;
+                        }
+                    }
+                    None => {
+                        cap.conn.unmap_window(bid)?;
+                    }
+                }
+                badge_at = want;
+            }
         }
+        let f = (ring && !st.settings_open).then_some(pfocus);
+        (redraw, st.focus) = (redraw || f != st.focus, f);
+        let f = ring.then_some(sfocus);
+        (restyle, set.focus) = (restyle || f != set.focus, f);
         st.sync();
         if redraw || moving || st.busy() {
             panel.redraw(&cap.conn, ui::panel(&st))?;

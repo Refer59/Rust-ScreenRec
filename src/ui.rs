@@ -5,6 +5,7 @@
 
 use crate::Res;
 use crate::capture::{Capture, Sprite};
+use crate::select::Rect;
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::{Duration, Instant};
@@ -565,7 +566,6 @@ pub enum Hit {
 }
 
 /// Keyboard focus order.
-#[allow(dead_code)] // the keyboard wiring comes next
 pub const PANEL_ORDER: [Hit; 8] = [Hit::Mode(Mode::Selection), Hit::Mode(Mode::Screen), Hit::Mode(Mode::Window), Hit::Shot, Hit::Cast, Hit::Settings, Hit::Shutter, Hit::Close];
 
 // Panel geometry, in logical px. The body sits in a transparent margin for its shadow.
@@ -609,13 +609,14 @@ fn hit_of(h: Hit) -> Geo {
 
 /// Canvas size in device px, and the canvas's top-left for the panel and the
 /// settings popover on a `sw`×`sh` screen: the panel body 48 px above the
-/// bottom, the popover body 20 px above the panel body, both centred.
+/// bottom, the popover body 36 px above it (its transparent margin then
+/// clears the panel's overhanging close button), both centred.
 pub fn place(sw: i32, sh: i32, scale: f32) -> ((i32, i32), (i32, i32)) {
     let s = |v: f32| v * scale;
     let px = (sw as f32 - s(BODY.0)) / 2.0 - s(M);
     let body_top = sh as f32 - s(48.0) - s(BODY.1);
     let mx = (sw as f32 - s(SBODY.0)) / 2.0 - s(M);
-    let my = body_top - s(20.0) - s(SBODY.1) - s(M);
+    let my = body_top - s(36.0) - s(SBODY.1) - s(M);
     ((px.round() as i32, (body_top - s(M)).round() as i32), (mx.round() as i32, my.round() as i32))
 }
 
@@ -681,6 +682,12 @@ impl<'a> PanelState<'a> {
 pub fn panel_hit(scale: f32, x: i16, y: i16) -> Option<Hit> {
     let (x, y) = (x as f32 / scale - M, y as f32 / scale - M);
     PANEL_ORDER.into_iter().rev().find(|&h| hit_of(h).has(x, y))
+}
+
+/// Whether device px (x, y) is on the panel's card or a control (the close button overhangs); the rest of the canvas is transparent.
+pub fn panel_body_has(scale: f32, x: i16, y: i16) -> bool {
+    let (x, y) = (x as f32 / scale - M, y as f32 / scale - M);
+    sd_rrect(x, y, (0.0, 0.0, BODY.0, BODY.1), 26.0) <= 0.0 || PANEL_ORDER.into_iter().any(|h| hit_of(h).has(x, y))
 }
 
 pub fn panel(s: &PanelState) -> Canvas {
@@ -797,7 +804,6 @@ pub enum SetHit {
 }
 
 /// Keyboard focus order.
-#[allow(dead_code)] // the keyboard wiring comes next
 pub const SETTINGS_ORDER: [SetHit; 15] = [
     SetHit::Output(0),
     SetHit::Output(1),
@@ -878,6 +884,12 @@ fn set_hit(h: SetHit) -> Geo {
 pub fn settings_hit(scale: f32, x: i16, y: i16) -> Option<SetHit> {
     let (x, y) = (x as f32 / scale - M, y as f32 / scale - M);
     SETTINGS_ORDER.into_iter().find(|&h| set_hit(h).has(x, y))
+}
+
+/// Like `panel_body_has`, for the settings popover.
+pub fn settings_body_has(scale: f32, x: i16, y: i16) -> bool {
+    let (x, y) = (x as f32 / scale - M, y as f32 / scale - M);
+    sd_rrect(x, y, (0.0, 0.0, SBODY.0, SBODY.1), 22.0) <= 0.0 || SETTINGS_ORDER.into_iter().any(|h| set_hit(h).has(x, y))
 }
 
 pub struct SettingsState<'a> {
@@ -1174,6 +1186,13 @@ impl Win {
         self.draw(conn)
     }
 
+    /// Move and resize to `canvas`, and draw it.
+    pub fn reset(&mut self, conn: &impl Connection, x: i32, y: i32, canvas: Canvas) -> Res<()> {
+        conn.configure_window(self.id, &ConfigureWindowAux::new().x(x).y(y).width(canvas.w as u32).height(canvas.h as u32))?;
+        (self.x, self.y) = (x, y);
+        self.redraw(conn, canvas)
+    }
+
     pub fn move_to(&mut self, conn: &impl Connection, x: i32, y: i32) -> Res<()> {
         conn.configure_window(self.id, &ConfigureWindowAux::new().x(x).y(y))?;
         (self.x, self.y) = (x, y);
@@ -1185,6 +1204,33 @@ impl Win {
         let c = &self.canvas;
         Sprite { x: self.x, y: self.y, w: c.w as i32, h: c.h as i32, argb: c.px.clone() }
     }
+}
+
+/// The control after (or, `back`, before) `cur` in `order`, wrapping and passing over `skip`ped ones.
+pub fn step<T: Copy + PartialEq>(order: &[T], cur: T, back: bool, skip: impl Fn(T) -> bool) -> T {
+    let (n, i) = (order.len(), order.iter().position(|&h| h == cur).unwrap_or(0));
+    (1..=n).map(|d| order[(i + if back { n - d } else { d }) % n]).find(|&h| !skip(h)).unwrap_or(cur)
+}
+
+/// The selection size badge: "1280 × 720", a 24 px pill just big enough.
+pub fn badge(w: i32, h: i32, font: Option<&FontVec>, scale: f32) -> Canvas {
+    let text = format!("{w} \u{d7} {h}");
+    let tw = font.map_or(60.0, |f| Canvas::width(f, &text, 12.5));
+    let bw = (tw + 20.0).ceil();
+    let mut c = Canvas::new(bw as usize, 24, scale);
+    c.paint(fade(BG, 0.92), rrect(0.0, 0.0, bw, 24.0, 12.0));
+    c.paint(HAIRLINE, stroke(rrect(0.5, 0.5, bw - 0.5, 23.5, 11.5), 1.0));
+    if let Some(f) = font {
+        c.text(f, &text, 12.5, bw / 2.0, 16.5, 0.5, TEXT);
+    }
+    c
+}
+
+/// Where the `b`-sized badge goes for selection `sel` on an `sw`×`sh` screen: `gap` px under
+/// its bottom-left corner, else inside its top-left one; always on screen.
+pub fn badge_pos(sel: Rect, (bw, bh): (i32, i32), (sw, sh): (i32, i32), gap: i32) -> (i32, i32) {
+    let (x, y) = if sel.3 + gap + bh <= sh { (sel.0, sel.3 + gap) } else { (sel.0 + gap, sel.1 + gap) };
+    (x.min(sw - bw).max(0), y.min(sh - bh).max(0))
 }
 
 const EDGE: i32 = 20; // where the pill rests, from the screen edge (logical px)
@@ -1435,10 +1481,31 @@ mod preview {
             let sel = (420, 260, 1240, 720);
             let mut full: Vec<u32> = crate::select::preview(frozen.clone(), sw, sh, Some(sel), true).as_chunks::<4>().0.iter().map(|p| 255 << 24 | u32::from_le_bytes([p[0], p[1], p[2], 0])).collect();
             let ((px, py), (mx, my)) = place(sw as i32, sh as i32, SCALE);
+            let bc = badge(sel.2 - sel.0, sel.3 - sel.1, font, SCALE);
+            let (bx, by) = badge_pos(sel, (bc.w as i32, bc.h as i32), (sw as i32, sh as i32), (14.0 * SCALE).round() as i32);
+            over(&mut full, sw, &bc, bx as usize, by as usize);
             over(&mut full, sw, &panel(&panels[0].1), px as usize, py as usize);
             save(&dir, &format!("launcher-{tag}"), sw, sh, &full, bg);
             over(&mut full, sw, &settings(&set_state(font, cjk, SCALE)), mx as usize, my as usize);
             save(&dir, &format!("launcher-settings-{tag}"), sw, sh, &full, bg);
+            // A tall selection: the badge goes inside it.
+            let sel = (300, 200, 1500, 1060);
+            let mut full: Vec<u32> = crate::select::preview(frozen.clone(), sw, sh, Some(sel), true).as_chunks::<4>().0.iter().map(|p| 255 << 24 | u32::from_le_bytes([p[0], p[1], p[2], 0])).collect();
+            let bc = badge(sel.2 - sel.0, sel.3 - sel.1, font, SCALE);
+            let (bx, by) = badge_pos(sel, (bc.w as i32, bc.h as i32), (sw as i32, sh as i32), (14.0 * SCALE).round() as i32);
+            over(&mut full, sw, &bc, bx as usize, by as usize);
+            over(&mut full, sw, &panel(&panels[0].1), px as usize, py as usize);
+            save(&dir, &format!("launcher-badge-inside-{tag}"), sw, sh, &full, bg);
+        }
+        // The size badge, alone and under a selection.
+        for (lang, tag, font) in [(Lang::En, "en", latin.as_ref()), (Lang::Ja, "ja", ja.as_ref())] {
+            i18n::set(lang);
+            for (w, h) in [(1280, 720), (64, 64), (1920, 1080)] {
+                let c = badge(w, h, font, SCALE);
+                save(&dir, &format!("badge-{w}x{h}-{tag}"), c.w, c.h, &c.px, bg);
+            }
+            let c = badge(1280, 720, font, SCALE);
+            save(&dir, &format!("badge-{tag}"), c.w, c.h, &c.px, [0x30, 0x2a, 0x3a]);
         }
         i18n::set(Lang::En);
         let c = panel(&{
@@ -1512,6 +1579,49 @@ mod preview {
             }
         }
         assert_eq!(panel_hit(1.0, 5, 5), None);
+    }
+
+    #[test]
+    fn focus_steps_wrap_and_skip() {
+        let o = [1, 2, 3, 4];
+        assert_eq!([step(&o, 1, false, |_| false), step(&o, 4, false, |_| false), step(&o, 1, true, |_| false), step(&o, 3, true, |_| false)], [2, 1, 4, 2]);
+        assert_eq!([step(&o, 1, false, |h| h == 2), step(&o, 3, true, |h| h == 2), step(&o, 4, false, |h| h == 1)], [3, 1, 2]);
+        let no_gpu = |h| h == SetHit::Gpu;
+        assert_eq!(step(&SETTINGS_ORDER, SetHit::VideoFormat(1), false, no_gpu), SetHit::ImageFormat(0));
+        assert_eq!(step(&SETTINGS_ORDER, SetHit::ImageFormat(0), true, no_gpu), SetHit::VideoFormat(1));
+        assert_eq!(step(&SETTINGS_ORDER, SetHit::Close, false, no_gpu), SetHit::Output(0));
+        assert_eq!(step(&PANEL_ORDER, Hit::Close, false, |_| false), Hit::Mode(Mode::Selection));
+        assert_eq!(step(&PANEL_ORDER, Hit::Mode(Mode::Selection), true, |_| false), Hit::Close);
+    }
+
+    #[test]
+    fn margins_are_not_body() {
+        for s in [1.0, 1.25] {
+            let d = |v: f32| (v * s) as i16;
+            assert!(!panel_body_has(s, 1, 1) && !panel_body_has(s, d(M + BODY.0 + 20.0), d(M + BODY.1 + 20.0)));
+            assert!(panel_body_has(s, d(M + 30.0), d(M + 30.0)) && panel_body_has(s, d(M + 280.0), d(M + 136.0)));
+            assert!(panel_body_has(s, d(M + 375.0), d(M - 3.0)), "the close button overhangs the card");
+            assert!(!settings_body_has(s, 1, 1) && !settings_body_has(s, d(M + SBODY.0 + 20.0), d(M + SBODY.1 + 20.0)));
+            assert!(settings_body_has(s, d(M + 170.0), d(M + 240.0)) && settings_body_has(s, d(M + 30.0), d(M + 30.0)));
+        }
+    }
+
+    #[test]
+    fn badge_placement() {
+        let (b, scr) = ((90, 24), (1920, 1080));
+        assert_eq!(badge_pos((420, 260, 1240, 720), b, scr, 8), (420, 728)); // below, left-aligned
+        assert_eq!(badge_pos((420, 260, 1240, 1070), b, scr, 8), (428, 268)); // no room: inside
+        assert_eq!(badge_pos((1900, 100, 1919, 200), b, scr, 8), (1830, 208)); // clamped right
+        assert_eq!(badge_pos((-30, 100, 200, 200), b, scr, 8), (0, 208)); // and left
+        assert_eq!(badge_pos((0, 0, 1920, 1080), (200, 24), (300, 100), 8), (8, 8)); // flipped, on a small screen
+    }
+
+    #[test]
+    fn badge_is_just_big_enough() {
+        let f = load_font(false);
+        let c = badge(1280, 720, f.as_ref(), 1.25);
+        assert_eq!(c.h, 30);
+        assert!(c.w > 60 && c.w < 120 && c.px.iter().all(|p| p >> 24 > 0 || *p == 0));
     }
 
     #[test]
