@@ -216,7 +216,8 @@ mod tests {
 
     #[test]
     fn converts_bt709_limited() {
-        let child = Command::new(std::env::current_exe().unwrap()).arg("--list").stdout(Stdio::null()).spawn().unwrap(); // any process that exits
+        let quiet = Command::new(std::env::current_exe().unwrap()).arg("--list").stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+        let child = quiet.unwrap(); // any process that exits: `true` isn't there on Windows
         let mut e = Encoder { child, stdin: None, units: channel().1, pending: VecDeque::new(), yuv: vec![0; 6], w: 2, h: 2 };
         e.upload(&[0, 0, 255, 0].repeat(4), 8, (0, 2)); // pure red
         assert_eq!(e.yuv, [63, 63, 63, 63, 102, 240]);
