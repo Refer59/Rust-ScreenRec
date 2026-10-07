@@ -82,7 +82,8 @@ impl Drop for Source {
 
 fn parec(target: &str, lag: i64) -> Res<Source> {
     let args = ["--raw", "--format=s16le", "--rate=48000", "--channels=2", "--latency-msec=20", "--client-name=screenrec", target];
-    let mut child = Command::new("parec").args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
+    let missing = |_| tr!("sound needs parec (PulseAudio tools)", "el sonido necesita parec (herramientas de PulseAudio)", "音声には parec (PulseAudio のツール) が必要です");
+    let mut child = Command::new("parec").args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(missing)?;
     let mut out = child.stdout.take().ok_or(tr!("parec has no stdout", "parec sin stdout", "parec の stdout がありません"))?;
     let (tx, rx) = channel();
     std::thread::spawn(move || {
@@ -170,6 +171,9 @@ impl Audio {
     pub fn start(output: Output, mic: bool, app: Option<u32>) -> Res<Option<Self>> {
         if output == Output::None && !mic {
             return Ok(None);
+        }
+        if cfg!(not(target_os = "linux")) {
+            return Err(tr!("recording sound isn't available on this system yet", "grabar sonido aún no está disponible en este sistema", "この環境ではまだ音声を録音できません").into());
         }
         let opus = opus()?;
         let mut err = 0;

@@ -10,7 +10,7 @@
 //! image of an unmapped window, the video holds its last frame).
 
 use crate::Res;
-use crate::frame::{Rows, View, draw, shows};
+use crate::frame::{Rect, Rows, View, draw, shows};
 pub use crate::frame::Sprite;
 use std::os::fd::AsRawFd;
 use std::time::Duration;
@@ -294,6 +294,11 @@ impl Capture {
         Ok(())
     }
 
+    /// Where window `id` shows on screen (frame included, shadows not), if it does.
+    pub fn window_area(&self, id: u32) -> Option<Rect> {
+        crate::select::Ewmh::new(self).visible(self, id)
+    }
+
     /// The followed window was closed.
     pub fn window_gone(&self) -> bool {
         self.follow.as_ref().is_some_and(|f| f.gone)
@@ -337,6 +342,12 @@ impl Capture {
                 ev => self.events.push(ev),
             }
         }
+        Ok(())
+    }
+
+    /// Send what we asked of the server (our windows' moves and repaints sit in a buffer until then).
+    pub fn flush(&self) -> Res<()> {
+        self.conn.flush()?;
         Ok(())
     }
 

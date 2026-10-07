@@ -8,9 +8,12 @@ name = "screenrec"
 path = "src/main.rs"
 
 [dependencies]
-ab_glyph = "0.2"
 jpeg-encoder = "0.7"
 libc = "0.2"
 png = "0.18"
+
+# Capture, the launcher and its keyboard shortcut are X11 code.
+[target.'cfg(target_os = "linux")'.dependencies]
+ab_glyph = "0.2"
 x11rb = { version = "0.14", features = ["composite", "damage", "shm", "xfixes"] }
 xkeysym = "0.2"

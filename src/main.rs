@@ -5,7 +5,11 @@
 #[macro_use]
 mod i18n;
 mod audio;
+#[cfg_attr(windows, path = "windows/capture.rs")]
+#[cfg_attr(target_os = "macos", path = "macos/capture.rs")]
 mod capture;
+#[cfg_attr(windows, path = "windows/desktop.rs")]
+#[cfg_attr(target_os = "macos", path = "macos/desktop.rs")]
 mod desktop;
 mod dylib;
 mod frame;
@@ -13,8 +17,11 @@ mod mkv;
 mod nvenc;
 #[allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code, unused_imports, clippy::all)]
 mod nvenc_sys;
+#[cfg(target_os = "linux")]
 mod select;
+#[cfg(target_os = "linux")]
 mod shortcut;
+#[cfg(target_os = "linux")]
 mod ui;
 mod x264;
 
@@ -22,15 +29,22 @@ use audio::Output;
 use capture::Capture;
 use desktop::notify;
 use frame::{Rect, Sprite, View};
+#[cfg(target_os = "linux")]
 use std::io::Write;
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use ui::{Hit, Mode, PillEvent, SetHit};
+#[cfg(target_os = "linux")]
+use ui::{Hit, Mode, Pill, PillEvent, SetHit};
+#[cfg(target_os = "linux")]
 use x11rb::CURRENT_TIME;
+#[cfg(target_os = "linux")]
 use x11rb::connection::Connection;
+#[cfg(target_os = "linux")]
 use x11rb::protocol::Event;
+#[cfg(target_os = "linux")]
 use x11rb::protocol::xproto::{ConnectionExt as _, EventMask, GrabMode, GrabStatus};
 
 pub type Res<T> = Result<T, Box<dyn std::error::Error>>;
@@ -95,6 +109,7 @@ fn main() {
 }
 
 /// Point our GNOME shortcut at this executable; '-' unless one was already picked.
+#[cfg(target_os = "linux")]
 fn install() -> Res<()> {
     let accel = shortcut::get().unwrap_or_else(|| "minus".into());
     shortcut::set(&accel)?;
@@ -135,7 +150,7 @@ fn rec(args: &[String]) -> Res<()> {
     let rec_path = if mp4 { path.with_extension("rec.mkv") } else { path.clone() }; // MP4 comes out of the MKV at the end
     let mut cap = Capture::new()?;
     let target = match window {
-        Some(w) => Target::Window(w, select::Ewmh::new(&cap).visible(&cap, w).ok_or(tr!("that window is not visible on screen", "esa ventana no se ve en pantalla", "そのウィンドウは画面に表示されていません"))?),
+        Some(w) => Target::Window(w, cap.window_area(w).ok_or(tr!("that window is not visible on screen", "esa ventana no se ve en pantalla", "そのウィンドウは画面に表示されていません"))?),
         None => Target::Area((0, 0, cap.sw as i32, cap.sh as i32)),
     };
     record(&mut cap, &rec_path, &opts, None, None, target)?;
@@ -213,6 +228,7 @@ fn saved_lang() -> Option<i18n::Lang> {
 }
 
 /// What the launcher remembers between runs.
+#[cfg(target_os = "linux")]
 struct Last {
     mode: Mode,
     record: bool,
@@ -231,6 +247,7 @@ fn last_path() -> PathBuf {
     Path::new(&config).join("screenrec/last")
 }
 
+#[cfg(target_os = "linux")]
 impl Last {
     fn load(sw: i32, sh: i32) -> Self {
         let text = std::fs::read_to_string(last_path()).unwrap_or_default();
@@ -261,6 +278,7 @@ impl Last {
 
 /// One launcher at a time: launching again (the shortcut pressed twice)
 /// closes the first one, or stops its recording, and exits.
+#[cfg(target_os = "linux")]
 fn single_instance() -> Res<Option<std::fs::File>> {
     let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
     let path = Path::new(&dir).join("screenrec.lock");
@@ -277,12 +295,14 @@ fn single_instance() -> Res<Option<std::fs::File>> {
 }
 
 /// Keycode -> unshifted keysym.
+#[cfg(target_os = "linux")]
 struct Keymap {
     min: u8,
     per: usize,
     syms: Vec<u32>,
 }
 
+#[cfg(target_os = "linux")]
 impl Keymap {
     fn new(cap: &Capture) -> Res<Self> {
         let (min, max) = (cap.conn.setup().min_keycode, cap.conn.setup().max_keycode);
@@ -295,11 +315,14 @@ impl Keymap {
     }
 }
 
+#[cfg(target_os = "linux")]
 const KEY_ESCAPE: u32 = 0xff1b;
+#[cfg(target_os = "linux")]
 const KEY_ENTERS: [u32; 3] = [0xff0d, 0xff8d, 0x20]; // Return, KP_Enter, space
 
 /// Grab the keyboard so the launcher gets its keys. Best effort: the
 /// shortcut that launched us may hold a grab for a moment.
+#[cfg(target_os = "linux")]
 fn grab_keyboard(cap: &Capture, win: u32) -> Res<()> {
     for _ in 0..20 {
         if cap.conn.grab_keyboard(false, win, CURRENT_TIME, GrabMode::ASYNC, GrabMode::ASYNC)?.reply()?.status == GrabStatus::SUCCESS {
@@ -313,6 +336,7 @@ fn grab_keyboard(cap: &Capture, win: u32) -> Res<()> {
 /// The launcher, like GNOME's: the screen freezes, pick Selection / Screen /
 /// Window and screenshot or screencast, then the shutter (or Enter). The gear
 /// opens the settings: sound, pointer, shortcut.
+#[cfg(target_os = "linux")]
 fn gui() -> Res<()> {
     let Some(_lock) = single_instance()? else { return Ok(()) };
     let mut cap = Capture::new()?;
@@ -544,6 +568,7 @@ fn gui() -> Res<()> {
 /// Screenshot: cut the target out of the frozen screen. Screencast: take the
 /// UI down and record the target live, with the sound picked in the settings
 /// (`app`: the process whose sound "Window" means).
+#[cfg(target_os = "linux")]
 fn shutter(mut cap: Capture, ov: &select::Overlay, windows: &[&ui::Win], target: Option<Target>, last: &Last, cursor: &Sprite, app: Option<u32>) -> Res<()> {
     let Some(target) = target else { return Ok(()) }; // Window mode with no window picked
     let (Target::Area(r) | Target::Window(_, r)) = target;
@@ -591,6 +616,65 @@ fn settle(cap: &mut Capture, gone: Option<&Sprite>) -> Res<()> {
     }
     cap.invalidate(); // the encoder hasn't seen these grabs
     Ok(())
+}
+
+/// The pill's clicks and drags since the last call: pause or resume
+/// (`paused` since when, `paused_for` in all) or stop, which sets STOP.
+/// Without a pill, events nobody wants are dropped.
+#[cfg(target_os = "linux")]
+fn pump_pill(cap: &mut Capture, pill: &mut Option<Pill>, paused: &mut Option<Instant>, paused_for: &mut Duration) -> Res<()> {
+    for ev in cap.take_events()? {
+        let Some(p) = pill.as_mut() else { continue };
+        match p.event(&cap.conn, &ev)? {
+            PillEvent::TogglePause if paused.is_some() => {
+                *paused_for += paused.take().unwrap().elapsed();
+                p.set_paused(&cap.conn, false)?;
+                cap.overlay = Some(p.win.sprite());
+                settle(cap, None)?; // compositor must show this look before we remove it
+            }
+            PillEvent::TogglePause => {
+                *paused = Some(Instant::now());
+                p.set_paused(&cap.conn, true)?;
+            }
+            PillEvent::Stop => {
+                cap.conn.unmap_window(p.win.id)?;
+                STOP.store(true, Relaxed);
+            }
+            PillEvent::None => {}
+        }
+    }
+    if let Some(p) = pill.as_mut() {
+        p.animate(&cap.conn)?;
+        cap.move_overlay(p.win.x, p.win.y);
+    }
+    Ok(())
+}
+
+// The launcher (gui, shutter, the pill, the ui/select/shortcut modules) is X11
+// code: elsewhere the command line works and the launcher says why it doesn't.
+
+/// There is no launcher here, so never a pill.
+#[cfg(not(target_os = "linux"))]
+enum Pill {}
+
+#[cfg(not(target_os = "linux"))]
+fn pump_pill(_: &mut Capture, _: &mut Option<Pill>, _: &mut Option<Instant>, _: &mut Duration) -> Res<()> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn gui() -> Res<()> {
+    let msg = tr!(
+        "the launcher only runs on Linux (X11) for now: use `screenrec shot` or `screenrec rec`",
+        "por ahora la interfaz solo funciona en Linux (X11): usa `screenrec shot` o `screenrec rec`",
+        "ランチャーは今のところ Linux (X11) 専用です: `screenrec shot` か `screenrec rec` を使ってください"
+    );
+    Err(msg.into())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn install() -> Res<()> {
+    Err(tr!("the launcher shortcut is GNOME-only for now", "por ahora el atajo de la interfaz es solo para GNOME", "ランチャーのショートカットは今のところ GNOME 専用です").into())
 }
 
 /// The H.264 encoder: NVENC on the GPU, or x264 on the CPU.
@@ -663,7 +747,7 @@ fn to_mp4(src: &Path, dst: &Path) -> Res<PathBuf> {
 /// Record `target` until STOP (or until the recorded window closes). In GUI
 /// mode the pill is on screen (pause / stop / drag) and `gone` must be off
 /// screen first.
-fn record(cap: &mut Capture, path: &Path, opts: &RecOpts, mut pill: Option<ui::Pill>, gone: Option<Sprite>, target: Target) -> Res<()> {
+fn record(cap: &mut Capture, path: &Path, opts: &RecOpts, mut pill: Option<Pill>, gone: Option<Sprite>, target: Target) -> Res<()> {
     for sig in [libc::SIGINT, libc::SIGTERM] {
         unsafe { libc::signal(sig, on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t) };
     }
@@ -735,30 +819,7 @@ fn record(cap: &mut Capture, path: &Path, opts: &RecOpts, mut pill: Option<ui::P
     };
     let res = (|| -> Res<()> {
         while !STOP.load(Relaxed) {
-            for ev in cap.take_events()? {
-                let Some(p) = pill.as_mut() else { continue };
-                match p.event(&cap.conn, &ev)? {
-                    PillEvent::TogglePause if paused.is_some() => {
-                        paused_for += paused.take().unwrap().elapsed();
-                        p.set_paused(&cap.conn, false)?;
-                        cap.overlay = Some(p.win.sprite());
-                        settle(cap, None)?; // compositor must show this look before we remove it
-                    }
-                    PillEvent::TogglePause => {
-                        paused = Some(Instant::now());
-                        p.set_paused(&cap.conn, true)?;
-                    }
-                    PillEvent::Stop => {
-                        cap.conn.unmap_window(p.win.id)?;
-                        STOP.store(true, Relaxed);
-                    }
-                    PillEvent::None => {}
-                }
-            }
-            if let Some(p) = pill.as_mut() {
-                p.animate(&cap.conn)?;
-                cap.move_overlay(p.win.x, p.win.y);
-            }
+            pump_pill(cap, &mut pill, &mut paused, &mut paused_for)?;
             if let (Some(a), Some(m)) = (sound.as_mut(), mkv.as_mut()) {
                 let until = frame_of(paused.unwrap_or_else(Instant::now), paused_for);
                 for (ts, packet) in a.pump(|at| frame_of(at, paused_for), until, paused.is_some(), false)? {
@@ -769,7 +830,7 @@ fn record(cap: &mut Capture, path: &Path, opts: &RecOpts, mut pill: Option<ui::P
                 break;
             }
             if paused.is_some() {
-                cap.conn.flush()?;
+                cap.flush()?;
                 std::thread::sleep(tick);
                 continue;
             }
