@@ -7,9 +7,10 @@ use crate::Res;
 use crate::dylib::{self, sym};
 use std::collections::VecDeque;
 use std::ffi::{CStr, c_void};
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::{Arc, OnceLock};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Instant;
 
@@ -130,6 +131,37 @@ fn sink_inputs() -> Vec<(u32, u32)> {
         .collect()
 }
 
+/// `pactl subscribe`, read by a thread that raises `new` whenever a playback
+/// stream appears. Without it (no pactl, or it died) the caller rescans
+/// every second instead.
+struct Watch {
+    child: Child,
+    new: Arc<AtomicBool>,
+}
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn watch() -> Option<Watch> {
+    let args = ["subscribe"];
+    let mut child = Command::new("pactl").env("LC_ALL", "C").args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let out = child.stdout.take()?;
+    let new = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&new);
+    std::thread::spawn(move || {
+        for line in BufReader::new(out).lines().map_while(Result::ok) {
+            if line.starts_with("Event 'new' on sink-input") {
+                flag.store(true, Relaxed);
+            }
+        }
+    });
+    Some(Watch { child, new })
+}
+
 /// Add `pcm` (interleaved stereo) into `mix`, whose first frame is `base`,
 /// starting at frame `start`. Frames before `base` were already encoded: too
 /// late, dropped.
@@ -152,6 +184,7 @@ fn mix_in(mix: &mut VecDeque<i32>, base: i64, start: i64, pcm: &[i16]) {
 pub struct Audio {
     sources: Vec<Source>,
     app: Option<u32>, // pid whose playback streams we follow
+    watch: Option<Watch>, // tells us when to look for new streams of it
     scanned: Instant,
     mix: VecDeque<i32>, // interleaved stereo sums, starting at frame `base`
     base: i64,          // next frame to encode, counted from the start
@@ -190,6 +223,7 @@ impl Audio {
         let mut a = Audio {
             sources: vec![],
             app: if output == Output::Window { app } else { None },
+            watch: if output == Output::Window { watch() } else { None }, // subscribed before the first scan: no gap
             scanned: Instant::now(),
             mix: VecDeque::new(),
             base: 0,
@@ -242,8 +276,20 @@ impl Audio {
     /// delay unless `flush`). `frame_of` maps a wall-clock instant to a frame
     /// on the recording's timeline; while `paused` audio is thrown away.
     pub fn pump(&mut self, frame_of: impl Fn(Instant) -> i64, until: i64, paused: bool, flush: bool) -> Res<Vec<(u64, Vec<u8>)>> {
-        if self.app.is_some() && self.scanned.elapsed().as_secs() >= 1 {
-            self.follow_app()?;
+        if self.app.is_some() {
+            // Rescan when a stream appeared; every second if pactl isn't there to say so
+            // (and every 10 s anyway, in case an event got lost).
+            if self.watch.as_mut().is_some_and(|w| !matches!(w.child.try_wait(), Ok(None))) {
+                self.watch = None; // pactl subscribe died: back to polling
+            }
+            let since = self.scanned.elapsed().as_secs();
+            let rescan = match &self.watch {
+                Some(w) => w.new.swap(false, Relaxed) || since >= 10,
+                None => since >= 1,
+            };
+            if rescan {
+                self.follow_app()?;
+            }
         }
         self.sources.retain_mut(|s| !matches!(s.child.try_wait(), Ok(Some(_)))); // stream gone, parec ended
         for s in &mut self.sources {
