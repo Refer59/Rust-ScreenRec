@@ -5,7 +5,9 @@
 
 use crate::Res;
 use crate::capture::Capture;
+use std::os::fd::AsRawFd;
 use x11rb::connection::Connection;
+use x11rb::protocol::shm::ConnectionExt as _;
 use x11rb::protocol::xproto::*;
 use x11rb::wrapper::ConnectionExt as _;
 
@@ -80,6 +82,22 @@ pub struct Overlay {
     cursor: usize,
     /// UI scale (logical to device px); set between `new` and `show`.
     pub scale: f32,
+    /// An MIT-SHM segment laid out like the screen (w*h*4 bytes, BGRX): bands
+    /// are rendered there and sent with ShmPutImage, which copies them into the
+    /// pixmap without going through the socket. None: plain PutImage.
+    shm: Option<(u32, *mut u8)>,
+}
+
+/// A shared segment the size of the screen, mapped here. None (or Err) when
+/// the server can't hand out fd-backed segments.
+fn shm_segment(cap: &Capture) -> Res<Option<(u32, *mut u8)>> {
+    let c = &cap.conn;
+    let len = cap.sw * cap.sh * 4;
+    let seg = c.generate_id()?;
+    let fd = c.shm_create_segment(seg, len as u32, false)?.reply()?.shm_fd;
+    // SAFETY: a new shared mapping of the segment's fd, owned by the Overlay and unmapped in its Drop.
+    let buf = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd.as_raw_fd(), 0) };
+    Ok((buf != libc::MAP_FAILED).then(|| (seg, buf.cast())))
 }
 
 impl Overlay {
@@ -88,6 +106,7 @@ impl Overlay {
         let (w, h) = (cap.sw, cap.sh);
         let pix = c.generate_id()?;
         c.create_pixmap(24, pix, cap.root, w as u16, h as u16)?;
+        let shm = shm_segment(cap).ok().flatten();
         let gc = c.generate_id()?;
         c.create_gc(gc, pix, &CreateGCAux::new())?;
         let font = c.generate_id()?;
@@ -98,7 +117,7 @@ impl Overlay {
             c.create_glyph_cursor(id, font, font, g, g + 1, 0, 0, 0, 0xffff, 0xffff, 0xffff)?;
             cursors.push(id);
         }
-        let mut o = Overlay { win: 0, pix, gc, frozen, w, h, shown: (area, handles), cursors, cursor: CURSOR_ARROW, scale: 1.0 };
+        let mut o = Overlay { win: 0, pix, gc, frozen, w, h, shown: (area, handles), cursors, cursor: CURSOR_ARROW, scale: 1.0, shm };
         o.win = c.generate_id()?;
         let events = EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION | EventMask::KEY_PRESS;
         let aux = CreateWindowAux::new().background_pixmap(pix).override_redirect(1).event_mask(events).cursor(o.cursors[0]);
@@ -107,7 +126,7 @@ impl Overlay {
         Ok(o)
     }
 
-    pub fn show(&self, conn: &impl Connection) -> Res<()> {
+    pub fn show(&mut self, conn: &impl Connection) -> Res<()> {
         self.put(conn, (0, 0, self.w as i32, self.h as i32))?;
         conn.map_window(self.win)?;
         Ok(())
@@ -133,7 +152,8 @@ impl Overlay {
             (old, new) => union(reach(old), reach(new)).into_iter().collect(),
         };
         self.shown = (area, handles);
-        let on_screen = |r: Rect| (r.0.max(0), r.1.max(0), r.2.min(self.w as i32), r.3.min(self.h as i32));
+        let (w, h) = (self.w as i32, self.h as i32);
+        let on_screen = |r: Rect| (r.0.max(0), r.1.max(0), r.2.min(w), r.3.min(h));
         for r in dirty.into_iter().map(on_screen).filter(|r| r.0 < r.2 && r.1 < r.3) {
             self.put(conn, r)?;
             conn.clear_area(false, self.win, r.0 as i16, r.1 as i16, (r.2 - r.0) as u16, (r.3 - r.1) as u16)?;
@@ -155,9 +175,22 @@ impl Overlay {
         Ok(())
     }
 
-    /// Render `r` into the pixmap, in bands that keep requests small.
-    fn put(&self, conn: &impl Connection, r: Rect) -> Res<()> {
+    /// Render `r` into the pixmap: through the shared segment when there is one,
+    /// else by PutImage in bands that keep requests small.
+    fn put(&mut self, conn: &impl Connection, r: Rect) -> Res<()> {
         let rw = (r.2 - r.0) as usize;
+        if let Some((seg, p)) = self.shm {
+            // SAFETY: `p` maps w*h*4 bytes for as long as `self` lives, and `&mut self`
+            // makes this the only reference to it in the process while it lives. The
+            // server reads the segment only while processing the ShmPutImage request,
+            // which is written to the socket after these writes; a later band over the
+            // same rows only ever makes a queued request copy newer pixels.
+            let map = unsafe { std::slice::from_raw_parts_mut(p, self.w * self.h * 4) };
+            self.render_into(r, &mut map[(r.1 as usize * self.w + r.0 as usize) * 4..], self.w * 4);
+            let (w, h, rh) = (self.w as u16, self.h as u16, (r.3 - r.1) as u16);
+            conn.shm_put_image(self.pix, self.gc, w, h, r.0 as u16, r.1 as u16, rw as u16, rh, r.0 as i16, r.1 as i16, 24, u8::from(ImageFormat::Z_PIXMAP), false, seg, 0)?;
+            return Ok(());
+        }
         let band = ((2 << 20) / (rw * 4)).max(1) as i32;
         for y in (r.1..r.3).step_by(band as usize) {
             let y1 = (y + band).min(r.3);
@@ -167,12 +200,19 @@ impl Overlay {
         Ok(())
     }
 
-    fn render(&self, (x0, y0, x1, y1): Rect) -> Vec<u8> {
+    fn render(&self, r: Rect) -> Vec<u8> {
+        let rw = (r.2 - r.0) as usize * 4;
+        let mut out = vec![0u8; rw * (r.3 - r.1) as usize];
+        self.render_into(r, &mut out, rw);
+        out
+    }
+
+    /// Render `r`, its row k at `out[k * stride..][..rw * 4]`.
+    fn render_into(&self, (x0, y0, x1, y1): Rect, out: &mut [u8], stride: usize) {
         let (area, handles) = self.shown;
         let rw = (x1 - x0) as usize;
-        let mut out = vec![0u8; rw * (y1 - y0) as usize * 4];
-        if out.is_empty() {
-            return out;
+        if rw == 0 || y1 <= y0 {
+            return;
         }
         let sc = self.scale;
         let bw = border(sc, handles);
@@ -180,7 +220,8 @@ impl Overlay {
         let lift = if handles { 55 } else { 90 }; // the border: white at this % over the dim
         let white = |v: u8| (dim(v) as u16 + (255 - dim(v) as u16) * lift / 100) as u8;
         // Row by row, as spans: dim | edge | border | inside | border | edge | dim.
-        for (y, dst) in (y0..).zip(out.chunks_exact_mut(rw * 4)) {
+        for y in y0..y1 {
+            let dst = &mut out[(y - y0) as usize * stride..][..rw * 4];
             let src = &self.frozen[(y as usize * self.w + x0 as usize) * 4..][..rw * 4];
             let (mut e0, mut b0, mut i0, mut i1, mut b1, mut e1) = (x1, x1, x1, x1, x1, x1); // all dim
             if let Some(a) = area.filter(|a| y >= a.1 - bw - 1 && y < a.3 + bw + 1) {
@@ -222,14 +263,22 @@ impl Overlay {
                 for ((bx0, bx1), (by0, by1)) in [across, down] {
                     for y in by0.max(y0)..by1.min(y1) {
                         for x in bx0.max(x0)..bx1.min(x1) {
-                            let i = ((y - y0) as usize * rw + (x - x0) as usize) * 4;
+                            let i = (y - y0) as usize * stride + (x - x0) as usize * 4;
                             out[i..i + 3].fill(255);
                         }
                     }
                 }
             }
         }
-        out
+    }
+}
+
+impl Drop for Overlay {
+    fn drop(&mut self) {
+        if let Some((_, p)) = self.shm {
+            // SAFETY: `p` is our mapping of w*h*4 bytes and nothing uses it after this.
+            unsafe { libc::munmap(p.cast(), self.w * self.h * 4) };
+        }
     }
 }
 
@@ -367,7 +416,7 @@ pub fn drag(g: Grip, x: i32, y: i32, (sw, sh): (i32, i32)) -> Rect {
 /// The overlay as it would look over `frozen` (BGRX), for offscreen previews.
 #[cfg(test)]
 pub fn preview(frozen: Vec<u8>, w: usize, h: usize, area: Option<Rect>, handles: bool) -> Vec<u8> {
-    let o = Overlay { win: 0, pix: 0, gc: 0, frozen, w, h, shown: (area, handles), cursors: vec![], cursor: 0, scale: 1.25 };
+    let o = Overlay { win: 0, pix: 0, gc: 0, frozen, w, h, shown: (area, handles), cursors: vec![], cursor: 0, scale: 1.25, shm: None };
     o.render((0, 0, w as i32, h as i32))
 }
 
@@ -442,7 +491,7 @@ mod tests {
                 (seed >> 24) as u8
             })
             .collect();
-        Overlay { win: 0, pix: 0, gc: 0, frozen, w, h, shown, cursors: vec![], cursor: 0, scale: 1.0 }
+        Overlay { win: 0, pix: 0, gc: 0, frozen, w, h, shown, cursors: vec![], cursor: 0, scale: 1.0, shm: None }
     }
 
     #[test]
@@ -478,6 +527,37 @@ mod tests {
                 o.shown = (a, handles);
                 for r in rects {
                     assert!(o.render(r) == render_ref(&o, r), "area {a:?} handles {handles} scale {scale} rect {r:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn render_into_with_stride() {
+        let (w, h) = (64, 40);
+        let rects = [(0, 0, 64, 40), (5, 3, 50, 37), (31, 0, 32, 40), (17, 9, 23, 15), (42, 27, 64, 40), (0, 19, 64, 20), (30, 18, 30, 21)];
+        let mut o = overlay(w, h, (None, false));
+        for a in [None, Some((20, 12, 44, 30)), Some((-10, 10, 30, 30)), Some((30, 18, 33, 21))] {
+            for handles in [false, true] {
+                o.shown = (a, handles);
+                for r in rects {
+                    let fill: Vec<u8> = (0..w * h * 4).map(|i| (i * 7 % 251) as u8).collect();
+                    let mut buf = fill.clone();
+                    o.render_into(r, &mut buf[(r.1 as usize * w + r.0 as usize) * 4..], w * 4);
+                    let want = o.render(r);
+                    let rw = (r.2 - r.0) as usize * 4;
+                    for y in 0..h as i32 {
+                        for x in 0..w as i32 {
+                            let i = (y as usize * w + x as usize) * 4;
+                            let px = if contains(r, x, y) {
+                                let j = (y - r.1) as usize * rw + (x - r.0) as usize * 4;
+                                &want[j..j + 4]
+                            } else {
+                                &fill[i..i + 4]
+                            };
+                            assert!(buf[i..i + 4] == *px, "area {a:?} handles {handles} rect {r:?} at ({x},{y})");
+                        }
+                    }
                 }
             }
         }
