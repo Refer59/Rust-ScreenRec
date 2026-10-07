@@ -1,12 +1,85 @@
-//! H.264 without a GPU: x264 (ultrafast, zerolatency) in an ffmpeg process.
-//! It gets I420 converted here, and only for the rows that changed: ffmpeg's
-//! own BGRX->YUV conversion costs as much as the encoding itself.
+//! H.264 in an ffmpeg process: x264 (ultrafast, zerolatency) on the CPU, or
+//! the platform's GPU encoder (VAAPI, Media Foundation, VideoToolbox) when
+//! NVENC isn't there. It gets I420 converted here, and only for the rows that
+//! changed: ffmpeg's own BGRX->YUV conversion costs as much as the encoding.
 
 use crate::Res;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
+use std::time::{Duration, Instant};
+
+/// An H.264 encoder in ffmpeg: a name for messages, what sets it up (before
+/// the input) and what picks it. Every one must open each frame with an access
+/// unit delimiter (see `next_unit`) and make no B-frames: frames come back in
+/// the order they went in.
+pub struct Codec {
+    pub name: &'static str,
+    setup: &'static [&'static str],
+    args: &'static [&'static str],
+}
+
+pub const X264: Codec = Codec {
+    name: "x264",
+    setup: &[],
+    args: &["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "23", "-g", "300", "-x264-params", "aud=1"],
+};
+
+// h264_vaapi's own `-aud 1` breaks P-frames with ffmpeg 4.4 and Intel's iHD
+// driver; the h264_metadata filter adds the delimiters on any encoder.
+#[cfg(target_os = "linux")]
+const VAAPI: &[&str] = &["-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi", "-qp", "22", "-g", "300", "-bf", "0", "-bsf:v", "h264_metadata=aud=insert"];
+
+/// The GPU encoders worth trying, best first. VAAPI (Intel, AMD): the
+/// display's GPU first, then the first two render nodes.
+#[cfg(target_os = "linux")]
+const GPU: &[Codec] = &[
+    Codec { name: "VAAPI", setup: &["-init_hw_device", "vaapi=va", "-filter_hw_device", "va"], args: VAAPI },
+    Codec { name: "VAAPI", setup: &["-init_hw_device", "vaapi=va:/dev/dri/renderD128", "-filter_hw_device", "va"], args: VAAPI },
+    Codec { name: "VAAPI", setup: &["-init_hw_device", "vaapi=va:/dev/dri/renderD129", "-filter_hw_device", "va"], args: VAAPI },
+];
+
+// ponytail: fixed 16 Mbit/s for the encoders without a constant-quality mode
+// everywhere; scale it with the area if 4K recordings look soft.
+#[cfg(windows)]
+const GPU: &[Codec] = &[Codec {
+    name: "Media Foundation",
+    setup: &[],
+    args: &["-c:v", "h264_mf", "-hw_encoding", "1", "-b:v", "16M", "-g", "300", "-bf", "0", "-bsf:v", "dump_extra,h264_metadata=aud=insert"],
+}];
+
+#[cfg(target_os = "macos")]
+const GPU: &[Codec] = &[Codec {
+    name: "VideoToolbox",
+    setup: &[],
+    args: &["-c:v", "h264_videotoolbox", "-realtime", "1", "-b:v", "16M", "-g", "300", "-bf", "0", "-bsf:v", "dump_extra,h264_metadata=aud=insert"],
+}];
+
+/// The first GPU encoder that works here at this size, if any.
+pub fn gpu(w: usize, h: usize, fps: u32) -> Option<&'static Codec> {
+    GPU.iter().find(|c| works(c, w, h, fps))
+}
+
+/// Whether ffmpeg encodes two black frames with `c` (~0.1 s; a stuck driver
+/// gets 5 s).
+fn works(c: &Codec, w: usize, h: usize, fps: u32) -> bool {
+    let input = format!("color=c=black:s={w}x{h}:r={fps}");
+    let mut ff = Command::new("ffmpeg");
+    ff.args(["-v", "error"]).args(c.setup).args(["-f", "lavfi", "-i", &input, "-frames:v", "2"]).args(c.args).args(["-f", "null", "-"]);
+    let Ok(mut child) = ff.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() else { return false };
+    let give_up = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < give_up {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    false
+}
 
 pub struct Encoder {
     child: Child,
@@ -18,24 +91,27 @@ pub struct Encoder {
     h: usize,
 }
 
-/// Where the access unit after the first one starts (x264's aud=1 opens each
-/// with a delimiter NAL; NAL payloads never contain 00 00 01).
+/// Where the access unit after the first one starts (each opens with a
+/// delimiter NAL, see `Codec`; NAL payloads never contain 00 00 01).
 fn next_unit(b: &[u8]) -> Option<usize> {
     (4..b.len().saturating_sub(3)).find(|&i| b[i..i + 4] == [0, 0, 1, 9]).map(|i| if b[i - 1] == 0 { i - 1 } else { i })
 }
 
 impl Encoder {
-    pub fn new(w: usize, h: usize, fps: u32) -> Res<Self> {
+    pub fn new(codec: &Codec, w: usize, h: usize, fps: u32) -> Res<Self> {
         let (size, rate) = (format!("{w}x{h}"), fps.to_string());
         #[rustfmt::skip]
-        let args = [
-            "-v", "error", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", &size, "-r", &rate, "-i", "-",
-            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "23", "-g", "300", "-x264-params", "aud=1",
-            "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv",
-            "-vsync", "0", "-flush_packets", "1", "-f", "h264", "-",
-        ];
+        let (input, output) = (
+            ["-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", &size, "-r", &rate, "-i", "-"],
+            ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv",
+             "-vsync", "0", "-flush_packets", "1", "-f", "h264", "-"],
+        );
         let mut child = Command::new("ffmpeg")
-            .args(args)
+            .args(["-v", "error"])
+            .args(codec.setup)
+            .args(input)
+            .args(codec.args)
+            .args(output)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -140,7 +216,8 @@ mod tests {
 
     #[test]
     fn converts_bt709_limited() {
-        let mut e = Encoder { child: Command::new("true").spawn().unwrap(), stdin: None, units: channel().1, pending: VecDeque::new(), yuv: vec![0; 6], w: 2, h: 2 };
+        let child = Command::new(std::env::current_exe().unwrap()).arg("--list").stdout(Stdio::null()).spawn().unwrap(); // any process that exits
+        let mut e = Encoder { child, stdin: None, units: channel().1, pending: VecDeque::new(), yuv: vec![0; 6], w: 2, h: 2 };
         e.upload(&[0, 0, 255, 0].repeat(4), 8, (0, 2)); // pure red
         assert_eq!(e.yuv, [63, 63, 63, 63, 102, 240]);
         e.upload(&[255; 16], 8, (0, 2));

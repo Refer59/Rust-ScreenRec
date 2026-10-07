@@ -677,9 +677,11 @@ fn install() -> Res<()> {
     Err(tr!("the launcher shortcut is GNOME-only for now", "por ahora el atajo de la interfaz es solo para GNOME", "ランチャーのショートカットは今のところ GNOME 専用です").into())
 }
 
-/// The H.264 encoder: NVENC on the GPU, or x264 on the CPU.
+/// The H.264 encoder: NVENC on the GPU, another GPU encoder through ffmpeg
+/// (VAAPI, Media Foundation, VideoToolbox), or x264 on the CPU.
 enum Video {
     Gpu(Box<nvenc::Encoder>), // boxed: NVENC's function table is 2.6 KB
+    GpuFfmpeg(x264::Encoder),
     Cpu(x264::Encoder),
 }
 
@@ -687,21 +689,32 @@ enum Video {
 type Unit = (u64, bool, Vec<u8>);
 
 impl Video {
-    /// The GPU if wanted and it works, else the CPU (saying why).
+    /// If the GPU is wanted, the first that works of NVENC and this
+    /// platform's GPU encoders in ffmpeg; else x264 on the CPU. A failing
+    /// NVENC is reported, with what records instead.
     fn new(host: &[u8], w: usize, h: usize, fps: u32, gpu: bool) -> Res<Self> {
+        let mut failed = None;
         if gpu && nvenc::available() {
             match nvenc::Encoder::new(host, w, h, fps) {
                 Ok(e) => return Ok(Video::Gpu(Box::new(e))),
-                Err(e) => notify(&tr!("screenrec: the GPU failed, recording on the CPU", "screenrec: la GPU falló, grabando con el CPU", "screenrec: GPU が失敗したため CPU で録画します"), &e.to_string(), None),
+                Err(e) => failed = Some(e),
             }
         }
-        Ok(Video::Cpu(x264::Encoder::new(w, h, fps)?))
+        let other = if gpu { x264::gpu(w, h, fps) } else { None };
+        if let Some(e) = failed {
+            let with = other.map_or_else(|| tr!("the CPU", "el CPU", "CPU"), |c| c.name.to_owned());
+            notify(&tr!("screenrec: NVENC failed, recording with {}", "screenrec: NVENC falló, grabando con {}", "screenrec: NVENC が失敗したため {} で録画します", with), &e.to_string(), None);
+        }
+        Ok(match other {
+            Some(c) => Video::GpuFfmpeg(x264::Encoder::new(c, w, h, fps)?),
+            None => Video::Cpu(x264::Encoder::new(&x264::X264, w, h, fps)?),
+        })
     }
 
     fn upload(&mut self, host: &[u8], stride: usize, rows: (i32, i32)) -> Res<()> {
         match self {
             Video::Gpu(e) => e.upload(host, stride, rows),
-            Video::Cpu(e) => {
+            Video::GpuFfmpeg(e) | Video::Cpu(e) => {
                 e.upload(host, stride, rows);
                 Ok(())
             }
@@ -709,7 +722,7 @@ impl Video {
     }
 
     /// Encode the frame stamped `ts`; returns the frames finished meanwhile
-    /// (NVENC: this one; x264 runs a frame or so behind). `idr` only steers NVENC.
+    /// (NVENC: this one; ffmpeg runs a frame or so behind). `idr` only steers NVENC.
     fn encode(&mut self, ts: u64, idr: bool) -> Res<Vec<Unit>> {
         match self {
             Video::Gpu(e) => {
@@ -717,7 +730,7 @@ impl Video {
                 let key = e.encode(idr, &mut unit)?;
                 Ok(vec![(ts, key, unit)])
             }
-            Video::Cpu(e) => Ok(e.encode(ts)?.into_iter().map(|(t, u)| (t, mkv::is_keyframe(&u), u)).collect()),
+            Video::GpuFfmpeg(e) | Video::Cpu(e) => Ok(e.encode(ts)?.into_iter().map(|(t, u)| (t, mkv::is_keyframe(&u), u)).collect()),
         }
     }
 
@@ -725,7 +738,7 @@ impl Video {
     fn finish(&mut self) -> Vec<Unit> {
         match self {
             Video::Gpu(_) => vec![],
-            Video::Cpu(e) => e.finish().into_iter().map(|(t, u)| (t, mkv::is_keyframe(&u), u)).collect(),
+            Video::GpuFfmpeg(e) | Video::Cpu(e) => e.finish().into_iter().map(|(t, u)| (t, mkv::is_keyframe(&u), u)).collect(),
         }
     }
 }
@@ -759,7 +772,7 @@ fn record(cap: &mut Capture, path: &Path, opts: &RecOpts, mut pill: Option<Pill>
         return Err(tr!("the area is too small to record (minimum 64×64)", "el área es muy pequeña para grabar (mínimo 64×64)", "録画するには領域が小さすぎます (最小 64×64)").into());
     }
     let mut enc = Video::new(cap.frame(), w, h, opts.fps.unwrap_or(60), opts.gpu)?; // whole screen buffer: covers any area
-    let fps = opts.fps.unwrap_or(if matches!(enc, Video::Gpu(_)) { 60 } else { 30 });
+    let fps = opts.fps.unwrap_or(if matches!(enc, Video::Cpu(_)) { 30 } else { 60 });
     let (w32, h32) = (w as i32, h as i32);
     match target {
         Target::Window(id, _) => {
