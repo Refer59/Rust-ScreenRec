@@ -60,7 +60,6 @@ pub fn lower_priority() {
 
 /// Put the w×h BGRX image (rows `stride` bytes apart) on the clipboard, as a
 /// PNG. It stays there after we exit, until something else is copied.
-#[allow(dead_code)] // until shot and the launcher copy (the clipboard + OCR settings)
 pub fn copy_image(bgrx: &[u8], w: usize, h: usize, stride: usize) -> Res<()> {
     clip("image/png", &crate::frame::png(bgrx, w, h, stride)?)
 }

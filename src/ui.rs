@@ -570,6 +570,43 @@ fn card(c: &mut Canvas, w: f32, h: f32, r: f32) {
     }
 }
 
+/// Área's text switch, the settings' switch at half size around (0, 0): grey when
+/// off, the accent yellow when on; `h` is how hovered it is.
+fn mini_switch(c: &mut Canvas, v: f32, h: f32) {
+    c.paint(mix(mix(THUMB, TEXT2, 0.3 * h), YELLOW, v), rrect(-11.0, -6.0, 11.0, 6.0, 6.0));
+    c.paint(mix(mix(TEXT2, TEXT, h), BLACK, v), circle(-5.0 + 10.0 * v, 0.0, 4.5));
+}
+
+/// What recognizing text will do now, for the switch's tooltip: off, or where the text goes.
+pub fn ocr_tip(on: bool, record: bool, clip: bool) -> String {
+    match (on, record, clip) {
+        (false, ..) => tr!("Text recognition is off", "Reconocimiento de texto apagado", "文字の読み取りはオフです"),
+        (true, true, _) => tr!("The text will be saved to a .txt with timestamps", "El texto se guardará en un .txt con marcas de tiempo", "文字をタイムスタンプ付きで .txt に保存します"),
+        (true, false, true) => tr!("The text will be copied to the clipboard", "El texto se copiará al portapapeles", "文字をクリップボードにコピーします"),
+        (true, false, false) => tr!("The text will be saved to a .txt", "El texto se guardará en un .txt", "文字を .txt に保存します"),
+    }
+}
+
+/// A tooltip: one line in a dark capsule, the badge's look a little larger.
+pub fn tooltip(text: &str, font: Option<&FontVec>, scale: f32) -> Canvas {
+    let w = (font.map_or(120.0, |f| Canvas::width(f, text, 13.0)) + 24.0).ceil();
+    let mut c = Canvas::new(w as usize, 28, scale);
+    c.paint(fade(BLACK, 0.92), rrect(0.0, 0.0, w, 28.0, 14.0));
+    c.paint(HAIRLINE, stroke(rrect(0.5, 0.5, w - 0.5, 27.5, 13.5), 1.0));
+    if let Some(f) = font {
+        c.text(f, text, 13.0, w / 2.0, 18.5, 0.5, TEXT);
+    }
+    c
+}
+
+/// Where the `t`-sized tooltip of Área's switch goes: centred over it, 8 px above the panel, on screen.
+pub fn tooltip_pos(sw: i32, sh: i32, scale: f32, (tw, th): (i32, i32)) -> (i32, i32) {
+    let (px, py) = place(sw, sh, scale).0;
+    let x = px + ((M + cell_mid(0.0)) * scale).round() as i32 - tw / 2;
+    let y = py + ((M - 8.0) * scale).round() as i32 - th;
+    (x.clamp(0, (sw - tw).max(0)), y.max(0))
+}
+
 /// A round close button: `h` is how hovered it is.
 fn close_button(c: &mut Canvas, g: Geo, h: f32) {
     let Geo::Disc(x, y, r) = g else { unreachable!() };
@@ -606,30 +643,36 @@ fn mode_name(m: Mode) -> String {
 pub enum Hit {
     Close,
     Mode(Mode),
+    /// Recognize text: the small switch under Área, there only in that mode.
+    Ocr,
     Shot,
     Cast,
     Shutter,
     Settings,
 }
 
-/// Keyboard focus order: the strip of modes, then the bottom row left to right.
-pub const PANEL_ORDER: [Hit; 8] = [Hit::Mode(Mode::Selection), Hit::Mode(Mode::Screen), Hit::Mode(Mode::Window), Hit::Shot, Hit::Cast, Hit::Shutter, Hit::Settings, Hit::Close];
+/// Keyboard focus order: the strip of modes and Área's switch, then the bottom row left to right.
+pub const PANEL_ORDER: [Hit; 9] = [Hit::Mode(Mode::Selection), Hit::Mode(Mode::Screen), Hit::Mode(Mode::Window), Hit::Ocr, Hit::Shot, Hit::Cast, Hit::Shutter, Hit::Settings, Hit::Close];
 
 // Panel geometry, in logical px. The body sits in a transparent margin for its shadow.
 const M: f32 = 24.0;
-const BODY: (f32, f32) = (320.0, 135.0); // PAD + the strip + 3 + the shutter's hit (68) + PAD
+const BODY: (f32, f32) = (320.0, 139.0); // PAD + the strip + 3 + the shutter's hit (68) + PAD
 const BODY_R: f32 = 16.0;
 /// The body's inner padding around the controls (their hit areas), the same on all four sides.
 const PAD: f32 = 12.0;
 const PW: usize = 368;
-const PH: usize = 183;
-const SBODY: (f32, f32) = (BODY.0, 478.0); // as wide as the panel: the two cards stack flush
+const PH: usize = 187;
+const SBODY: (f32, f32) = (BODY.0, SEG_LANG.1 + 20.0); // as wide as the panel: the two cards stack flush
 const SBODY_R: f32 = 14.0;
 pub const SW: usize = 368; // the settings popover, logical px
-pub const SH: usize = 526;
-/// Each mode word's cell: a third of the strip, 40 tall.
-const CELL: (f32, f32) = ((BODY.0 - 2.0 * PAD) / 3.0, 40.0);
-const ROW: f32 = 89.0; // the bottom row's centre: photo|video, shutter, gear
+pub const SH: usize = SBODY.1 as usize + 2 * M as usize;
+/// Each mode word's cell: a third of the strip, 44 tall: the word, and under it
+/// the dot, or Área's text switch. All three alike, so none looks bigger.
+const CELL: (f32, f32) = ((BODY.0 - 2.0 * PAD) / 3.0, 44.0);
+/// The words' baseline and the dot's (or the switch's) centre: centred in the cell together.
+const WORD: f32 = PAD + 17.0;
+const DOT: f32 = PAD + 30.0;
+const ROW: f32 = 93.0; // the bottom row's centre: photo|video, shutter, gear
 const SHUTTER: (f32, f32) = (BODY.0 / 2.0, ROW);
 /// photo|video and the gear sit under the outer mode words.
 const SEG: f32 = SHUTTER.0 - CELL.0;
@@ -639,6 +682,11 @@ fn cell_x(i: usize) -> f32 {
     PAD + CELL.0 * i as f32
 }
 
+/// The middle of mode cell `i` (fractional while the dot slides).
+fn cell_mid(i: f32) -> f32 {
+    PAD + CELL.0 * (i + 0.5)
+}
+
 /// What a control looks like (and where its focus ring goes).
 fn shape_of(h: Hit) -> Geo {
     match h {
@@ -646,6 +694,7 @@ fn shape_of(h: Hit) -> Geo {
             let x = cell_x(MODES.iter().position(|&n| n == m).unwrap());
             Geo::Rect(x, PAD, x + CELL.0, PAD + CELL.1, 11.0)
         }
+        Hit::Ocr => Geo::Rect(cell_mid(0.0) - 11.0, DOT - 6.0, cell_mid(0.0) + 11.0, DOT + 6.0, 6.0), // the settings' switch at half size
         Hit::Shot => Geo::Rect(SEG - 43.0, ROW - 17.0, SEG, ROW + 17.0, 7.0),
         Hit::Cast => Geo::Rect(SEG, ROW - 17.0, SEG + 43.0, ROW + 17.0, 7.0),
         Hit::Shutter => Geo::Disc(SHUTTER.0, SHUTTER.1, 31.0),
@@ -657,6 +706,7 @@ fn shape_of(h: Hit) -> Geo {
 /// Where a control answers clicks: its look, a little bigger for the small ones.
 fn hit_of(h: Hit) -> Geo {
     match h {
+        Hit::Ocr => Geo::Rect(cell_mid(0.0) - 24.0, DOT - 7.0, cell_mid(0.0) + 24.0, PAD + CELL.1, 6.0), // the cell below its middle
         Hit::Shot => Geo::Rect(SEG - 48.0, ROW - 22.0, SEG, ROW + 22.0, 11.0),
         Hit::Cast => Geo::Rect(SEG, ROW - 22.0, SEG + 48.0, ROW + 22.0, 11.0),
         Hit::Shutter => Geo::Disc(SHUTTER.0, SHUTTER.1, 34.0),
@@ -690,6 +740,8 @@ pub struct PanelState<'a> {
     pub bold: Option<&'a FontVec>,
     /// Keyboard focus (None while the ring is hidden).
     pub focus: Option<Hit>,
+    /// Recognize text in an area (Área's switch).
+    pub ocr: bool,
     pub scale: f32,
     tw: PanelTw,
 }
@@ -697,14 +749,15 @@ pub struct PanelState<'a> {
 struct PanelTw {
     mode: Tween, // fractional index of the chosen mode
     record: Tween,
+    ocr: Tween,
     hover: Hov<Hit>,
 }
 
 impl<'a> PanelState<'a> {
     pub fn new(mode: Mode, record: bool, (font, bold): (Option<&'a FontVec>, Option<&'a FontVec>), scale: f32) -> Self {
         let ix = MODES.iter().position(|&m| m == mode).unwrap() as f32;
-        let tw = PanelTw { mode: Tween::io(ix), record: Tween::io(record as u8 as f32), hover: Hov::new() };
-        PanelState { mode, record, hover: None, settings_open: false, font, bold, focus: None, scale, tw }
+        let tw = PanelTw { mode: Tween::io(ix), record: Tween::io(record as u8 as f32), ocr: Tween::io(0.0), hover: Hov::new() };
+        PanelState { mode, record, hover: None, settings_open: false, font, bold, focus: None, ocr: false, scale, tw }
     }
 
     /// Aim the tweens at the current state; call before every render.
@@ -712,12 +765,13 @@ impl<'a> PanelState<'a> {
         let ix = MODES.iter().position(|&m| m == self.mode).unwrap() as f32;
         self.tw.mode.go(ix, 200.0);
         self.tw.record.go(self.record as u8 as f32, 180.0);
+        self.tw.ocr.go(self.ocr as u8 as f32, 160.0);
         self.tw.hover.set(self.hover);
     }
 
     pub fn busy(&self) -> bool {
         let t = &self.tw;
-        t.mode.busy() || t.record.busy() || t.hover.t.busy()
+        t.mode.busy() || t.record.busy() || t.ocr.busy() || t.hover.t.busy()
     }
 
     /// Jump every tween to the state (previews).
@@ -725,17 +779,17 @@ impl<'a> PanelState<'a> {
     pub fn settle(&mut self) {
         self.sync();
         let t = &mut self.tw;
-        for w in [&mut t.mode, &mut t.record] {
+        for w in [&mut t.mode, &mut t.record, &mut t.ocr] {
             w.settle();
         }
         t.hover.settle(self.hover);
     }
 }
 
-/// The control under device px (x, y).
-pub fn panel_hit(scale: f32, x: i16, y: i16) -> Option<Hit> {
+/// The control under device px (x, y); `switch`: Área's switch is there (Área mode).
+pub fn panel_hit(scale: f32, x: i16, y: i16, switch: bool) -> Option<Hit> {
     let (x, y) = (x as f32 / scale - M, y as f32 / scale - M);
-    PANEL_ORDER.into_iter().rev().find(|&h| hit_of(h).has(x, y))
+    PANEL_ORDER.into_iter().rev().filter(|&h| switch || h != Hit::Ocr).find(|&h| hit_of(h).has(x, y))
 }
 
 /// Whether device px (x, y) is on the panel's card or a control (the close button overhangs); the rest of the canvas is transparent.
@@ -755,17 +809,22 @@ pub fn panel(s: &PanelState) -> Canvas {
     let hv = |h| t.hover.amt(h);
 
     // the modes: words in big cells; the chosen one yellow, with a dot that slides
-    let mid = |i: f32| cell_x(0) + CELL.0 * (i + 0.5);
     for (i, &m) in MODES.iter().enumerate() {
         let Geo::Rect(x0, y0, x1, y1, r) = shape_of(Hit::Mode(m)) else { unreachable!() };
         let (h, sel) = (hv(Hit::Mode(m)), (1.0 - (idx - i as f32).abs()).clamp(0.0, 1.0));
         c.paint(fade(WHITE, 0.06 * h), rrect(x0, y0, x1, y1, r));
         if let Some(f) = s.bold.or(s.font) {
             let (word, px, track) = caps(&mode_name(m), 13.0);
-            c.spaced(f, &word, px, (mid(i as f32), PAD + 18.0), 0.5, (track, false), mix(mix(TEXT2, TEXT, h), YELLOW, sel));
+            c.spaced(f, &word, px, (cell_mid(i as f32), WORD), 0.5, (track, false), mix(mix(TEXT2, TEXT, h), YELLOW, sel));
         }
     }
-    c.paint(YELLOW, circle(mid(idx), PAD + 29.0, 2.5)); // word and dot centred in the cell
+    // Arriving at Área the dot grows into the text switch, leaving it the switch shrinks back into the dot.
+    let area = (1.0 - idx).clamp(0.0, 1.0);
+    c.alpha = 1.0 - area;
+    c.paint(YELLOW, circle(cell_mid(idx), DOT, 2.5));
+    c.alpha = area;
+    c.scaled((cell_mid(0.0), DOT), 0.4 + 0.6 * area, |c| mini_switch(c, t.ocr.get(), hv(Hit::Ocr)));
+    c.alpha = 1.0;
 
     // photo | video
     c.paint(WELL, rrect(SEG - 46.0, ROW - 20.0, SEG + 46.0, ROW + 20.0, 10.0));
@@ -801,13 +860,14 @@ pub enum SetHit {
     VideoFormat(usize),
     Gpu,
     ImageFormat(usize),
+    Clip,
     Pointer,
     Shortcut,
     Lang(usize),
 }
 
 /// Keyboard focus order.
-pub const SETTINGS_ORDER: [SetHit; 15] = [
+pub const SETTINGS_ORDER: [SetHit; 16] = [
     SetHit::Output(0),
     SetHit::Output(1),
     SetHit::Output(2),
@@ -817,6 +877,7 @@ pub const SETTINGS_ORDER: [SetHit; 15] = [
     SetHit::Gpu,
     SetHit::ImageFormat(0),
     SetHit::ImageFormat(1),
+    SetHit::Clip,
     SetHit::Pointer,
     SetHit::Shortcut,
     SetHit::Lang(0),
@@ -834,9 +895,10 @@ const ROW_MIC: f32 = 140.0;
 const ROW_VIDEO: f32 = 190.0;
 const ROW_GPU: f32 = 230.0;
 const ROW_SHOT: f32 = 278.0;
-const ROW_POINTER: f32 = 318.0;
-const ROW_KEY: f32 = 366.0;
-const SEG_LANG: (f32, f32) = (426.0, 458.0);
+const ROW_CLIP: f32 = 318.0;
+const ROW_POINTER: f32 = 358.0;
+const ROW_KEY: f32 = 406.0;
+const SEG_LANG: (f32, f32) = (466.0, 498.0);
 
 /// Cell `i` of `n` across x0..x1 and y0..y1; `inset` 3 gives the thumb, its corners concentric with the well's.
 fn cell(x0: f32, x1: f32, (y0, y1): (f32, f32), n: usize, i: usize, inset: f32) -> Geo {
@@ -868,6 +930,7 @@ fn set_shape(h: SetHit) -> Geo {
         SetHit::Mic => switch_geo(ROW_MIC),
         SetHit::Gpu => switch_geo(ROW_GPU),
         SetHit::Pointer => switch_geo(ROW_POINTER),
+        SetHit::Clip => switch_geo(ROW_CLIP),
         SetHit::Shortcut => Geo::Rect(PICK, ROW_KEY - 16.0, SX.1, ROW_KEY + 16.0, 8.0),
     }
 }
@@ -883,6 +946,7 @@ fn set_hit(h: SetHit) -> Geo {
         SetHit::Mic => row_rect(ROW_MIC),
         SetHit::Gpu => row_rect(ROW_GPU),
         SetHit::Pointer => row_rect(ROW_POINTER),
+        SetHit::Clip => row_rect(ROW_CLIP),
         SetHit::Shortcut => set_shape(h),
     }
 }
@@ -906,6 +970,11 @@ pub struct SettingsState<'a> {
     pub gpu_found: bool,
     pub jpg: bool,
     pub pointer: bool,
+    /// Copy photos to the clipboard; off limits while the panel is on video (`record`).
+    pub clip: bool,
+    pub record: bool,
+    /// Text will be recognized (Área mode, its switch on): then the text is what gets copied.
+    pub text: bool,
     pub shortcut: String,
     pub capturing: bool, // waiting for the new shortcut
     pub hover: Option<SetHit>,
@@ -928,16 +997,17 @@ struct SetTw {
     image: Tween,
     pointer: Tween,
     lang: Tween,
+    clip: Tween,
     hover: Hov<SetHit>,
 }
 
 impl SetTw {
-    fn all(&mut self) -> [&mut Tween; 8] {
-        [&mut self.appear, &mut self.out, &mut self.mic, &mut self.video, &mut self.gpu, &mut self.image, &mut self.pointer, &mut self.lang]
+    fn all(&mut self) -> [&mut Tween; 9] {
+        [&mut self.appear, &mut self.out, &mut self.mic, &mut self.video, &mut self.gpu, &mut self.image, &mut self.pointer, &mut self.lang, &mut self.clip]
     }
 
     fn busy(&self) -> bool {
-        [&self.appear, &self.out, &self.mic, &self.video, &self.gpu, &self.image, &self.pointer, &self.lang].iter().any(|t| t.busy()) || self.hover.t.busy()
+        [&self.appear, &self.out, &self.mic, &self.video, &self.gpu, &self.image, &self.pointer, &self.lang, &self.clip].iter().any(|t| t.busy()) || self.hover.t.busy()
     }
 }
 
@@ -957,9 +1027,10 @@ impl<'a> SettingsState<'a> {
             image: Tween::io(0.0),
             pointer: Tween::io(0.0),
             lang: Tween::io(lang_ix()),
+            clip: Tween::io(0.0),
             hover: Hov::new(),
         };
-        SettingsState { output: 0, mic: false, mp4: false, gpu: false, gpu_found: false, jpg: false, pointer: false, shortcut: String::new(), capturing: false, hover: None, focus: None, font, bold, cjk, scale, tw }
+        SettingsState { output: 0, mic: false, mp4: false, gpu: false, gpu_found: false, jpg: false, pointer: false, clip: false, record: false, text: false, shortcut: String::new(), capturing: false, hover: None, focus: None, font, bold, cjk, scale, tw }
     }
 
     pub fn sync(&mut self) {
@@ -972,6 +1043,7 @@ impl<'a> SettingsState<'a> {
         t.mic.go(f(self.mic), 160.0);
         t.gpu.go(f(self.gpu && self.gpu_found), 160.0);
         t.pointer.go(f(self.pointer), 160.0);
+        t.clip.go(f(self.clip), 160.0);
         t.hover.set(self.hover);
     }
 
@@ -990,11 +1062,11 @@ impl<'a> SettingsState<'a> {
     }
 }
 
-/// On: a white track with a black knob; off: a grey track with a white one.
+/// On: a white track with a black knob; off: a grey track with a white one; disabled: dim, the knob where it was.
 fn switch(c: &mut Canvas, cy: f32, v: f32, enabled: bool) {
     let Geo::Rect(x0, y0, x1, y1, r) = switch_geo(cy) else { unreachable!() };
     c.paint(if enabled { mix(THUMB, TEXT, v) } else { WELL }, rrect(x0, y0, x1, y1, r));
-    c.paint(if enabled { mix(TEXT, BLACK, v) } else { DISABLED }, circle(x0 + 12.0 + 20.0 * v, cy, 9.0));
+    c.paint(if enabled { mix(TEXT, BLACK, v) } else { mix(DISABLED, THUMB, v) }, circle(x0 + 12.0 + 20.0 * v, cy, 9.0));
 }
 
 /// Segmented control in the rect x0..x1 × `ys`: `labels` in a capsule, the thumb at the fractional index `on`.
@@ -1052,15 +1124,15 @@ pub fn settings(s: &SettingsState) -> Canvas {
     segmented(&mut c, SX, SEG_OUT, &labels, t.out.get(), &|i| hv(SetHit::Output(i)));
 
     // rows: whole switch rows react to the pointer
-    for (h, cy) in [(SetHit::Mic, ROW_MIC), (SetHit::Gpu, ROW_GPU), (SetHit::Pointer, ROW_POINTER)] {
-        if h != SetHit::Gpu || s.gpu_found {
+    for (h, cy) in [(SetHit::Mic, ROW_MIC), (SetHit::Gpu, ROW_GPU), (SetHit::Clip, ROW_CLIP), (SetHit::Pointer, ROW_POINTER)] {
+        if (h != SetHit::Gpu || s.gpu_found) && (h != SetHit::Clip || !s.record) {
             let Geo::Rect(x0, y0, x1, y1, r) = row_rect(cy) else { unreachable!() };
             c.paint(fade(WHITE, 0.05 * hv(h)), rrect(x0, y0, x1, y1, r));
         }
     }
     lbl(&mut c, &tr!("Microphone", "Micrófono", "マイク"), 15.0, 20.0, ROW_MIC + 5.0, TEXT);
     switch(&mut c, ROW_MIC, t.mic.get(), true);
-    for y in [166.0, 254.0, 342.0, 392.0] {
+    for y in [166.0, 254.0, ROW_POINTER + 24.0, ROW_KEY + 26.0] {
         c.paint(DIVIDER, line(SX.0, y, SX.1, y, 0.5));
     }
 
@@ -1078,6 +1150,19 @@ pub fn settings(s: &SettingsState) -> Canvas {
     lbl(&mut c, &tr!("Image format", "Formato de imagen", "画像の形式"), 15.0, 20.0, ROW_SHOT + 5.0, TEXT);
     segmented(&mut c, (PICK, SX.1), pick_y(ROW_SHOT), &[("PNG", f), ("JPG", f)], t.image.get(), &|i| hv(SetHit::ImageFormat(i)));
 
+    // the clipboard: photos only; the note says what goes there, the image or the recognized text
+    let copy = tr!("Copy to clipboard", "Copiar al portapapeles", "クリップボードにコピー");
+    lbl(&mut c, &copy, 15.0, 20.0, ROW_CLIP + 5.0, if s.record { TEXT2 } else { TEXT });
+    if let Some(f) = f {
+        let what = match (s.record, s.text) {
+            (true, _) => tr!("photos only", "solo fotos", "写真のみ"),
+            (false, false) => tr!("the image", "la imagen", "画像"),
+            (false, true) => tr!("the text", "el texto", "文字"),
+        };
+        c.text(f, &what, 12.0, 20.0 + Canvas::width(f, &copy, 15.0) + 8.0, ROW_CLIP + 5.0, 0.0, TEXT2);
+    }
+    switch(&mut c, ROW_CLIP, t.clip.get(), !s.record);
+
     lbl(&mut c, &tr!("Show pointer", "Mostrar cursor", "ポインターを表示"), 15.0, 20.0, ROW_POINTER + 5.0, TEXT);
     switch(&mut c, ROW_POINTER, t.pointer.get(), true);
 
@@ -1093,7 +1178,7 @@ pub fn settings(s: &SettingsState) -> Canvas {
     }
 
     // language: each in its own name, so a wrong pick can be undone
-    section(&mut c, &tr!("Language", "Idioma", "言語"), 416.0);
+    section(&mut c, &tr!("Language", "Idioma", "言語"), SEG_LANG.0 - 10.0);
     let ja = if s.cjk.is_some() || crate::i18n::lang() == crate::i18n::Lang::Ja { "日本語".to_owned() } else { tr!("Japanese", "Japonés", "日本語") };
     let langs = [("English", f), ("Español", f), (ja.as_str(), s.cjk.or(f))];
     segmented(&mut c, SX, SEG_LANG, &langs, t.lang.get(), &|i| hv(SetHit::Lang(i)));
@@ -1524,9 +1609,16 @@ mod preview {
 
     type Fonts<'a> = (Option<&'a FontVec>, Option<&'a FontVec>);
 
+    /// `s` with Área's switch on.
+    fn ocr(mut s: PanelState) -> PanelState {
+        s.ocr = true;
+        s.settle();
+        s
+    }
+
     fn set_state<'a>(fonts: Fonts<'a>, cjk: Option<&'a FontVec>, scale: f32) -> SettingsState<'a> {
         let mut s = SettingsState::new(fonts, cjk, scale);
-        (s.output, s.mic, s.mp4, s.gpu, s.gpu_found, s.shortcut) = (1, true, false, true, true, "Ctrl+Shift+S".into());
+        (s.output, s.mic, s.mp4, s.gpu, s.gpu_found, s.clip, s.shortcut) = (1, true, false, true, true, true, "Ctrl+Shift+S".into());
         s.settle();
         s
     }
@@ -1558,6 +1650,9 @@ mod preview {
             };
             let mut mid = panel_state(Mode::Screen, true, None, false, None);
             (mid.tw.mode, mid.tw.record) = (Tween::io(0.5), Tween::io(0.5));
+            // Halfway from Área to Pantalla: the switch shrinking back into the dot.
+            let mut morph = ocr(panel_state(Mode::Selection, false, None, false, None));
+            morph.tw.mode = Tween::io(0.5);
             let panels = [
                 ("shot", panel_state(Mode::Selection, false, None, false, None)),
                 ("rec-hover", panel_state(Mode::Window, true, Some(Hit::Shutter), false, None)),
@@ -1566,6 +1661,14 @@ mod preview {
                 ("focus-shutter", panel_state(Mode::Screen, false, None, false, Some(Hit::Shutter))),
                 ("focus-window", panel_state(Mode::Screen, false, Some(Hit::Close), false, Some(Hit::Mode(Mode::Window)))),
                 ("mid", mid),
+                ("area-ocr-on", ocr(panel_state(Mode::Selection, false, None, false, None))),
+                ("area-rec-ocr-on", ocr(panel_state(Mode::Selection, true, None, false, None))),
+                ("area-ocr-hover", panel_state(Mode::Selection, false, Some(Hit::Ocr), false, None)),
+                ("focus-ocr", panel_state(Mode::Selection, false, None, false, Some(Hit::Ocr))),
+                ("focus-ocr-on", ocr(panel_state(Mode::Selection, false, None, false, Some(Hit::Ocr)))),
+                ("screen-ocr-on", ocr(panel_state(Mode::Screen, false, None, false, None))),
+                ("window-ocr-on", ocr(panel_state(Mode::Window, false, None, false, None))),
+                ("morph", morph),
             ];
             // Every mode word fits its cell with room to spare.
             for m in MODES {
@@ -1590,6 +1693,14 @@ mod preview {
             focused.settle();
             let c = settings(&focused);
             save(&dir, &format!("settings-focus-{tag}"), c.w, c.h, &c.px, bg);
+            // The clipboard row: the image, the text (Área's switch on), off limits on video; its focus ring.
+            for (name, record, text, focus) in [("image", false, false, None), ("text", false, true, None), ("video", true, true, None), ("focus", false, false, Some(SetHit::Clip))] {
+                let mut s = set_state(fonts, cjk, SCALE);
+                (s.record, s.text, s.focus) = (record, text, focus);
+                s.settle();
+                let c = settings(&s);
+                save(&dir, &format!("settings-clip-{name}-{tag}"), c.w, c.h, &c.px, bg);
+            }
 
             // The whole launcher over the frozen desktop, as the user sees it.
             let ((px, py), (mx, my)) = place(sw as i32, sh as i32, SCALE);
@@ -1606,6 +1717,26 @@ mod preview {
             save(&dir, &format!("launcher-{tag}"), sw, sh, &full, bg);
             over(&mut full, sw, &settings(&set_state(fonts, cjk, SCALE)), mx as usize, my as usize);
             save(&dir, &format!("launcher-settings-{tag}"), sw, sh, &full, bg);
+            // Área's switch with its tooltip: off, on (a .txt, or the clipboard), on while recording.
+            for (name, on, record, clip) in [("off", false, false, false), ("on", true, false, false), ("clip", true, false, true), ("video", true, true, false)] {
+                let sel = (420, 260, 1240, 720);
+                let mut full = overlay(&frozen, (sw, sh), sel, true);
+                with_badge(&mut full, sel, None);
+                let mut s = panel_state(Mode::Selection, record, Some(Hit::Ocr), false, None);
+                s.ocr = on;
+                s.settle();
+                over(&mut full, sw, &panel(&s), px as usize, py as usize);
+                let t = tooltip(&ocr_tip(on, record, clip), font, SCALE);
+                let (tx, ty) = tooltip_pos(sw as i32, sh as i32, SCALE, (t.w as i32, t.h as i32));
+                over(&mut full, sw, &t, tx as usize, ty as usize);
+                let (x0, y0, cw) = (560, 740, 800);
+                let crop: Vec<u32> = full.chunks_exact(sw).skip(y0).flat_map(|r| r[x0..x0 + cw].to_vec()).collect();
+                save(&dir, &format!("launcher-tip-{name}-{tag}"), cw, sh - y0, &crop, bg);
+            }
+            // Screen mode: no badge, no switch.
+            let mut full = overlay(&frozen, (sw, sh), (0, 0, sw as i32, sh as i32), false);
+            over(&mut full, sw, &panel(&panel_state(Mode::Screen, false, None, false, None)), px as usize, py as usize);
+            save(&dir, &format!("launcher-screen-{tag}"), sw, sh, &full, bg);
             // A tall selection: the badge goes inside it.
             let sel = (300, 200, 1500, 1060);
             let mut full = overlay(&frozen, (sw, sh), sel, true);
@@ -1672,6 +1803,21 @@ mod preview {
             }).fold(f64::MAX, f64::min) // best of ten: the machine is shared
         };
         println!("panel {:.2} ms, settings {:.2} ms", time(&|| panel(&p)), time(&|| settings(&s)));
+        // What a fade drawn here would cost a frame: the 1080p overlay redrawn, and the panel at partial alpha (no card cache).
+        let frozen = vec![128u8; 1920 * 1080 * 4];
+        let t0 = Instant::now();
+        for _ in 0..10 {
+            std::hint::black_box(crate::select::preview(frozen.clone(), 1920, 1080, Some((420, 260, 1240, 720)), true));
+        }
+        let overlay = t0.elapsed().as_secs_f64() * 100.0;
+        let t0 = Instant::now();
+        for _ in 0..10 {
+            let mut c = Canvas::new(PW, PH, SCALE);
+            c.alpha = 0.5;
+            card(&mut c, BODY.0, BODY.1, BODY_R);
+            std::hint::black_box(c);
+        }
+        println!("overlay 1080p {overlay:.2} ms, panel card at half alpha {:.2} ms", t0.elapsed().as_secs_f64() * 100.0);
     }
 
     #[test]
@@ -1716,14 +1862,17 @@ mod preview {
             let centre = |(x0, y0, x1, y1): (f32, f32, f32, f32)| ((((x0 + x1) / 2.0 + M) * s) as i16, (((y0 + y1) / 2.0 + M) * s) as i16);
             for h in PANEL_ORDER {
                 let (x, y) = centre(bounds(shape_of(h)));
-                assert_eq!(panel_hit(s, x, y), Some(h));
+                assert_eq!(panel_hit(s, x, y, true), Some(h));
             }
+            // Out of Área mode its switch isn't there: the spot is Área's cell.
+            let (x, y) = centre(bounds(shape_of(Hit::Ocr)));
+            assert_eq!(panel_hit(s, x, y, false), Some(Hit::Mode(Mode::Selection)));
             for h in SETTINGS_ORDER {
                 let (x, y) = centre(bounds(set_shape(h)));
                 assert_eq!(settings_hit(s, x, y), Some(h));
             }
         }
-        assert_eq!(panel_hit(1.0, 5, 5), None);
+        assert_eq!(panel_hit(1.0, 5, 5, true), None);
     }
 
     #[test]
@@ -1737,6 +1886,9 @@ mod preview {
         assert_eq!(step(&SETTINGS_ORDER, SetHit::Close, false, no_gpu), SetHit::Output(0));
         assert_eq!(step(&PANEL_ORDER, Hit::Close, false, |_| false), Hit::Mode(Mode::Selection));
         assert_eq!(step(&PANEL_ORDER, Hit::Mode(Mode::Selection), true, |_| false), Hit::Close);
+        assert_eq!(step(&PANEL_ORDER, Hit::Mode(Mode::Window), false, |_| false), Hit::Ocr); // right after the mode words
+        assert_eq!(step(&PANEL_ORDER, Hit::Mode(Mode::Window), false, |h| h == Hit::Ocr), Hit::Shot);
+        assert_eq!(step(&SETTINGS_ORDER, SetHit::ImageFormat(1), false, |h| h == SetHit::Clip), SetHit::Pointer);
     }
 
     #[test]

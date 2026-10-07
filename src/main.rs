@@ -34,6 +34,7 @@ use frame::{Rect, Sprite, View};
 use std::io::Write;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -200,26 +201,26 @@ fn freeze(cap: &mut Capture) -> Res<Sprite> {
 }
 
 /// Cut `r` out of the BGRX `screen` and save it as PNG, or JPG if the path says so.
-fn save_image(screen: &[u8], sw: usize, r: Rect, cursor: Option<&Sprite>, path: &Path) -> Res<()> {
+/// Returns the image it wrote: w×h BGRX, rows w·4 bytes apart.
+fn save_image<'a>(screen: &'a [u8], sw: usize, r: Rect, cursor: Option<&Sprite>, path: &Path) -> Res<Cow<'a, [u8]>> {
     let (w, h) = ((r.2 - r.0) as usize, (r.3 - r.1) as usize);
     let rows = || (r.1..r.3).map(|y| &screen[(y as usize * sw + r.0 as usize) * 4..][..w * 4]);
     // Full-width rows are already one contiguous image; a cut-out or a
     // drawn-in pointer needs its own copy.
-    let mut own = Vec::new();
-    let img: &[u8] = if cursor.is_none() && w == sw {
-        &screen[r.1 as usize * sw * 4..r.3 as usize * sw * 4]
+    let img = if cursor.is_none() && w == sw {
+        Cow::Borrowed(&screen[r.1 as usize * sw * 4..r.3 as usize * sw * 4])
     } else {
-        own.reserve_exact(w * h * 4);
+        let mut own = Vec::with_capacity(w * h * 4);
         rows().for_each(|row| own.extend_from_slice(row));
         if let Some(c) = cursor {
             frame::draw(&mut own, View { w, h, x0: r.0, y0: r.1 }, c);
         }
-        &own
+        Cow::Owned(own)
     };
     if path.extension().is_some_and(|e| e == "jpg" || e == "jpeg") {
         let jpg = jpeg_encoder::Encoder::new_file(path, 90)?;
-        jpg.encode(img, w as u16, h as u16, jpeg_encoder::ColorType::Bgra)?; // the 4th byte is ignored
-        return Ok(());
+        jpg.encode(&img, w as u16, h as u16, jpeg_encoder::ColorType::Bgra)?; // the 4th byte is ignored
+        return Ok(img);
     }
     let mut rgb = vec![0u8; w * h * 3];
     for (o, p) in rgb.as_chunks_mut::<3>().0.iter_mut().zip(img.as_chunks::<4>().0) {
@@ -231,7 +232,7 @@ fn save_image(screen: &[u8], sw: usize, r: Rect, cursor: Option<&Sprite>, path: 
     let mut wr = png.write_header()?;
     wr.write_image_data(&rgb)?;
     wr.finish()?;
-    Ok(())
+    Ok(img)
 }
 
 /// The language picked in the launcher's settings (the last file's 13th field).
@@ -253,6 +254,10 @@ struct Last {
     mp4: bool,
     jpg: bool,
     gpu: bool,
+    /// Copy screenshots to the clipboard.
+    clip: bool,
+    /// Recognize text; only an area's (Área mode), see `text`.
+    ocr: bool,
 }
 
 fn last_path() -> PathBuf {
@@ -264,7 +269,10 @@ fn last_path() -> PathBuf {
 #[cfg(target_os = "linux")]
 impl Last {
     fn load(sw: i32, sh: i32) -> Self {
-        let text = std::fs::read_to_string(last_path()).unwrap_or_default();
+        Self::parse(&std::fs::read_to_string(last_path()).unwrap_or_default(), sw, sh)
+    }
+
+    fn parse(text: &str, sw: i32, sh: i32) -> Self {
         let f: Vec<&str> = text.split_whitespace().collect();
         let n = |i: usize| f.get(i).and_then(|v| v.parse().ok());
         let named = |i: usize, name: String| f.get(i) == Some(&name.as_str());
@@ -277,17 +285,32 @@ impl Last {
         let flag = |i: usize| f.get(i) == Some(&"true");
         let gpu = f.get(11) != Some(&"false"); // the GPU when there is one, unless told otherwise
         let mode = mode.unwrap_or(Mode::Selection);
-        Last { mode, record: flag(1), pointer: flag(2), sel, output, mic: flag(8), mp4: flag(9), jpg: flag(10), gpu }
+        Last { mode, record: flag(1), pointer: flag(2), sel, output, mic: flag(8), mp4: flag(9), jpg: flag(10), gpu, clip: flag(13), ocr: flag(14) } // older files end at 12: both off
     }
 
     fn save(&self) {
         let path = last_path();
         let (m, (x0, y0, x1, y1), o) = (self.mode, self.sel, self.output);
         let _ = std::fs::create_dir_all(path.parent().unwrap());
-        let (rec, ptr, mic, mp4, jpg, gpu) = (self.record, self.pointer, self.mic, self.mp4, self.jpg, self.gpu);
+        let (rec, ptr, mic, mp4, jpg, gpu, clip, ocr) = (self.record, self.pointer, self.mic, self.mp4, self.jpg, self.gpu, self.clip, self.ocr);
         let lang = i18n::chosen().map_or("-".into(), |l| format!("{l:?}")); // "-": the locale's
-        let _ = std::fs::write(path, format!("{m:?} {rec} {ptr} {x0} {y0} {x1} {y1} {o:?} {mic} {mp4} {jpg} {gpu} {lang}\n"));
+        let _ = std::fs::write(path, format!("{m:?} {rec} {ptr} {x0} {y0} {x1} {y1} {o:?} {mic} {mp4} {jpg} {gpu} {lang} {clip} {ocr}\n"));
     }
+
+    /// Whether the capture's text gets recognized: the switch is on and the mode is Área.
+    fn text(&self) -> bool {
+        self.ocr && self.mode == Mode::Selection
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn last_reads_older_files() {
+    let old = Last::parse("Selection true false 1 2 300 400 System true false true false Es\n", 1920, 1080);
+    assert!((old.record, old.mic, old.jpg, old.gpu, old.clip, old.ocr) == (true, true, true, false, false, false));
+    let new = Last::parse("Selection false false 1 2 300 400 None false false false true - true true\n", 1920, 1080);
+    assert!((new.clip, new.ocr, new.text()) == (true, true, true));
+    assert!(!Last { mode: Mode::Screen, ..new }.text(), "text is read from an area only");
 }
 
 /// One launcher at a time: launching again (the shortcut pressed twice)
@@ -409,6 +432,7 @@ fn gui() -> Res<()> {
         _ => ja.get_or_init(|| ui::load_font(true)).as_ref(), // loaded when the settings first open
     };
     let mut st = ui::PanelState::new(last.mode, last.record, fonts(), scale);
+    st.ocr = last.ocr;
     let mut window = name_of(&cap, hovered); // the name of the window Window mode would take, for the badge
     let ((px, py), (mx, my)) = ui::place(sw, sh, scale);
     let mask = EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION | EventMask::LEAVE_WINDOW;
@@ -433,10 +457,13 @@ fn gui() -> Res<()> {
     // The shortcut (two gsettings runs), the NVIDIA probe (a driver dlopen) and the
     // render wait for the gear: none of them is needed to show the panel.
     (set.output, set.mic, set.pointer) = (audio::OUTPUTS.iter().position(|&o| o == last.output).unwrap_or(0), last.mic, last.pointer);
-    (set.mp4, set.jpg, set.gpu) = (last.mp4, last.jpg, last.gpu);
+    (set.mp4, set.jpg, set.gpu, set.clip) = (last.mp4, last.jpg, last.gpu, last.clip);
     let mut modal = ui::Win::new(&cap, mx, my, ui::Canvas::new(ui::SW, ui::SH, scale), mask)?; // drawn and mapped by the gear
+    // The tooltip of Área's switch, shown while it's hovered or focused.
+    let mut tip = ui::Win::new(&cap, 0, 0, ui::Canvas::new(1, 1, scale), EventMask::NO_EVENT)?;
+    let mut tip_text: Option<String> = None;
     // Everything fades in together: the dimmed screen, the badge, the panel.
-    let ours = [ov.win, badge.id, panel.id, modal.id];
+    let ours = [ov.win, badge.id, panel.id, modal.id, tip.id];
     let mut fade = ui::Fade::new(&cap)?;
     fade.apply(&cap.conn, &ours)?; // transparent before it's mapped
     ui::set_reduced_motion(reduced.join().unwrap_or(false));
@@ -502,7 +529,7 @@ fn gui() -> Res<()> {
                     false
                 }
                 Event::MotionNotify(e) if e.event == panel.id => {
-                    let h = ui::panel_hit(scale, e.event_x, e.event_y);
+                    let h = ui::panel_hit(scale, e.event_x, e.event_y, st.mode == Mode::Selection);
                     (redraw, st.hover) = (redraw || h != st.hover, h);
                     false
                 }
@@ -520,7 +547,7 @@ fn gui() -> Res<()> {
                     false
                 }
                 Event::ButtonPress(e) if e.event == pid && e.detail == 1 => {
-                    press = ui::panel_hit(scale, e.event_x, e.event_y).map(|h| (Press::Panel(h), false));
+                    press = ui::panel_hit(scale, e.event_x, e.event_y, st.mode == Mode::Selection).map(|h| (Press::Panel(h), false));
                     false
                 }
                 Event::ButtonPress(e) if e.event == mid && e.detail == 1 => {
@@ -585,9 +612,9 @@ fn gui() -> Res<()> {
                     } else if sym == KEY_TAB || KEYS_PREV.contains(&sym) || KEYS_NEXT.contains(&sym) {
                         let back = if sym == KEY_TAB { u16::from(e.state) & 1 != 0 } else { KEYS_PREV.contains(&sym) }; // Shift is bit 1
                         if ring && st.settings_open {
-                            sfocus = ui::step(&ui::SETTINGS_ORDER, sfocus, back, |h| h == SetHit::Gpu && !set.gpu_found);
+                            sfocus = ui::step(&ui::SETTINGS_ORDER, sfocus, back, |h| (h == SetHit::Gpu && !set.gpu_found) || (h == SetHit::Clip && set.record));
                         } else if ring {
-                            pfocus = ui::step(&ui::PANEL_ORDER, pfocus, back, |_| false);
+                            pfocus = ui::step(&ui::PANEL_ORDER, pfocus, back, |h| h == Hit::Ocr && st.mode != Mode::Selection);
                         }
                         ring = true; // the first press only shows where the focus is
                         false
@@ -623,6 +650,10 @@ fn gui() -> Res<()> {
                             cap.conn.map_window(mid)?;
                         }
                         Hit::Shutter => shoot = true,
+                        Hit::Ocr => {
+                            (st.ocr, last.ocr) = (!st.ocr, !st.ocr);
+                            last.save();
+                        }
                     }
                     if key && matches!(h, Hit::Mode(_) | Hit::Shot | Hit::Cast) {
                         pfocus = Hit::Shutter; // pick, then Enter again captures
@@ -637,6 +668,8 @@ fn gui() -> Res<()> {
                         SetHit::Output(i) => set.output = i,
                         SetHit::Mic => set.mic = !set.mic,
                         SetHit::Pointer => set.pointer = !set.pointer,
+                        SetHit::Clip if !set.record => set.clip = !set.clip,
+                        SetHit::Clip => {} // photos only: off limits on video
                         SetHit::VideoFormat(i) => set.mp4 = i == 1,
                         SetHit::Gpu => set.gpu = !set.gpu,
                         SetHit::ImageFormat(i) => set.jpg = i == 1,
@@ -649,7 +682,7 @@ fn gui() -> Res<()> {
                     }
                     // Settings stick at once, also when the launcher is then closed.
                     (last.pointer, last.output, last.mic) = (set.pointer, audio::OUTPUTS[set.output], set.mic);
-                    (last.mp4, last.jpg, last.gpu) = (set.mp4, set.jpg, set.gpu);
+                    (last.mp4, last.jpg, last.gpu, last.clip) = (set.mp4, set.jpg, set.gpu, set.clip);
                     last.save();
                 }
                 None => {}
@@ -668,7 +701,7 @@ fn gui() -> Res<()> {
                     None => None,
                 };
                 let app = app.and_then(|id| ewmh.pid(&cap, id));
-                return shutter(cap, &mut ov, (&[&panel, &modal, &badge], &mut fade), target, &last, &cursor, app, (fonts(), scale));
+                return shutter(cap, &mut ov, (&[&panel, &modal, &badge, &tip], &mut fade), target, &last, &cursor, app, (fonts(), scale));
             }
         }
         if reshape {
@@ -692,6 +725,12 @@ fn gui() -> Res<()> {
                 badge_at = want;
             }
         }
+        if pfocus == Hit::Ocr && st.mode != Mode::Selection {
+            pfocus = Hit::Mode(st.mode); // the switch went with Área
+        }
+        if sfocus == SetHit::Clip && st.record {
+            sfocus = SetHit::ImageFormat(1); // the clipboard is off limits on video
+        }
         let f = (ring && !st.settings_open).then_some(pfocus);
         (redraw, st.focus) = (redraw || f != st.focus, f);
         let f = ring.then_some(sfocus);
@@ -701,6 +740,21 @@ fn gui() -> Res<()> {
             panel.redraw(&cap.conn, ui::panel(&st))?;
         }
         moving = st.busy();
+        // Área's switch explains itself while it's hovered or focused.
+        let want = (st.mode == Mode::Selection && (st.hover == Some(Hit::Ocr) || st.focus == Some(Hit::Ocr))).then(|| ui::ocr_tip(st.ocr, st.record, set.clip));
+        if want != tip_text {
+            if let Some(text) = &want {
+                let c = ui::tooltip(text, font(), scale);
+                let (x, y) = ui::tooltip_pos(sw, sh, scale, (c.w as i32, c.h as i32));
+                tip.reset(&cap.conn, x, y, c)?;
+                tip.show(&cap.conn)?;
+            } else {
+                cap.conn.unmap_window(tip.id)?;
+            }
+            tip_text = want;
+        }
+        let (rec, text) = (st.record, st.ocr && st.mode == Mode::Selection);
+        (restyle, set.record, set.text) = (restyle || (rec, text) != (set.record, set.text), rec, text);
         if st.settings_open {
             set.sync();
             if restyle || moving_set || set.busy() {
@@ -721,15 +775,29 @@ fn shutter(mut cap: Capture, ov: &mut select::Overlay, (windows, fade): (&[&ui::
     let Some(target) = target else { return fade_out(&cap.conn, fade, &ours) }; // Window mode with no window picked
     let (Target::Area(r) | Target::Window(_, r)) = target;
     last.save();
+    let text = last.text(); // recognize the capture's text
     if !last.record {
         // The file never waits for the fade: it's cut from the frozen screen while the launcher fades out.
         let path = default_path("PICTURES", &shot_prefix(), if last.jpg { "jpg" } else { "png" });
         let (frame, sw) = (cap.frame(), cap.sw);
+        let (w, h) = ((r.2 - r.0) as usize, (r.3 - r.1) as usize);
         return std::thread::scope(|s| {
-            let saved = s.spawn(|| save_image(frame, sw, r, last.pointer.then_some(cursor), &path).map_err(|e| e.to_string())); // a String crosses threads
+            // Errors cross the thread as Strings; the copy's own failure doesn't undo the saved file.
+            let saved = s.spawn(|| -> Result<Option<String>, String> {
+                let img = save_image(frame, sw, r, last.pointer.then_some(cursor), &path).map_err(|e| e.to_string())?;
+                // With the text recognized, the clipboard gets the text instead.
+                Ok(if last.clip && !text { desktop::copy_image(&img, w, h, w * 4).err().map(|e| e.to_string()) } else { None })
+            });
             fade_out(&cap.conn, fade, &ours)?;
-            saved.join().map_err(|_| "the screenshot could not be saved")??;
-            notify(&tr!("Screenshot saved", "Captura guardada", "スクリーンショットを保存しました"), &tilde(&path), Some(&path));
+            let copy_failed = saved.join().map_err(|_| "the screenshot could not be saved")??;
+            let title = match last.clip && !text && copy_failed.is_none() {
+                true => tr!("Screenshot saved and copied", "Captura guardada y copiada", "スクリーンショットを保存してコピーしました"),
+                false => tr!("Screenshot saved", "Captura guardada", "スクリーンショットを保存しました"),
+            };
+            notify(&title, &tilde(&path), Some(&path));
+            if let Some(e) = copy_failed {
+                notify(&tr!("Couldn't copy the screenshot", "No se pudo copiar la captura", "スクリーンショットをコピーできませんでした"), &e, None);
+            }
             Ok(())
         });
     }
