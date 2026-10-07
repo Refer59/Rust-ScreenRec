@@ -247,10 +247,6 @@ impl Capture {
         false
     }
 
-    pub fn flush(&self) -> Res<()> {
-        Ok(())
-    }
-
     /// No damage events: after a still screen, wait `timeout` before looking
     /// again; after a change, look again at once (record() already paces
     /// itself to the frame rate).

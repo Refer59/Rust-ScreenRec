@@ -315,6 +315,22 @@ impl Capture {
         self.track(self.root)
     }
 
+    /// Stop tracking (paused): no damage reports wake us up until `retrack`.
+    pub fn untrack(&mut self) -> Res<()> {
+        if self.damage != 0 {
+            self.conn.damage_destroy(self.damage)?;
+            self.damage = 0;
+        }
+        self.pending = None;
+        Ok(())
+    }
+
+    /// Track again what `track_changes` or `follow_window` tracked.
+    pub fn retrack(&mut self) -> Res<()> {
+        let drawable = self.follow.as_ref().map_or(self.root, |f| f.top);
+        self.track(drawable)
+    }
+
     fn track(&mut self, drawable: u32) -> Res<()> {
         self.conn.damage_query_version(1, 1)?.reply()?;
         self.damage = self.conn.generate_id()?;
@@ -375,7 +391,7 @@ impl Capture {
     fn drain_events(&mut self) -> Res<()> {
         while let Some(ev) = self.conn.poll_for_event()? {
             match ev {
-                Event::DamageNotify(e) => {
+                Event::DamageNotify(e) if e.damage == self.damage => {
                     let (mut x, mut y) = (e.area.x as i32, e.area.y as i32);
                     let (v, w) = (self.view, e.area.width as i32);
                     if let Some(f) = &self.follow {
@@ -385,6 +401,7 @@ impl Capture {
                         self.pending = union(self.pending, Some((y, y + e.area.height as i32)));
                     }
                 }
+                Event::DamageNotify(_) => {} // from a tracker destroyed by `untrack`
                 Event::ConfigureNotify(e) if self.follow.as_ref().is_some_and(|f| f.top == e.window) => {
                     let f = self.follow.as_mut().unwrap();
                     (self.view.x0, self.view.y0) = (e.x as i32 + f.crop.0, e.y as i32 + f.crop.1);
@@ -410,12 +427,6 @@ impl Capture {
                 ev => self.events.push(ev),
             }
         }
-        Ok(())
-    }
-
-    /// Send what we asked of the server (our windows' moves and repaints sit in a buffer until then).
-    pub fn flush(&self) -> Res<()> {
-        self.conn.flush()?;
         Ok(())
     }
 

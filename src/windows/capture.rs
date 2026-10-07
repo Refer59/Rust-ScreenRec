@@ -274,10 +274,6 @@ impl Capture {
         self.follow.as_ref().is_some_and(|f| unsafe { IsWindow(f.hwnd) } == 0)
     }
 
-    pub fn flush(&self) -> Res<()> {
-        Ok(())
-    }
-
     /// No damage events: after a capture that found nothing, sleep `timeout`
     /// (the caller already slept until the tick, so after a change don't).
     /// Takes a Duration or an Option of one (None: no limit, so one poll

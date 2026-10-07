@@ -755,11 +755,13 @@ fn pump_pill(cap: &mut Capture, pill: &mut Option<Pill>, paused: &mut Option<Ins
                 *paused_for += paused.take().unwrap().elapsed();
                 p.set_paused(&cap.conn, false)?;
                 cap.set_overlay(p.win.sprite());
+                cap.retrack()?;
                 settle(cap, None)?; // compositor must show this look before we remove it
             }
             PillEvent::TogglePause => {
                 *paused = Some(Instant::now());
                 p.set_paused(&cap.conn, true)?;
+                cap.untrack()?; // repaints must not wake us while paused
             }
             PillEvent::Stop => {
                 cap.conn.unmap_window(p.win.id)?;
@@ -974,8 +976,7 @@ fn record(cap: &mut Capture, path: &Path, opts: &RecOpts, mut pill: Option<Pill>
                 break;
             }
             if paused.is_some() {
-                cap.flush()?;
-                std::thread::sleep(tick);
+                cap.wait(Some(Duration::from_millis(100)))?; // the pill's clicks wake us at once
                 continue;
             }
             // At most `fps`, but otherwise capture the moment something changes:
