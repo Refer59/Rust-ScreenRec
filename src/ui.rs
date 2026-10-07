@@ -1714,7 +1714,7 @@ mod live {
     #[ignore = "needs an X display with a compositor"]
     fn pill_never_in_frames() {
         let mut cap = Capture::new().unwrap();
-        let (font, scale) = (load_font(false), 1.25);
+        let (font, bold, scale) = (load_font(false), load_bold(), 1.25);
         let (sw, sh) = (cap.sw as i32, cap.sh as i32);
         // An opaque backdrop with known pixels under the pill.
         let (bw, bh) = (320usize, 110usize);
@@ -1726,7 +1726,8 @@ mod live {
         let (bx, by) = (sw - bw as i32, sh - bh as i32);
         let backdrop = Win::new(&cap, bx, by, back, EventMask::EXPOSURE).unwrap();
         backdrop.show(&cap.conn).unwrap();
-        let mut pill = Pill::new(&cap, (font.as_ref(), None), scale).unwrap();
+        let fonts = (font.as_ref(), bold.as_ref());
+        let mut pill = Pill::new(&cap, fonts, scale).unwrap();
         cap.overlay = Some(pill.win.sprite());
         cap.draw_pointer = false;
         cap.track_changes().unwrap();
@@ -1740,7 +1741,7 @@ mod live {
         while t0.elapsed() < Duration::from_secs(3) {
             if Instant::now() >= next {
                 secs += 1;
-                pill.win.redraw(&cap.conn, pill_canvas(secs, font.as_ref(), scale)).unwrap();
+                pill.win.redraw(&cap.conn, pill_canvas(secs, fonts, scale)).unwrap();
                 cap.set_overlay(pill.win.sprite());
                 next += Duration::from_millis(150);
             }
@@ -1769,7 +1770,7 @@ mod live {
         assert_eq!(bad_frames, 0);
     }
 
-    fn pill_canvas(secs: u64, font: Option<&FontVec>, scale: f32) -> Canvas {
-        pill(false, secs * 7, (font, None), scale) // a new look every time
+    fn pill_canvas(secs: u64, fonts: (Option<&FontVec>, Option<&FontVec>), scale: f32) -> Canvas {
+        pill(false, secs * 7, fonts, scale) // a new look every time
     }
 }
