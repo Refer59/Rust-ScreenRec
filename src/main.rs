@@ -899,7 +899,9 @@ fn record(cap: &mut Capture, path: &Path, opts: &RecOpts, mut pill: Option<Pill>
     if w < 64 || h < 64 {
         return Err(tr!("the area is too small to record (minimum 64×64)", "el área es muy pequeña para grabar (mínimo 64×64)", "録画するには領域が小さすぎます (最小 64×64)").into());
     }
-    let mut enc = Video::new(cap.frame(), w, h, opts.fps.unwrap_or(60), opts.gpu)?; // whole screen buffer: covers any area
+    // The area's rows come first in the capture buffer (same stride once the
+    // region is set), so only that much is pinned for the GPU.
+    let mut enc = Video::new(&cap.frame()[..w * h * 4], w, h, opts.fps.unwrap_or(60), opts.gpu)?;
     let fps = opts.fps.unwrap_or(if matches!(enc, Video::Cpu(_)) { 30 } else { 60 });
     let (w32, h32) = (w as i32, h as i32);
     match target {
