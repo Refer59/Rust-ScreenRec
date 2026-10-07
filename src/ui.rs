@@ -511,7 +511,11 @@ type ShadowKey = (usize, usize, u32, u32, u32);
 thread_local! {
     /// Rendered shadows (alpha only), by canvas size and card: they never change, so frames just copy them.
     static SHADOWS: std::cell::RefCell<Vec<(ShadowKey, Vec<u8>)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Settled cards (shadow, body and hairline, opaque and at rest), by canvas size, card
+    /// and scale: every frame after the appear animation starts from a copy of one.
+    static CARDS: std::cell::RefCell<Vec<(CardKey, Vec<u32>)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
+type CardKey = (usize, usize, u32, u32, u32, u32);
 
 /// The soft shadow under a `w`×`h` body of radius `r`, drawn first on a still empty canvas.
 fn shadow(c: &mut Canvas, w_: f32, h_: f32, r: f32) {
@@ -550,10 +554,20 @@ fn shadow(c: &mut Canvas, w_: f32, h_: f32, r: f32) {
 }
 
 /// The one look of both cards: soft shadow, body, 1 px hairline inside its edge.
+/// It is the first thing painted on an empty canvas; once settled (opaque, at
+/// rest) its pixels are kept, and the next frame copies them instead.
 fn card(c: &mut Canvas, w: f32, h: f32, r: f32) {
+    let settled = c.alpha >= 1.0 && c.origin == (M, M);
+    let key = (c.w, c.h, w.to_bits(), h.to_bits(), r.to_bits(), c.scale.to_bits());
+    if settled && CARDS.with_borrow(|cache| cache.iter().find(|e| e.0 == key).map(|e| c.px.copy_from_slice(&e.1)).is_some()) {
+        return;
+    }
     shadow(c, w, h, r);
     c.paint(BLACK, rrect(0.0, 0.0, w, h, r));
     c.paint(HAIRLINE, stroke(rrect(0.5, 0.5, w - 0.5, h - 0.5, r - 0.5), 1.0));
+    if settled {
+        CARDS.with_borrow_mut(|cache| cache.push((key, c.px.clone())));
+    }
 }
 
 /// A round close button: `h` is how hovered it is.
