@@ -374,7 +374,10 @@ fn grab_keyboard(cap: &Capture, win: u32) -> Res<()> {
 #[cfg(target_os = "linux")]
 fn gui() -> Res<()> {
     let Some(_lock) = single_instance()? else { return Ok(()) };
-    std::thread::spawn(|| ui::set_reduced_motion(shortcut::animations_off())); // a gsettings call: not on the way to the first frame
+    for sig in [libc::SIGINT, libc::SIGTERM] {
+        unsafe { libc::signal(sig, on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t) }; // the shortcut again: fade out, then quit
+    }
+    let reduced = std::thread::spawn(shortcut::animations_off); // a gsettings call: runs while the screen freezes
     let fonts_job = std::thread::spawn(|| (ui::load_font(false), ui::load_bold())); // fc-match runs while the screen is set up
     let mut cap = Capture::new()?;
     let cursor = freeze(&mut cap)?; // the buffer keeps that screen until a recording starts: overlay and screenshots read it
@@ -407,7 +410,6 @@ fn gui() -> Res<()> {
     };
     let mut st = ui::PanelState::new(last.mode, last.record, fonts(), scale);
     let mut window = name_of(&cap, hovered); // the name of the window Window mode would take, for the badge
-    st.reveal();
     let ((px, py), (mx, my)) = ui::place(sw, sh, scale);
     let mask = EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION | EventMask::LEAVE_WINDOW;
     // The size badge sits under the panel in the stack (made first): the selection's size,
@@ -433,6 +435,12 @@ fn gui() -> Res<()> {
     (set.output, set.mic, set.pointer) = (audio::OUTPUTS.iter().position(|&o| o == last.output).unwrap_or(0), last.mic, last.pointer);
     (set.mp4, set.jpg, set.gpu) = (last.mp4, last.jpg, last.gpu);
     let mut modal = ui::Win::new(&cap, mx, my, ui::Canvas::new(ui::SW, ui::SH, scale), mask)?; // drawn and mapped by the gear
+    // Everything fades in together: the dimmed screen, the badge, the panel.
+    let ours = [ov.win, badge.id, panel.id, modal.id];
+    let mut fade = ui::Fade::new(&cap)?;
+    fade.apply(&cap.conn, &ours)?; // transparent before it's mapped
+    ui::set_reduced_motion(reduced.join().unwrap_or(false));
+    fade.go(1.0);
     ov.show(&cap.conn, cap.frame())?;
     if badge_at.is_some() {
         badge.show(&cap.conn)?;
@@ -447,7 +455,11 @@ fn gui() -> Res<()> {
     let (pid, mid, bid) = (panel.id, modal.id, badge.id);
     let mut thru = false; // a press began in a transparent margin: the drag belongs to the overlay
     loop {
-        cap.wait((moving || moving_set).then_some(Duration::from_millis(8)))?; // the next animation frame, else sleep until an event
+        cap.wait((moving || moving_set || fade.busy()).then_some(Duration::from_millis(8)))?; // the next animation frame, else sleep until an event
+        fade.apply(&cap.conn, &ours)?;
+        if STOP.load(Relaxed) {
+            return fade_out(&cap.conn, &mut fade, &ours);
+        }
         let (mut redraw, mut reshape, mut restyle) = (false, false, false); // panel, overlay, settings
         macro_rules! close_settings {
             () => {
@@ -569,7 +581,7 @@ fn gui() -> Res<()> {
                         close_settings!();
                         false
                     } else if sym == KEY_ESCAPE {
-                        return Ok(());
+                        return fade_out(&cap.conn, &mut fade, &ours);
                     } else if sym == KEY_TAB || KEYS_PREV.contains(&sym) || KEYS_NEXT.contains(&sym) {
                         let back = if sym == KEY_TAB { u16::from(e.state) & 1 != 0 } else { KEYS_PREV.contains(&sym) }; // Shift is bit 1
                         if ring && st.settings_open {
@@ -594,7 +606,7 @@ fn gui() -> Res<()> {
                 Some((Press::Panel(h), key)) => {
                     redraw = true;
                     match h {
-                        Hit::Close => return Ok(()),
+                        Hit::Close => return fade_out(&cap.conn, &mut fade, &ours),
                         Hit::Mode(m) => (st.mode, reshape) = (m, true),
                         Hit::Shot => st.record = false,
                         Hit::Cast => st.record = true,
@@ -656,7 +668,7 @@ fn gui() -> Res<()> {
                     None => None,
                 };
                 let app = app.and_then(|id| ewmh.pid(&cap, id));
-                return shutter(cap, &mut ov, &[&panel, &modal, &badge], target, &last, &cursor, app, (fonts(), scale));
+                return shutter(cap, &mut ov, (&[&panel, &modal, &badge], &mut fade), target, &last, &cursor, app, (fonts(), scale));
             }
         }
         if reshape {
@@ -704,21 +716,32 @@ fn gui() -> Res<()> {
 /// (`app`: the process whose sound "Window" means).
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
-fn shutter(mut cap: Capture, ov: &mut select::Overlay, windows: &[&ui::Win], target: Option<Target>, last: &Last, cursor: &Sprite, app: Option<u32>, (fonts, scale): ((Option<&ab_glyph::FontVec>, Option<&ab_glyph::FontVec>), f32)) -> Res<()> {
-    let Some(target) = target else { return Ok(()) }; // Window mode with no window picked
+fn shutter(mut cap: Capture, ov: &mut select::Overlay, (windows, fade): (&[&ui::Win], &mut ui::Fade), target: Option<Target>, last: &Last, cursor: &Sprite, app: Option<u32>, (fonts, scale): ((Option<&ab_glyph::FontVec>, Option<&ab_glyph::FontVec>), f32)) -> Res<()> {
+    let ours: Vec<u32> = std::iter::once(ov.win).chain(windows.iter().map(|w| w.id)).collect();
+    let Some(target) = target else { return fade_out(&cap.conn, fade, &ours) }; // Window mode with no window picked
     let (Target::Area(r) | Target::Window(_, r)) = target;
     last.save();
     if !last.record {
+        // The file never waits for the fade: it's cut from the frozen screen while the launcher fades out.
         let path = default_path("PICTURES", &shot_prefix(), if last.jpg { "jpg" } else { "png" });
-        save_image(cap.frame(), cap.sw, r, last.pointer.then_some(cursor), &path)?;
-        notify(&tr!("Screenshot saved", "Captura guardada", "スクリーンショットを保存しました"), &tilde(&path), Some(&path));
-        return Ok(());
+        let (frame, sw) = (cap.frame(), cap.sw);
+        return std::thread::scope(|s| {
+            let saved = s.spawn(|| save_image(frame, sw, r, last.pointer.then_some(cursor), &path).map_err(|e| e.to_string())); // a String crosses threads
+            fade_out(&cap.conn, fade, &ours)?;
+            saved.join().map_err(|_| "the screenshot could not be saved")??;
+            notify(&tr!("Screenshot saved", "Captura guardada", "スクリーンショットを保存しました"), &tilde(&path), Some(&path));
+            Ok(())
+        });
+    }
+    // A recording waits until the launcher is gone: none of it may end up in the video.
+    fade_out(&cap.conn, fade, &ours)?;
+    if STOP.load(Relaxed) {
+        return Ok(()); // the shortcut again while it faded: that's a cancel
     }
     ov.release(&cap.conn)?;
     for w in windows {
         cap.conn.unmap_window(w.id)?;
     }
-    cap.conn.ungrab_keyboard(CURRENT_TIME)?;
     let pill = ui::Pill::new(&cap, fonts, scale)?;
     cap.overlay = Some(pill.win.sprite());
     cap.draw_pointer = last.pointer;
@@ -734,6 +757,23 @@ fn shutter(mut cap: Capture, ov: &mut select::Overlay, windows: &[&ui::Win], tar
     };
     notify(&tr!("Recording saved", "Grabación guardada", "録画を保存しました"), &tilde(&path), None);
     Ok(())
+}
+
+/// Fade the launcher out and return once it's invisible. The keyboard goes
+/// back to the desktop at once, so typing right after Esc isn't lost.
+#[cfg(target_os = "linux")]
+fn fade_out(conn: &impl Connection, fade: &mut ui::Fade, ours: &[u32]) -> Res<()> {
+    conn.ungrab_keyboard(CURRENT_TIME)?;
+    fade.go(0.0);
+    loop {
+        let done = !fade.busy();
+        fade.apply(conn, ours)?;
+        conn.flush()?;
+        if done {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(8));
+    }
 }
 
 /// Grab until `gone` is off screen and the pill, if any, is composited as

@@ -695,7 +695,6 @@ pub struct PanelState<'a> {
 }
 
 struct PanelTw {
-    appear: Tween,
     mode: Tween, // fractional index of the chosen mode
     record: Tween,
     hover: Hov<Hit>,
@@ -704,7 +703,7 @@ struct PanelTw {
 impl<'a> PanelState<'a> {
     pub fn new(mode: Mode, record: bool, (font, bold): (Option<&'a FontVec>, Option<&'a FontVec>), scale: f32) -> Self {
         let ix = MODES.iter().position(|&m| m == mode).unwrap() as f32;
-        let tw = PanelTw { appear: Tween::new(1.0), mode: Tween::io(ix), record: Tween::io(record as u8 as f32), hover: Hov::new() };
+        let tw = PanelTw { mode: Tween::io(ix), record: Tween::io(record as u8 as f32), hover: Hov::new() };
         PanelState { mode, record, hover: None, settings_open: false, font, bold, focus: None, scale, tw }
     }
 
@@ -718,12 +717,7 @@ impl<'a> PanelState<'a> {
 
     pub fn busy(&self) -> bool {
         let t = &self.tw;
-        t.appear.busy() || t.mode.busy() || t.record.busy() || t.hover.t.busy()
-    }
-
-    /// Start the appear animation over.
-    pub fn reveal(&mut self) {
-        self.tw.appear = appear(180.0);
+        t.mode.busy() || t.record.busy() || t.hover.t.busy()
     }
 
     /// Jump every tween to the state (previews).
@@ -731,7 +725,7 @@ impl<'a> PanelState<'a> {
     pub fn settle(&mut self) {
         self.sync();
         let t = &mut self.tw;
-        for w in [&mut t.appear, &mut t.mode, &mut t.record] {
+        for w in [&mut t.mode, &mut t.record] {
             w.settle();
         }
         t.hover.settle(self.hover);
@@ -755,8 +749,7 @@ pub fn panel_body_has(scale: f32, x: i16, y: i16) -> bool {
 pub fn panel(s: &PanelState) -> Canvas {
     let mut c = Canvas::new(PW, PH, s.scale);
     let t = &s.tw;
-    let a = t.appear.get();
-    (c.alpha, c.origin) = (a, (M, M + (1.0 - a) * 14.0));
+    c.origin = (M, M);
     card(&mut c, BODY.0, BODY.1, BODY_R);
     let (idx, rec) = (t.mode.get(), t.record.get());
     let hv = |h| t.hover.amt(h);
@@ -1176,6 +1169,54 @@ pub fn pill(paused: bool, secs: u64, (font, bold): (Option<&FontVec>, Option<&Fo
     c
 }
 
+/// The whole launcher's opacity, which the compositor applies through each window's
+/// _NET_WM_WINDOW_OPACITY: fading in or out redraws nothing here, a frame costs four
+/// small requests. Without a compositing manager nothing can fade, so it doesn't.
+pub struct Fade {
+    atom: u32,
+    tw: Tween,
+    shown: Option<u32>, // the value last set
+    on: bool,           // a compositor applies it
+}
+
+/// A fade all the way, in or out.
+const FADE_MS: f32 = 500.0;
+
+impl Fade {
+    /// Fully transparent until `go`.
+    pub fn new(cap: &Capture) -> Res<Self> {
+        let conn = &cap.conn;
+        let screen = conn.setup().roots.iter().position(|s| s.root == cap.root).unwrap_or(0);
+        let cm = conn.intern_atom(false, format!("_NET_WM_CM_S{screen}").as_bytes())?;
+        let atom = conn.intern_atom(false, b"_NET_WM_WINDOW_OPACITY")?.reply()?.atom;
+        let on = conn.get_selection_owner(cm.reply()?.atom)?.reply()?.owner != x11rb::NONE;
+        Ok(Fade { atom, tw: Tween::new(0.0), shown: None, on })
+    }
+
+    /// Head for opacity `to`: half a second for the whole way, less for part of it;
+    /// at once without a compositor or with reduced motion.
+    pub fn go(&mut self, to: f32) {
+        let ms = if self.on { FADE_MS * (to - self.tw.get()).abs() } else { 0.0 };
+        self.tw.go(to, ms);
+    }
+
+    pub fn busy(&self) -> bool {
+        self.tw.busy()
+    }
+
+    /// Put the current opacity on `wins`, if it changed since the last call.
+    pub fn apply(&mut self, conn: &impl Connection, wins: &[u32]) -> Res<()> {
+        let v = (self.tw.get().clamp(0.0, 1.0) as f64 * u32::MAX as f64).round() as u32;
+        if self.shown != Some(v) {
+            for &w in wins {
+                conn.change_property32(PropMode::REPLACE, w, self.atom, AtomEnum::CARDINAL, &[v])?;
+            }
+            self.shown = Some(v);
+        }
+        Ok(())
+    }
+}
+
 /// Override-redirect ARGB window: no decorations, no WM animations, stays on top.
 pub struct Win {
     pub id: u32,
@@ -1517,8 +1558,6 @@ mod preview {
             };
             let mut mid = panel_state(Mode::Screen, true, None, false, None);
             (mid.tw.mode, mid.tw.record) = (Tween::io(0.5), Tween::io(0.5));
-            let mut fresh = panel_state(Mode::Selection, false, None, false, None);
-            fresh.tw.appear = Tween::new(0.5);
             let panels = [
                 ("shot", panel_state(Mode::Selection, false, None, false, None)),
                 ("rec-hover", panel_state(Mode::Window, true, Some(Hit::Shutter), false, None)),
@@ -1527,7 +1566,6 @@ mod preview {
                 ("focus-shutter", panel_state(Mode::Screen, false, None, false, Some(Hit::Shutter))),
                 ("focus-window", panel_state(Mode::Screen, false, Some(Hit::Close), false, Some(Hit::Mode(Mode::Window)))),
                 ("mid", mid),
-                ("appear", fresh),
             ];
             // Every mode word fits its cell with room to spare.
             for m in MODES {

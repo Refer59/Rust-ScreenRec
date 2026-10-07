@@ -524,7 +524,9 @@ impl Capture {
             } else {
                 let ms = until.map_or(-1, |t| t.saturating_duration_since(now).as_micros().div_ceil(1000).min(i32::MAX as u128) as i32);
                 let mut fd = libc::pollfd { fd: self.conn.stream().as_raw_fd(), events: libc::POLLIN, revents: 0 };
-                unsafe { libc::poll(&mut fd, 1, ms) };
+                if unsafe { libc::poll(&mut fd, 1, ms) } < 0 {
+                    return Ok(()); // a signal: the caller looks at what it changed
+                }
             }
             if deadline.is_some_and(|d| Instant::now() >= d) {
                 self.drain_events()?;
