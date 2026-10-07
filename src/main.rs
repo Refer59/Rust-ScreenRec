@@ -362,6 +362,7 @@ fn grab_keyboard(cap: &Capture, win: u32) -> Res<()> {
 fn gui() -> Res<()> {
     let Some(_lock) = single_instance()? else { return Ok(()) };
     std::thread::spawn(|| ui::set_reduced_motion(shortcut::animations_off())); // a gsettings call: not on the way to the first frame
+    let fonts_job = std::thread::spawn(|| (ui::load_font(false), ui::load_bold())); // fc-match runs while the screen is set up
     let mut cap = Capture::new()?;
     let (screen, cursor) = freeze(&mut cap)?; // screenshots come from this: our UI is never in them
     let (sw, sh) = (cap.sw as i32, cap.sh as i32);
@@ -369,7 +370,7 @@ fn gui() -> Res<()> {
     let wins = ewmh.windows(&cap);
     let window_at = |x: i32, y: i32| wins.iter().copied().find(|&(r, _)| select::contains(r, x, y));
     let mut last = Last::load(sw, sh);
-    let ((latin, latin_bold), ja) = (std::thread::scope(|s| (ui::load_font(false), s.spawn(ui::load_bold).join().ok().flatten())), std::cell::OnceCell::new());
+    let ((latin, latin_bold), ja) = (fonts_job.join().unwrap_or((None, None)), std::cell::OnceCell::new());
     let font = || match i18n::lang() {
         i18n::Lang::Ja => ja.get_or_init(|| ui::load_font(true)).as_ref(),
         _ => latin.as_ref(),
@@ -414,10 +415,11 @@ fn gui() -> Res<()> {
     let mut panel = ui::Win::new(&cap, px, py, ui::panel(&st), mask)?;
     let shortcut_now = || shortcut::get().map_or(tr!("none", "ninguno", "なし"), |a| shortcut::pretty(&a));
     let mut set = ui::SettingsState::new(fonts(), None, scale);
-    (set.output, set.mic, set.pointer, set.shortcut) = (audio::OUTPUTS.iter().position(|&o| o == last.output).unwrap_or(0), last.mic, last.pointer, shortcut_now());
-    (set.mp4, set.jpg, set.gpu, set.gpu_found) = (last.mp4, last.jpg, last.gpu, nvenc::available());
-    set.settle();
-    let mut modal = ui::Win::new(&cap, mx, my, ui::settings(&set), mask)?; // mapped by the gear
+    // The shortcut (two gsettings runs), the NVIDIA probe (a driver dlopen) and the
+    // render wait for the gear: none of them is needed to show the panel.
+    (set.output, set.mic, set.pointer) = (audio::OUTPUTS.iter().position(|&o| o == last.output).unwrap_or(0), last.mic, last.pointer);
+    (set.mp4, set.jpg, set.gpu) = (last.mp4, last.jpg, last.gpu);
+    let mut modal = ui::Win::new(&cap, mx, my, ui::Canvas::new(ui::SW, ui::SH, scale), mask)?; // drawn and mapped by the gear
     ov.show(&cap.conn)?;
     if badge_at.is_some() {
         badge.show(&cap.conn)?;
@@ -580,6 +582,7 @@ fn gui() -> Res<()> {
                         }
                         Hit::Settings => {
                             (st.settings_open, set.shortcut, set.capturing, set.cjk, sfocus) = (true, shortcut_now(), false, cjk(), ui::SETTINGS_ORDER[0]);
+                            set.gpu_found = nvenc::available();
                             (set.hover, set.focus) = (None, ring.then_some(sfocus));
                             set.settle();
                             set.reveal();

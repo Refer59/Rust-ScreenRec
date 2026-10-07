@@ -609,8 +609,8 @@ const PW: usize = 448;
 const PH: usize = 212;
 const SBODY: (f32, f32) = (340.0, 478.0);
 const SBODY_R: f32 = 28.0;
-const SW: usize = 388;
-const SH: usize = 526;
+pub const SW: usize = 388; // the settings popover, logical px
+pub const SH: usize = 526;
 /// Each mode word's cell: a third of the strip, 75 tall (as big as the old 110×88 tiles).
 const CELL: (f32, f32) = ((BODY.0 - 12.0) / 3.0, 75.0);
 const ROW: f32 = 118.0; // the bottom row's centre: photo|video, shutter, gear
