@@ -10,6 +10,8 @@
 //! image of an unmapped window, the video holds its last frame).
 
 use crate::Res;
+use crate::frame::{Rows, View, draw, shows};
+pub use crate::frame::Sprite;
 use std::os::fd::AsRawFd;
 use std::time::Duration;
 use x11rb::connection::Connection;
@@ -22,9 +24,6 @@ use x11rb::protocol::xproto::{ChangeWindowAttributesAux, ConnectionExt as _, Cre
 use x11rb::rust_connection::RustConnection;
 use x11rb::{CURRENT_TIME, NONE};
 
-/// Half-open row range [y0, y1).
-pub type Rows = (i32, i32);
-
 fn union(a: Option<Rows>, b: Option<Rows>) -> Option<Rows> {
     match (a, b) {
         (Some(a), Some(b)) => Some((a.0.min(b.0), a.1.max(b.1))),
@@ -34,75 +33,6 @@ fn union(a: Option<Rows>, b: Option<Rows>) -> Option<Rows> {
 
 fn overlaps(a: Rows, b: Rows) -> bool {
     a.0 < b.1 && b.0 < a.1
-}
-
-/// An image at a screen position, premultiplied ARGB: the cursor or one of our windows.
-pub struct Sprite {
-    pub x: i32,
-    pub y: i32,
-    pub w: i32,
-    pub h: i32,
-    pub argb: Vec<u32>,
-}
-
-impl Sprite {
-    /// (pixel, screen x, screen y) of every non-transparent pixel, drawn at (x, y).
-    fn pixels_at(&self, x: i32, y: i32) -> impl Iterator<Item = (u32, i32, i32)> + '_ {
-        (0..self.h)
-            .flat_map(move |sy| (0..self.w).map(move |sx| (self.argb[(sy * self.w + sx) as usize], x + sx, y + sy)))
-            .filter(|(p, ..)| p >> 24 != 0)
-    }
-
-    fn covers(&self, x: i32, y: i32) -> bool {
-        let (x, y) = (x - self.x, y - self.y);
-        x >= 0 && y >= 0 && x < self.w && y < self.h && self.argb[(y * self.w + x) as usize] >> 24 != 0
-    }
-}
-
-/// Where a BGRX frame sits on screen: w×h pixels with top-left at (x0, y0).
-#[derive(Clone, Copy)]
-pub struct View {
-    pub w: usize,
-    pub h: usize,
-    pub x0: i32,
-    pub y0: i32,
-}
-
-impl View {
-    /// Byte offset of screen pixel (x, y), if it is in the frame.
-    fn at(&self, x: i32, y: i32) -> Option<usize> {
-        let (x, y) = (x - self.x0, y - self.y0);
-        (x >= 0 && y >= 0 && (x as usize) < self.w && (y as usize) < self.h).then(|| (y as usize * self.w + x as usize) * 4)
-    }
-
-    /// Screen rows this frame covers.
-    fn rows(&self) -> Rows {
-        (self.y0, self.y0 + self.h as i32)
-    }
-}
-
-/// Whether most opaque pixels of `s` are in the frame, verbatim.
-fn shows(f: &[u8], v: View, s: &Sprite) -> bool {
-    let (mut n, mut hit) = (0, 0);
-    for (p, x, y) in s.pixels_at(s.x, s.y).filter(|(p, ..)| p >> 24 == 255) {
-        if let Some(i) = v.at(x, y) {
-            n += 1;
-            hit += (f[i..i + 3] == p.to_le_bytes()[..3]) as usize;
-        }
-    }
-    n > 0 && hit * 2 >= n
-}
-
-/// Alpha-blend `s` over the frame.
-pub fn draw(f: &mut [u8], v: View, s: &Sprite) {
-    for (p, x, y) in s.pixels_at(s.x, s.y) {
-        if let Some(i) = v.at(x, y) {
-            let a = p >> 24;
-            for (k, d) in f[i..i + 3].iter_mut().enumerate() {
-                *d = ((p >> (8 * k) & 255) + (*d as u32 * (255 - a) + 127) / 255) as u8;
-            }
-        }
-    }
 }
 
 /// The compositor shows the pill `o`, drawn at (ox, oy), as o + under·(1 − a).

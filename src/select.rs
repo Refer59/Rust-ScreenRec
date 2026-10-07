@@ -9,8 +9,7 @@ use x11rb::connection::Connection;
 use x11rb::protocol::xproto::*;
 use x11rb::wrapper::ConnectionExt as _;
 
-/// Screen rectangle, half-open: (x0, y0, x1, y1).
-pub type Rect = (i32, i32, i32, i32);
+pub use crate::frame::Rect;
 
 const HANDLE: i32 = 11; // corner handle radius
 const BORDER: i32 = 2;

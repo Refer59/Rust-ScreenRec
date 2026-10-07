@@ -6,6 +6,7 @@
 mod i18n;
 mod audio;
 mod capture;
+mod frame;
 mod mkv;
 mod nvenc;
 #[allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code, unused_imports, clippy::all)]
@@ -16,8 +17,8 @@ mod ui;
 mod x264;
 
 use audio::Output;
-use capture::{Capture, Sprite, View};
-use select::Rect;
+use capture::Capture;
+use frame::{Rect, Sprite, View};
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -184,7 +185,7 @@ fn save_image(screen: &[u8], sw: usize, r: Rect, cursor: Option<&Sprite>, path: 
         img.extend_from_slice(&screen[(y as usize * sw + r.0 as usize) * 4..][..w * 4]);
     }
     if let Some(c) = cursor {
-        capture::draw(&mut img, View { w, h, x0: r.0, y0: r.1 }, c);
+        frame::draw(&mut img, View { w, h, x0: r.0, y0: r.1 }, c);
     }
     if path.extension().is_some_and(|e| e == "jpg" || e == "jpeg") {
         let jpg = jpeg_encoder::Encoder::new_file(path, 90)?;
