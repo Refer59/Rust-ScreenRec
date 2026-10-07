@@ -287,6 +287,13 @@ pub fn drag(g: Grip, x: i32, y: i32, (sw, sh): (i32, i32)) -> Rect {
     }
 }
 
+/// The overlay as it would look over `frozen` (BGRX), for offscreen previews.
+#[cfg(test)]
+pub fn preview(frozen: Vec<u8>, w: usize, h: usize, area: Option<Rect>, handles: bool) -> Vec<u8> {
+    let o = Overlay { win: 0, pix: 0, gc: 0, frozen, w, h, shown: (area, handles), cursors: vec![], cursor: 0 };
+    o.render((0, 0, w as i32, h as i32))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

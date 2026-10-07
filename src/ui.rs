@@ -677,3 +677,119 @@ impl Pill {
         self.win.redraw(conn, pill(paused))
     }
 }
+
+/// Offscreen renders of every surface, for design review:
+/// `SCREENREC_PREVIEW=<dir> cargo test preview -- --ignored`.
+#[cfg(test)]
+mod preview {
+    use super::*;
+    use crate::i18n::{self, Lang};
+
+    /// Save premultiplied ARGB pixels over an opaque `bg` as an RGB PNG.
+    fn save(dir: &str, name: &str, w: usize, h: usize, px: &[u32], bg: [u8; 3]) {
+        let rgb: Vec<u8> = px
+            .iter()
+            .flat_map(|&p| {
+                let a = 255 - (p >> 24);
+                [(p >> 16 & 255, bg[0]), (p >> 8 & 255, bg[1]), (p & 255, bg[2])].map(|(c, b)| (c + (b as u32 * a + 127) / 255).min(255) as u8)
+            })
+            .collect();
+        let mut png = png::Encoder::new(std::fs::File::create(format!("{dir}/{name}.png")).unwrap(), w as u32, h as u32);
+        png.set_color(png::ColorType::Rgb);
+        let mut wr = png.write_header().unwrap();
+        wr.write_image_data(&rgb).unwrap();
+    }
+
+    /// Blend canvas `c` onto `dst` (premultiplied ARGB, `dw` wide) at (x, y).
+    fn over(dst: &mut [u32], dw: usize, c: &Canvas, x: usize, y: usize) {
+        for (cy, row) in c.px.chunks_exact(c.w).enumerate() {
+            for (cx, &p) in row.iter().enumerate() {
+                let d = &mut dst[(y + cy) * dw + x + cx];
+                let a = 255 - (p >> 24);
+                let ch = |sh: u32| ((p >> sh & 255) + ((*d >> sh & 255) * a + 127) / 255).min(255);
+                *d = 255 << 24 | ch(16) << 16 | ch(8) << 8 | ch(0);
+            }
+        }
+    }
+
+    /// A made-up 1920×1080 desktop: wallpaper and two windows.
+    fn desktop() -> Canvas {
+        let (w, h) = (1920, 1080);
+        let mut c = Canvas::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let (t, u) = (x as f32 / w as f32, y as f32 / h as f32);
+                let ch = |a: f32, b: f32| ((a + (b - a) * (t * 0.6 + u * 0.4)) * 255.0) as u32;
+                c.px[y * w + x] = 255 << 24 | ch(0.17, 0.85) << 16 | ch(0.12, 0.42) << 8 | ch(0.33, 0.25);
+            }
+        }
+        for (x0, y0, x1, y1, bar) in [(180.0, 120.0, 1100.0, 760.0, gray(0.92)), (820.0, 300.0, 1700.0, 900.0, gray(0.2))] {
+            c.paint((0.0, 0.0, 0.0, 0.35), rrect(x0 - 6.0, y0 - 2.0, x1 + 6.0, y1 + 12.0, 16.0));
+            c.paint(if bar.0 > 0.5 { WHITE } else { gray(0.14) }, rrect(x0, y0, x1, y1, 10.0));
+            c.paint(bar, rrect(x0, y0, x1, y0 + 46.0, 10.0));
+            for i in 0..8 {
+                let y = y0 + 90.0 + i as f32 * 48.0;
+                let col = if bar.0 > 0.5 { gray(0.75) } else { gray(0.35) };
+                c.paint(col, rrect(x0 + 40.0, y, x0 + 40.0 + (x1 - x0 - 80.0) * (0.4 + 0.07 * (i % 5) as f32), y + 14.0, 7.0));
+            }
+        }
+        c
+    }
+
+    #[test]
+    #[ignore = "writes PNGs for design review"]
+    fn render_surfaces() {
+        let dir = std::env::var("SCREENREC_PREVIEW").unwrap_or_else(|_| "/tmp/screenrec-preview".into());
+        std::fs::create_dir_all(&dir).unwrap();
+        let bg = [0x30, 0x2a, 0x3a];
+        let desk = desktop();
+        let frozen: Vec<u8> = desk.px.iter().flat_map(|p| p.to_le_bytes()).collect();
+        let (sw, sh) = (desk.w, desk.h);
+        let (latin, ja) = (load_font(false), load_font(true));
+        for (lang, tag) in [(Lang::En, "en"), (Lang::Es, "es"), (Lang::Ja, "ja")] {
+            i18n::set(lang);
+            let font = if lang == Lang::Ja { ja.as_ref() } else { latin.as_ref() };
+            let panels = [
+                ("shot", PanelState { mode: Mode::Selection, record: false, window: None, hover: None, settings_open: false, font }),
+                ("rec-hover", PanelState { mode: Mode::Window, record: true, window: Some("Firefox Web Browser".into()), hover: Some(Hit::Shutter), settings_open: false, font }),
+                ("hover-gear", PanelState { mode: Mode::Screen, record: false, window: None, hover: Some(Hit::Mode(Mode::Window)), settings_open: true, font }),
+            ];
+            for (name, s) in &panels {
+                let c = panel(s);
+                save(&dir, &format!("panel-{name}-{tag}"), c.w, c.h, &c.px, bg);
+            }
+            let set = |hover, capturing, gpu_found| SettingsState {
+                output: 1,
+                mic: true,
+                mp4: false,
+                gpu: true,
+                gpu_found,
+                jpg: false,
+                pointer: false,
+                shortcut: "Ctrl+Shift+S".into(),
+                capturing,
+                hover,
+                font,
+            };
+            for (name, s) in [("default", set(None, false, true)), ("hover-capturing", set(Some(SetHit::Pointer), true, false))] {
+                let c = settings(&s);
+                save(&dir, &format!("settings-{name}-{tag}"), c.w, c.h, &c.px, bg);
+            }
+            // The whole launcher over the frozen desktop, as the user sees it.
+            let sel = (420, 260, 1240, 720);
+            let mut full: Vec<u32> = crate::select::preview(frozen.clone(), sw, sh, Some(sel), true).chunks_exact(4).map(|p| 255 << 24 | u32::from_le_bytes([p[0], p[1], p[2], 0])).collect();
+            let (px, py) = ((sw - PANEL_W) / 2, sh - PANEL_H - 48);
+            over(&mut full, sw, &panel(&panels[0].1), px, py);
+            save(&dir, &format!("launcher-{tag}"), sw, sh, &full, bg);
+            let (mx, my) = ((sw - SET_W) / 2, py + PANEL_TOP as usize - SET_H - 14);
+            over(&mut full, sw, &settings(&set(None, false, true)), mx, my);
+            save(&dir, &format!("launcher-settings-{tag}"), sw, sh, &full, bg);
+        }
+        // The pill over light and dark backgrounds.
+        for (name, paused) in [("recording", false), ("paused", true)] {
+            let c = pill(paused);
+            save(&dir, &format!("pill-{name}-light"), c.w, c.h, &c.px, [0xf2, 0xf2, 0xf2]);
+            save(&dir, &format!("pill-{name}-dark"), c.w, c.h, &c.px, [0x24, 0x24, 0x24]);
+        }
+    }
+}
