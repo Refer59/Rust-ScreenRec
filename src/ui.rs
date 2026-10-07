@@ -617,15 +617,15 @@ pub const PANEL_ORDER: [Hit; 8] = [Hit::Mode(Mode::Selection), Hit::Mode(Mode::S
 
 // Panel geometry, in logical px. The body sits in a transparent margin for its shadow.
 const M: f32 = 24.0;
-const BODY: (f32, f32) = (320.0, 147.0); // PAD + the strip + 3 + the shutter's hit (68) + 2 PAD under it
+const BODY: (f32, f32) = (320.0, 135.0); // PAD + the strip + 3 + the shutter's hit (68) + PAD
 const BODY_R: f32 = 16.0;
-/// The body's inner padding around the controls (their hit areas): twice that under the shutter.
+/// The body's inner padding around the controls (their hit areas), the same on all four sides.
 const PAD: f32 = 12.0;
 const PW: usize = 368;
-const PH: usize = 195;
-const SBODY: (f32, f32) = (340.0, 478.0);
+const PH: usize = 183;
+const SBODY: (f32, f32) = (BODY.0, 478.0); // as wide as the panel: the two cards stack flush
 const SBODY_R: f32 = 14.0;
-pub const SW: usize = 388; // the settings popover, logical px
+pub const SW: usize = 368; // the settings popover, logical px
 pub const SH: usize = 526;
 /// Each mode word's cell: a third of the strip, 40 tall.
 const CELL: (f32, f32) = ((BODY.0 - 2.0 * PAD) / 3.0, 40.0);
@@ -650,7 +650,7 @@ fn shape_of(h: Hit) -> Geo {
         Hit::Cast => Geo::Rect(SEG, ROW - 17.0, SEG + 43.0, ROW + 17.0, 7.0),
         Hit::Shutter => Geo::Disc(SHUTTER.0, SHUTTER.1, 31.0),
         Hit::Settings => Geo::Disc(GEAR, ROW, 20.0),
-        Hit::Close => Geo::Disc(BODY.0 - 4.0, 4.0, 14.0),
+        Hit::Close => Geo::Disc(BODY.0 - 1.0, 1.0, 14.0),
     }
 }
 
@@ -661,7 +661,7 @@ fn hit_of(h: Hit) -> Geo {
         Hit::Cast => Geo::Rect(SEG, ROW - 22.0, SEG + 48.0, ROW + 22.0, 11.0),
         Hit::Shutter => Geo::Disc(SHUTTER.0, SHUTTER.1, 34.0),
         Hit::Settings => Geo::Disc(GEAR, ROW, 25.0),
-        Hit::Close => Geo::Disc(BODY.0 - 4.0, 4.0, 18.0),
+        Hit::Close => Geo::Disc(BODY.0 - 1.0, 1.0, 18.0),
         _ => shape_of(h),
     }
 }
@@ -832,6 +832,9 @@ pub const SETTINGS_ORDER: [SetHit; 15] = [
     SetHit::Close,
 ];
 
+// Settings content runs between SX.0 and SX.1; the pickers and the shortcut field fill a right-hand column from PICK.
+const SX: (f32, f32) = (20.0, SBODY.0 - 20.0);
+const PICK: f32 = SX.1 - 124.0;
 // Settings rows (centres) in the body.
 const SEG_OUT: (f32, f32) = (84.0, 116.0);
 const ROW_MIC: f32 = 140.0;
@@ -854,36 +857,36 @@ fn pick_y(cy: f32) -> (f32, f32) {
 }
 
 fn row_rect(cy: f32) -> Geo {
-    Geo::Rect(8.0, cy - 18.0, 332.0, cy + 18.0, 6.0)
+    Geo::Rect(8.0, cy - 18.0, SBODY.0 - 8.0, cy + 18.0, 6.0)
 }
 
 fn switch_geo(cy: f32) -> Geo {
-    Geo::Rect(276.0, cy - 12.0, 320.0, cy + 12.0, 12.0)
+    Geo::Rect(SX.1 - 44.0, cy - 12.0, SX.1, cy + 12.0, 12.0)
 }
 
 /// What a settings control looks like (and where its focus ring goes).
 fn set_shape(h: SetHit) -> Geo {
     match h {
-        SetHit::Close => Geo::Disc(310.0, 30.0, 14.0),
-        SetHit::Output(i) => cell(20.0, 320.0, SEG_OUT, 3, i, 3.0),
-        SetHit::Lang(i) => cell(20.0, 320.0, SEG_LANG, 3, i, 3.0),
-        SetHit::VideoFormat(i) => cell(196.0, 320.0, pick_y(ROW_VIDEO), 2, i, 3.0),
-        SetHit::ImageFormat(i) => cell(196.0, 320.0, pick_y(ROW_SHOT), 2, i, 3.0),
+        SetHit::Close => Geo::Disc(SX.1 - 10.0, 30.0, 14.0),
+        SetHit::Output(i) => cell(SX.0, SX.1, SEG_OUT, 3, i, 3.0),
+        SetHit::Lang(i) => cell(SX.0, SX.1, SEG_LANG, 3, i, 3.0),
+        SetHit::VideoFormat(i) => cell(PICK, SX.1, pick_y(ROW_VIDEO), 2, i, 3.0),
+        SetHit::ImageFormat(i) => cell(PICK, SX.1, pick_y(ROW_SHOT), 2, i, 3.0),
         SetHit::Mic => switch_geo(ROW_MIC),
         SetHit::Gpu => switch_geo(ROW_GPU),
         SetHit::Pointer => switch_geo(ROW_POINTER),
-        SetHit::Shortcut => Geo::Rect(196.0, 350.0, 320.0, 382.0, 8.0),
+        SetHit::Shortcut => Geo::Rect(PICK, ROW_KEY - 16.0, SX.1, ROW_KEY + 16.0, 8.0),
     }
 }
 
 /// Where a settings control answers clicks: whole cells and whole rows.
 fn set_hit(h: SetHit) -> Geo {
     match h {
-        SetHit::Close => Geo::Disc(310.0, 30.0, 18.0),
-        SetHit::Output(i) => cell(20.0, 320.0, SEG_OUT, 3, i, 0.0),
-        SetHit::Lang(i) => cell(20.0, 320.0, SEG_LANG, 3, i, 0.0),
-        SetHit::VideoFormat(i) => cell(196.0, 320.0, pick_y(ROW_VIDEO), 2, i, 0.0),
-        SetHit::ImageFormat(i) => cell(196.0, 320.0, pick_y(ROW_SHOT), 2, i, 0.0),
+        SetHit::Close => Geo::Disc(SX.1 - 10.0, 30.0, 18.0),
+        SetHit::Output(i) => cell(SX.0, SX.1, SEG_OUT, 3, i, 0.0),
+        SetHit::Lang(i) => cell(SX.0, SX.1, SEG_LANG, 3, i, 0.0),
+        SetHit::VideoFormat(i) => cell(PICK, SX.1, pick_y(ROW_VIDEO), 2, i, 0.0),
+        SetHit::ImageFormat(i) => cell(PICK, SX.1, pick_y(ROW_SHOT), 2, i, 0.0),
         SetHit::Mic => row_rect(ROW_MIC),
         SetHit::Gpu => row_rect(ROW_GPU),
         SetHit::Pointer => row_rect(ROW_POINTER),
@@ -1053,7 +1056,7 @@ pub fn settings(s: &SettingsState) -> Canvas {
     section(&mut c, &tr!("Sound", "Sonido", "サウンド"), 74.0);
     let sound = [tr!("None", "Sin sonido", "なし"), tr!("System", "Sistema", "システム"), tr!("App", "Aplicación", "アプリ")];
     let labels: Vec<(&str, Option<&FontVec>)> = sound.iter().map(|l| (l.as_str(), f)).collect();
-    segmented(&mut c, (20.0, 320.0), SEG_OUT, &labels, t.out.get(), &|i| hv(SetHit::Output(i)));
+    segmented(&mut c, SX, SEG_OUT, &labels, t.out.get(), &|i| hv(SetHit::Output(i)));
 
     // rows: whole switch rows react to the pointer
     for (h, cy) in [(SetHit::Mic, ROW_MIC), (SetHit::Gpu, ROW_GPU), (SetHit::Pointer, ROW_POINTER)] {
@@ -1065,11 +1068,11 @@ pub fn settings(s: &SettingsState) -> Canvas {
     lbl(&mut c, &tr!("Microphone", "Micrófono", "マイク"), 15.0, 20.0, ROW_MIC + 5.0, TEXT);
     switch(&mut c, ROW_MIC, t.mic.get(), true);
     for y in [166.0, 254.0, 342.0, 392.0] {
-        c.paint(DIVIDER, line(20.0, y, 320.0, y, 0.5));
+        c.paint(DIVIDER, line(SX.0, y, SX.1, y, 0.5));
     }
 
     lbl(&mut c, &tr!("Video format", "Formato de video", "動画の形式"), 15.0, 20.0, ROW_VIDEO + 5.0, TEXT);
-    segmented(&mut c, (196.0, 320.0), pick_y(ROW_VIDEO), &[("MKV", f), ("MP4", f)], t.video.get(), &|i| hv(SetHit::VideoFormat(i)));
+    segmented(&mut c, (PICK, SX.1), pick_y(ROW_VIDEO), &[("MKV", f), ("MP4", f)], t.video.get(), &|i| hv(SetHit::VideoFormat(i)));
 
     let use_gpu = tr!("Use GPU", "Usar GPU", "GPU を使う");
     lbl(&mut c, &use_gpu, 15.0, 20.0, ROW_GPU + 5.0, if s.gpu_found { TEXT } else { TEXT2 });
@@ -1080,7 +1083,7 @@ pub fn settings(s: &SettingsState) -> Canvas {
     switch(&mut c, ROW_GPU, t.gpu.get(), s.gpu_found);
 
     lbl(&mut c, &tr!("Image format", "Formato de imagen", "画像の形式"), 15.0, 20.0, ROW_SHOT + 5.0, TEXT);
-    segmented(&mut c, (196.0, 320.0), pick_y(ROW_SHOT), &[("PNG", f), ("JPG", f)], t.image.get(), &|i| hv(SetHit::ImageFormat(i)));
+    segmented(&mut c, (PICK, SX.1), pick_y(ROW_SHOT), &[("PNG", f), ("JPG", f)], t.image.get(), &|i| hv(SetHit::ImageFormat(i)));
 
     lbl(&mut c, &tr!("Show pointer", "Mostrar cursor", "ポインターを表示"), 15.0, 20.0, ROW_POINTER + 5.0, TEXT);
     switch(&mut c, ROW_POINTER, t.pointer.get(), true);
@@ -1100,7 +1103,7 @@ pub fn settings(s: &SettingsState) -> Canvas {
     section(&mut c, &tr!("Language", "Idioma", "言語"), 416.0);
     let ja = if s.cjk.is_some() || crate::i18n::lang() == crate::i18n::Lang::Ja { "日本語".to_owned() } else { tr!("Japanese", "Japonés", "日本語") };
     let langs = [("English", f), ("Español", f), (ja.as_str(), s.cjk.or(f))];
-    segmented(&mut c, (20.0, 320.0), SEG_LANG, &langs, t.lang.get(), &|i| hv(SetHit::Lang(i)));
+    segmented(&mut c, SX, SEG_LANG, &langs, t.lang.get(), &|i| hv(SetHit::Lang(i)));
 
     if let Some(h) = s.focus {
         focus_ring(&mut c, set_shape(h));
@@ -1703,7 +1706,7 @@ mod preview {
         for s in [1.0, 1.25] {
             let d = |v: f32| (v * s) as i16;
             assert!(!panel_body_has(s, 1, 1) && !panel_body_has(s, d(M + BODY.0 + 20.0), d(M + BODY.1 + 20.0)));
-            assert!(panel_body_has(s, d(M + 30.0), d(M + 30.0)) && panel_body_has(s, d(M + 280.0), d(M + 136.0)));
+            assert!(panel_body_has(s, d(M + 30.0), d(M + 30.0)) && panel_body_has(s, d(M + 280.0), d(M + BODY.1 - 11.0)));
             assert!(panel_body_has(s, d(M + BODY.0 + 4.0), d(M - 4.0)), "the close button overhangs the card");
             assert!(!settings_body_has(s, 1, 1) && !settings_body_has(s, d(M + SBODY.0 + 20.0), d(M + SBODY.1 + 20.0)));
             assert!(settings_body_has(s, d(M + 170.0), d(M + 240.0)) && settings_body_has(s, d(M + 30.0), d(M + 30.0)));
