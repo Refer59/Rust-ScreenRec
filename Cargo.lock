@@ -153,6 +153,7 @@ dependencies = [
  "jpeg-encoder",
  "libc",
  "png",
+ "windows-sys",
  "x11rb",
  "xkeysym",
 ]
