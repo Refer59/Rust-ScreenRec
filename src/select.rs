@@ -30,6 +30,33 @@ fn union(a: Option<Rect>, b: Option<Rect>) -> Option<Rect> {
     }
 }
 
+fn dim(v: u8) -> u8 {
+    (v as u16 * 140 / 255) as u8
+}
+
+/// `f` over BGRX pixels from `s` into `d`, X = 0. Two plain passes: both vectorize.
+fn map_span(d: &mut [u8], s: &[u8], f: impl Fn(u8) -> u8) {
+    for (d, &s) in d.iter_mut().zip(s) {
+        *d = f(s);
+    }
+    for x in d.iter_mut().skip(3).step_by(4) {
+        *x = 0;
+    }
+}
+
+/// What can change when a highlight with margin `m` moves from `old` to
+/// `new`: their grown union minus the core inside both shrunk by `m`, as up
+/// to four non-overlapping bands (top, bottom, left, right).
+fn dirty_bands(old: Rect, new: Rect, m: i32) -> Vec<Rect> {
+    let u = (old.0.min(new.0) - m, old.1.min(new.1) - m, old.2.max(new.2) + m, old.3.max(new.3) + m);
+    let c = (old.0.max(new.0) + m, old.1.max(new.1) + m, old.2.min(new.2) - m, old.3.min(new.3) - m);
+    if c.0 >= c.2 || c.1 >= c.3 {
+        return vec![u];
+    }
+    let bands = [(u.0, u.1, u.2, c.1), (u.0, c.3, u.2, u.3), (u.0, c.1, c.0, c.3), (c.2, c.1, u.2, c.3)];
+    bands.into_iter().filter(|r| r.0 < r.2 && r.1 < r.3).collect()
+}
+
 pub fn contains(r: Rect, x: i32, y: i32) -> bool {
     x >= r.0 && x < r.2 && y >= r.1 && y < r.3
 }
@@ -96,18 +123,28 @@ impl Overlay {
         if (area, handles) == self.shown {
             return Ok(());
         }
+        let margin = |hd: bool| self.margin(hd);
         let reach = |(a, hd): (Option<Rect>, bool)| {
-            let m = if hd { bracket(self.scale).0 } else { border(self.scale, false) } + 2;
+            let m = margin(hd);
             a.map(|r| (r.0 - m, r.1 - m, r.2 + m, r.3 + m))
         };
-        let dirty = union(reach(self.shown), reach((area, handles)));
+        let dirty = match (self.shown, (area, handles)) {
+            ((Some(o), ho), (Some(n), hn)) if ho == hn => dirty_bands(o, n, margin(hn)),
+            (old, new) => union(reach(old), reach(new)).into_iter().collect(),
+        };
         self.shown = (area, handles);
         let on_screen = |r: Rect| (r.0.max(0), r.1.max(0), r.2.min(self.w as i32), r.3.min(self.h as i32));
-        if let Some(r) = dirty.map(on_screen).filter(|r| r.0 < r.2 && r.1 < r.3) {
+        for r in dirty.into_iter().map(on_screen).filter(|r| r.0 < r.2 && r.1 < r.3) {
             self.put(conn, r)?;
             conn.clear_area(false, self.win, r.0 as i16, r.1 as i16, (r.2 - r.0) as u16, (r.3 - r.1) as u16)?;
         }
         Ok(())
+    }
+
+    /// How far an area's look reaches past its edges, in and out: the
+    /// brackets' arms with handles, else the border and its dark edge.
+    fn margin(&self, handles: bool) -> i32 {
+        if handles { bracket(self.scale).1 } else { border(self.scale, false) + 1 }
     }
 
     pub fn set_cursor(&mut self, conn: &impl Connection, which: usize) -> Res<()> {
@@ -132,24 +169,44 @@ impl Overlay {
 
     fn render(&self, (x0, y0, x1, y1): Rect) -> Vec<u8> {
         let (area, handles) = self.shown;
-        let (rw, sc) = ((x1 - x0) as usize, self.scale);
+        let rw = (x1 - x0) as usize;
+        let mut out = vec![0u8; rw * (y1 - y0) as usize * 4];
+        if out.is_empty() {
+            return out;
+        }
+        let sc = self.scale;
         let bw = border(sc, handles);
-        let mut out = Vec::with_capacity(rw * (y1 - y0) as usize * 4);
-        let dim = |v: u8| (v as u16 * 140 / 255) as u8;
         let edge = |v: u8| (dim(v) as u16 * 65 / 100) as u8; // black at 35% over the dim
         let lift = if handles { 55 } else { 90 }; // the border: white at this % over the dim
         let white = |v: u8| (dim(v) as u16 + (255 - dim(v) as u16) * lift / 100) as u8;
-        let grow = |a: Rect, m: i32| (a.0 - m, a.1 - m, a.2 + m, a.3 + m);
-        for y in y0..y1 {
-            let row = &self.frozen[(y as usize * self.w + x0 as usize) * 4..][..rw * 4];
-            for (x, p) in (x0..).zip(row.as_chunks::<4>().0) {
-                match area {
-                    Some(a) if contains(a, x, y) => out.extend_from_slice(p),
-                    Some(a) if contains(grow(a, bw), x, y) => out.extend_from_slice(&[white(p[0]), white(p[1]), white(p[2]), 0]),
-                    Some(a) if contains(grow(a, bw + 1), x, y) => out.extend_from_slice(&[edge(p[0]), edge(p[1]), edge(p[2]), 0]),
-                    _ => out.extend_from_slice(&[dim(p[0]), dim(p[1]), dim(p[2]), 0]),
+        // Row by row, as spans: dim | edge | border | inside | border | edge | dim.
+        for (y, dst) in (y0..).zip(out.chunks_exact_mut(rw * 4)) {
+            let src = &self.frozen[(y as usize * self.w + x0 as usize) * 4..][..rw * 4];
+            let (mut e0, mut b0, mut i0, mut i1, mut b1, mut e1) = (x1, x1, x1, x1, x1, x1); // all dim
+            if let Some(a) = area.filter(|a| y >= a.1 - bw - 1 && y < a.3 + bw + 1) {
+                let cl = |v: i32, lo: i32, hi: i32| v.clamp(lo, hi.max(lo));
+                e0 = cl(a.0 - bw - 1, x0, x1);
+                e1 = cl(a.2 + bw + 1, e0, x1);
+                (b0, i0, i1, b1) = (e1, e1, e1, e1); // the edge's own row: edge only
+                if y >= a.1 - bw && y < a.3 + bw {
+                    b0 = cl(a.0 - bw, e0, e1);
+                    b1 = cl(a.2 + bw, b0, e1);
+                    (i0, i1) = (b1, b1); // a border row: no inside
+                    if y >= a.1 && y < a.3 {
+                        i0 = cl(a.0, b0, b1);
+                        i1 = cl(a.2, i0, b1);
+                    }
                 }
             }
+            let at = |x: i32| (x - x0) as usize * 4;
+            let mut span = |from: i32, to: i32, f: &dyn Fn(u8) -> u8| map_span(&mut dst[at(from)..at(to)], &src[at(from)..at(to)], f);
+            span(x0, e0, &dim);
+            span(e0, b0, &edge);
+            span(b0, i0, &white);
+            span(i1, b1, &white);
+            span(b1, e1, &edge);
+            span(e1, x1, &dim);
+            dst[at(i0)..at(i1)].copy_from_slice(&src[at(i0)..at(i1)]);
         }
         // Viewfinder brackets just outside the corners, nudged inside where the screen ends.
         if let (Some(a), true) = (area, handles) {
@@ -330,5 +387,158 @@ mod tests {
         assert_eq!(drag(g, 1900, 150, (1920, 1080)), (1720, 100, 1920, 200));
         // Outside: a new selection from the press point.
         assert_eq!(drag(grip(sel, 10, 10), 40, 5, (1920, 1080)), (10, 5, 40, 10));
+    }
+
+    /// The per-pixel `render` this module used to have: the reference.
+    fn render_ref(o: &Overlay, (x0, y0, x1, y1): Rect) -> Vec<u8> {
+        let (area, handles) = o.shown;
+        let (rw, sc) = ((x1 - x0) as usize, o.scale);
+        let bw = border(sc, handles);
+        let mut out = Vec::with_capacity(rw * (y1 - y0) as usize * 4);
+        let dim = |v: u8| (v as u16 * 140 / 255) as u8;
+        let edge = |v: u8| (dim(v) as u16 * 65 / 100) as u8;
+        let lift = if handles { 55 } else { 90 };
+        let white = |v: u8| (dim(v) as u16 + (255 - dim(v) as u16) * lift / 100) as u8;
+        let grow = |a: Rect, m: i32| (a.0 - m, a.1 - m, a.2 + m, a.3 + m);
+        for y in y0..y1 {
+            let row = &o.frozen[(y as usize * o.w + x0 as usize) * 4..][..rw * 4];
+            for (x, p) in (x0..).zip(row.as_chunks::<4>().0) {
+                match area {
+                    Some(a) if contains(a, x, y) => out.extend_from_slice(p),
+                    Some(a) if contains(grow(a, bw), x, y) => out.extend_from_slice(&[white(p[0]), white(p[1]), white(p[2]), 0]),
+                    Some(a) if contains(grow(a, bw + 1), x, y) => out.extend_from_slice(&[edge(p[0]), edge(p[1]), edge(p[2]), 0]),
+                    _ => out.extend_from_slice(&[dim(p[0]), dim(p[1]), dim(p[2]), 0]),
+                }
+            }
+        }
+        if let (Some(a), true) = (area, handles) {
+            let (t, l) = bracket(sc);
+            let span = |c: i32, dir: i32, len: i32, lim: i32| match dir {
+                1 => ((c - t).max(0), (c - t).max(0) + len),
+                _ => ((c + t).min(lim) - len, (c + t).min(lim)),
+            };
+            let (w, h) = (o.w as i32, o.h as i32);
+            for (cx, cy, dx, dy) in [(a.0, a.1, 1, 1), (a.2, a.1, -1, 1), (a.0, a.3, 1, -1), (a.2, a.3, -1, -1)] {
+                let across = (span(cx, dx, l, w), span(cy, dy, t, h));
+                let down = (span(cx, dx, t, w), span(cy, dy, l, h));
+                for ((bx0, bx1), (by0, by1)) in [across, down] {
+                    for y in by0.max(y0)..by1.min(y1) {
+                        for x in bx0.max(x0)..bx1.min(x1) {
+                            let i = ((y - y0) as usize * rw + (x - x0) as usize) * 4;
+                            out[i..i + 3].fill(255);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn overlay(w: usize, h: usize, shown: (Option<Rect>, bool)) -> Overlay {
+        let mut seed = 12345u32;
+        let frozen = (0..w * h * 4)
+            .map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                (seed >> 24) as u8
+            })
+            .collect();
+        Overlay { win: 0, pix: 0, gc: 0, frozen, w, h, shown, cursors: vec![], cursor: 0, scale: 1.0 }
+    }
+
+    #[test]
+    fn render_matches_reference() {
+        let (w, h) = (64, 40);
+        let areas = [
+            None,
+            Some((20, 12, 44, 30)),
+            Some((-10, 10, 30, 30)),
+            Some((40, 10, 80, 30)),
+            Some((10, -5, 50, 20)),
+            Some((10, 20, 50, 60)),
+            Some((0, 0, 64, 40)),
+            Some((1, 1, 63, 39)),
+            Some((30, 18, 33, 21)),
+            Some((30, 18, 30, 21)), // empty: border only
+        ];
+        let rects = [
+            (0, 0, 64, 40),
+            (0, 10, 64, 20),
+            (5, 0, 50, 40),
+            (31, 0, 32, 40),
+            (0, 19, 64, 20),
+            (17, 9, 23, 15),
+            (42, 27, 47, 33),
+            (19, 11, 21, 31),
+            (30, 18, 31, 19),
+        ];
+        let mut o = overlay(w, h, (None, false));
+        for (a, scale) in areas.into_iter().flat_map(|a| [(a, 1.0), (a, 1.25)]) {
+            o.scale = scale;
+            for handles in [false, true] {
+                o.shown = (a, handles);
+                for r in rects {
+                    assert!(o.render(r) == render_ref(&o, r), "area {a:?} handles {handles} scale {scale} rect {r:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dirty_bands_cover_every_change() {
+        let (w, h) = (200, 150);
+        let pairs = [
+            ((40, 30, 140, 100), (50, 35, 150, 105)),  // move
+            ((40, 30, 140, 100), (40, 30, 160, 120)),  // resize by a corner
+            ((40, 30, 140, 100), (30, 20, 150, 110)),  // grow
+            ((30, 20, 150, 110), (40, 30, 140, 100)),  // shrink
+            ((10, 10, 50, 40), (120, 90, 180, 140)),   // disjoint
+            ((40, 30, 140, 100), (40, 30, 140, 100)),  // identical
+            ((20, 15, 180, 135), (80, 60, 100, 80)),   // one containing the other
+            ((-20, -10, 60, 50), (-15, -10, 70, 60)),  // partly off-screen
+            ((60, 50, 70, 60), (61, 50, 71, 60)),      // too small for a core
+        ];
+        let mut o = overlay(w, h, (None, false));
+        let full = (0, 0, w as i32, h as i32);
+        for (old, new, scale) in pairs.into_iter().flat_map(|(a, b)| [(a, b, 1.0), (a, b, 1.25)]) {
+            o.scale = scale;
+            for handles in [false, true] {
+                let m = o.margin(handles);
+                let bands = dirty_bands(old, new, m);
+                o.shown = (Some(old), handles);
+                let mut pix = render_ref(&o, full);
+                let before = pix.clone();
+                o.shown = (Some(new), handles);
+                let after = render_ref(&o, full);
+                let u = (old.0.min(new.0) - m, old.1.min(new.1) - m, old.2.max(new.2) + m, old.3.max(new.3) + m);
+                for (i, b) in bands.iter().enumerate() {
+                    assert!(b.0 >= u.0 && b.1 >= u.1 && b.2 <= u.2 && b.3 <= u.3, "{b:?} outside {u:?}");
+                    for c in &bands[i + 1..] {
+                        assert!(b.2 <= c.0 || c.2 <= b.0 || b.3 <= c.1 || c.3 <= b.1, "{b:?} overlaps {c:?}");
+                    }
+                }
+                for y in 0..h as i32 {
+                    for x in 0..w as i32 {
+                        let i = (y as usize * w + x as usize) * 4;
+                        if before[i..i + 4] != after[i..i + 4] {
+                            assert!(bands.iter().any(|&b| contains(b, x, y)), "({x},{y}) changed outside {bands:?} for {old:?} -> {new:?}");
+                        }
+                    }
+                }
+                // Painting the bands (clipped, as `set` does) leaves the full new frame.
+                for b in &bands {
+                    let r = (b.0.max(0), b.1.max(0), b.2.min(w as i32), b.3.min(h as i32));
+                    if r.0 >= r.2 || r.1 >= r.3 {
+                        continue;
+                    }
+                    let data = o.render(r);
+                    let rw = (r.2 - r.0) as usize * 4;
+                    for (y, row) in (r.1..).zip(data.chunks_exact(rw)) {
+                        let i = (y as usize * w + r.0 as usize) * 4;
+                        pix[i..i + rw].copy_from_slice(row);
+                    }
+                }
+                assert!(pix == after, "{old:?} -> {new:?} handles {handles}");
+            }
+        }
     }
 }
