@@ -57,7 +57,7 @@ fn zero(b: &[u8]) -> Option<usize> {
 }
 
 /// Index of the first `00 00 01` at or after `i`.
-fn start_code(b: &[u8], mut i: usize) -> Option<usize> {
+pub(crate) fn start_code(b: &[u8], mut i: usize) -> Option<usize> {
     while i + 3 <= b.len() {
         let z = i + zero(&b[i..b.len() - 2])?;
         if b[z + 1] == 0 && b[z + 2] == 1 {
