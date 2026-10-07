@@ -2,6 +2,8 @@
 //! NVENC, or on the CPU with x264; MKV or MP4), from the command line or a
 //! launcher modelled on GNOME 42's screenshot UI.
 
+#[macro_use]
+mod i18n;
 mod audio;
 mod capture;
 mod mkv;
@@ -29,13 +31,31 @@ use x11rb::protocol::xproto::{ConnectionExt as _, EventMask, GrabMode, GrabStatu
 
 pub type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
-const USAGE: &str = "uso:
+fn usage() -> String {
+    tr!(
+        "usage:
+  screenrec                             launcher: screenshot or recording (selection, screen or window)
+  screenrec shot [file.png|.jpg]        full-screen screenshot
+  screenrec rec [file.mkv|.mp4] [-r FPS] [--window ID] [--cpu]
+                                        record the screen (or a window) until Ctrl+C / SIGTERM
+                                        (max FPS: 60 on the GPU, 30 without it; --cpu: no GPU even if there is one)
+  screenrec install                     keyboard shortcut for the launcher ('-' if it has none yet)",
+        "uso:
   screenrec                             interfaz: captura o grabación (selección, pantalla o ventana)
   screenrec shot [archivo.png|.jpg]     captura de pantalla completa
   screenrec rec [archivo.mkv|.mp4] [-r FPS] [--window ID] [--cpu]
                                         graba la pantalla (o una ventana) hasta Ctrl+C / SIGTERM
                                         (máx. FPS: 60 con GPU, 30 sin ella; --cpu: sin GPU aunque haya)
-  screenrec install                     atajo de teclado para la interfaz ('-' si aún no tiene)";
+  screenrec install                     atajo de teclado para la interfaz ('-' si aún no tiene)",
+        "使い方:
+  screenrec                             ランチャー: スクリーンショットまたは録画 (選択範囲、画面、ウィンドウ)
+  screenrec shot [ファイル.png|.jpg]    画面全体のスクリーンショット
+  screenrec rec [ファイル.mkv|.mp4] [-r FPS] [--window ID] [--cpu]
+                                        Ctrl+C / SIGTERM まで画面 (またはウィンドウ) を録画
+                                        (最大 FPS: GPU で 60、なしで 30。--cpu: GPU があっても使わない)
+  screenrec install                     ランチャーのキーボードショートカット (未設定なら '-')"
+    )
+}
 
 /// Wall time between forced keyframes (seek granularity).
 const KEYINT_MS: u64 = 5000;
@@ -48,13 +68,16 @@ extern "C" fn on_signal(_: libc::c_int) {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(l) = saved_lang() {
+        i18n::set(l);
+    }
     let res = match args.first().map(String::as_str) {
         None => gui(),
         Some("shot") => shot(args.get(1)),
         Some("rec") => rec(&args[1..]),
         Some("install") => install(),
         _ => {
-            eprintln!("{USAGE}");
+            eprintln!("{}", usage());
             std::process::exit(2);
         }
     };
@@ -71,14 +94,14 @@ fn main() {
 fn install() -> Res<()> {
     let accel = shortcut::get().unwrap_or_else(|| "minus".into());
     shortcut::set(&accel)?;
-    println!("atajo de la interfaz: {}", shortcut::pretty(&accel));
+    println!("{}", tr!("launcher shortcut: {}", "atajo de la interfaz: {}", "ランチャーのショートカット: {}", shortcut::pretty(&accel)));
     Ok(())
 }
 
 fn shot(out: Option<&String>) -> Res<()> {
     let mut cap = Capture::new()?;
     let (screen, _) = freeze(&mut cap)?;
-    let path = out.map(PathBuf::from).unwrap_or_else(|| default_path("PICTURES", "captura", "png"));
+    let path = out.map(PathBuf::from).unwrap_or_else(|| default_path("PICTURES", &shot_prefix(), "png"));
     save_image(&screen, cap.sw, (0, 0, cap.sw as i32, cap.sh as i32), None, &path)?;
     println!("{}", path.display());
     Ok(())
@@ -89,26 +112,26 @@ fn rec(args: &[String]) -> Res<()> {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "-r" => opts.fps = Some(it.next().and_then(|v| v.parse().ok()).filter(|f| (1..=240).contains(f)).ok_or("-r espera 1..240")?),
+            "-r" => opts.fps = Some(it.next().and_then(|v| v.parse().ok()).filter(|f| (1..=240).contains(f)).ok_or(tr!("-r expects 1..240", "-r espera 1..240", "-r には 1..240 を指定してください"))?),
             "--cpu" => opts.gpu = false,
             "--window" => {
-                let id = it.next().ok_or("--window espera el id de la ventana")?;
+                let id = it.next().ok_or(tr!("--window expects the window id", "--window espera el id de la ventana", "--window にはウィンドウ ID を指定してください"))?;
                 let id = id.strip_prefix("0x").map_or_else(|| id.parse().ok(), |h| u32::from_str_radix(h, 16).ok());
-                window = Some(id.ok_or("id de ventana inválido")?);
+                window = Some(id.ok_or(tr!("invalid window id", "id de ventana inválido", "無効なウィンドウ ID です"))?);
             }
             p => path = Some(PathBuf::from(p)),
         }
     }
-    let path = path.unwrap_or_else(|| default_path("VIDEOS", "grabacion", "mkv"));
+    let path = path.unwrap_or_else(|| default_path("VIDEOS", &rec_prefix(), "mkv"));
     let mp4 = match path.extension().and_then(|e| e.to_str()) {
         Some("mp4") => true,
         Some("mkv") => false,
-        _ => return Err("se graba en .mkv o .mp4".into()),
+        _ => return Err(tr!("recordings are .mkv or .mp4", "se graba en .mkv o .mp4", "録画は .mkv または .mp4 のみです").into()),
     };
     let rec_path = if mp4 { path.with_extension("rec.mkv") } else { path.clone() }; // MP4 comes out of the MKV at the end
     let mut cap = Capture::new()?;
     let target = match window {
-        Some(w) => Target::Window(w, select::Ewmh::new(&cap).visible(&cap, w).ok_or("esa ventana no se ve en pantalla")?),
+        Some(w) => Target::Window(w, select::Ewmh::new(&cap).visible(&cap, w).ok_or(tr!("that window is not visible on screen", "esa ventana no se ve en pantalla", "そのウィンドウは画面に表示されていません"))?),
         None => Target::Area((0, 0, cap.sw as i32, cap.sh as i32)),
     };
     record(&mut cap, &rec_path, &opts, None, None, target)?;
@@ -178,6 +201,13 @@ fn save_image(screen: &[u8], sw: usize, r: Rect, cursor: Option<&Sprite>, path: 
     Ok(())
 }
 
+/// The language picked in the launcher's settings (the last file's 13th field).
+fn saved_lang() -> Option<i18n::Lang> {
+    let text = std::fs::read_to_string(last_path()).ok()?;
+    let name = text.split_whitespace().nth(12)?;
+    i18n::LANGS.into_iter().find(|l| format!("{l:?}") == name)
+}
+
 /// What the launcher remembers between runs.
 struct Last {
     mode: Mode,
@@ -220,7 +250,8 @@ impl Last {
         let (m, (x0, y0, x1, y1), o) = (self.mode, self.sel, self.output);
         let _ = std::fs::create_dir_all(path.parent().unwrap());
         let (rec, ptr, mic, mp4, jpg, gpu) = (self.record, self.pointer, self.mic, self.mp4, self.jpg, self.gpu);
-        let _ = std::fs::write(path, format!("{m:?} {rec} {ptr} {x0} {y0} {x1} {y1} {o:?} {mic} {mp4} {jpg} {gpu}\n"));
+        let lang = i18n::chosen().map_or("-".into(), |l| format!("{l:?}")); // "-": the locale's
+        let _ = std::fs::write(path, format!("{m:?} {rec} {ptr} {x0} {y0} {x1} {y1} {o:?} {mic} {mp4} {jpg} {gpu} {lang}\n"));
     }
 }
 
@@ -287,7 +318,11 @@ fn gui() -> Res<()> {
     let wins = ewmh.windows(&cap);
     let window_at = |x: i32, y: i32| wins.iter().copied().find(|&(r, _)| select::contains(r, x, y));
     let mut last = Last::load(sw, sh);
-    let font = ui::load_font();
+    let (latin, ja) = (ui::load_font(false), std::cell::OnceCell::new());
+    let font = || match i18n::lang() {
+        i18n::Lang::Ja => ja.get_or_init(|| ui::load_font(true)).as_ref(),
+        _ => latin.as_ref(),
+    };
     let pointer = cap.conn.query_pointer(cap.root)?.reply()?;
     let (mut hovered, mut picked) = (window_at(pointer.root_x as i32, pointer.root_y as i32), None);
     let area = |last: &Last, w: Option<(Rect, u32)>| match last.mode {
@@ -304,12 +339,12 @@ fn gui() -> Res<()> {
         window: name_of(&cap, hovered),
         hover: None,
         settings_open: false,
-        font: font.as_ref(),
+        font: font(),
     };
     let (px, py) = ((sw - ui::PANEL_W as i32) / 2, sh - ui::PANEL_H as i32 - 48);
     let mask = EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::POINTER_MOTION | EventMask::LEAVE_WINDOW;
     let mut panel = ui::Win::new(&cap, px, py, ui::panel(&st), mask)?;
-    let shortcut_now = || shortcut::get().map_or("none".into(), |a| shortcut::pretty(&a));
+    let shortcut_now = || shortcut::get().map_or(tr!("none", "ninguno", "なし"), |a| shortcut::pretty(&a));
     let mut set = ui::SettingsState {
         output: audio::OUTPUTS.iter().position(|&o| o == last.output).unwrap_or(0),
         mic: last.mic,
@@ -321,7 +356,7 @@ fn gui() -> Res<()> {
         gpu: last.gpu,
         gpu_found: nvenc::available(),
         hover: None,
-        font: font.as_ref(),
+        font: font(),
     };
     let (mx, my) = ((sw - ui::SET_W as i32) / 2, py + ui::PANEL_TOP - ui::SET_H as i32 - 14);
     let mut modal = ui::Win::new(&cap, mx, my, ui::settings(&set), mask)?; // mapped by the gear
@@ -394,6 +429,10 @@ fn gui() -> Res<()> {
                         Some(SetHit::Gpu) => set.gpu = !set.gpu,
                         Some(SetHit::ImageFormat(i)) => set.jpg = i == 1,
                         Some(SetHit::Shortcut) => set.capturing = true,
+                        Some(SetHit::Lang(i)) => {
+                            i18n::set(i18n::LANGS[i]);
+                            (st.font, set.font, set.shortcut, redraw) = (font(), font(), shortcut_now(), true);
+                        }
                         None => {}
                     }
                     // Settings stick at once, also when the launcher is then closed.
@@ -448,7 +487,7 @@ fn gui() -> Res<()> {
                             (set.capturing, restyle) = (false, true);
                         } else if let Some(a) = shortcut::accel(sym, e.state.into()) {
                             if let Err(err) = shortcut::set(&a) {
-                                notify("screenrec: no se pudo cambiar el atajo", &err.to_string(), None);
+                                notify(&tr!("screenrec: could not change the shortcut", "screenrec: no se pudo cambiar el atajo", "screenrec: ショートカットを変更できませんでした"), &err.to_string(), None);
                             }
                             (set.shortcut, set.capturing, restyle) = (shortcut_now(), false, true);
                         }
@@ -506,9 +545,9 @@ fn shutter(mut cap: Capture, ov: &select::Overlay, windows: &[&ui::Win], target:
     let (Target::Area(r) | Target::Window(_, r)) = target;
     last.save();
     if !last.record {
-        let path = default_path("PICTURES", "captura", if last.jpg { "jpg" } else { "png" });
+        let path = default_path("PICTURES", &shot_prefix(), if last.jpg { "jpg" } else { "png" });
         save_image(ov.frozen(), cap.sw, r, last.pointer.then_some(cursor), &path)?;
-        notify("Captura guardada", &path.display().to_string(), Some(&path));
+        notify(&tr!("Screenshot saved", "Captura guardada", "スクリーンショットを保存しました"), &path.display().to_string(), Some(&path));
         return Ok(());
     }
     cap.conn.unmap_window(ov.win)?;
@@ -519,17 +558,17 @@ fn shutter(mut cap: Capture, ov: &select::Overlay, windows: &[&ui::Win], target:
     let pill = ui::Pill::new(&cap)?;
     cap.overlay = Some(pill.win.sprite());
     cap.draw_pointer = last.pointer;
-    let path = default_path("VIDEOS", "grabacion", "mkv");
+    let path = default_path("VIDEOS", &rec_prefix(), "mkv");
     let opts = RecOpts { fps: None, gpu: last.gpu, sound: Some((last.output, last.mic, app)) };
     record(&mut cap, &path, &opts, Some(pill), Some(windows[0].sprite()), target)?;
     let path = match last.mp4 {
         true => to_mp4(&path, &path.with_extension("mp4")).unwrap_or_else(|e| {
-            notify("screenrec: quedó en MKV", &e.to_string(), None);
+            notify(&tr!("screenrec: kept as MKV", "screenrec: quedó en MKV", "screenrec: MKV のまま保存しました"), &e.to_string(), None);
             path
         }),
         false => path,
     };
-    notify("Grabación guardada", &path.display().to_string(), None);
+    notify(&tr!("Recording saved", "Grabación guardada", "録画を保存しました"), &path.display().to_string(), None);
     Ok(())
 }
 
@@ -565,7 +604,7 @@ impl Video {
         if gpu && nvenc::available() {
             match nvenc::Encoder::new(host, w, h, fps) {
                 Ok(e) => return Ok(Video::Gpu(Box::new(e))),
-                Err(e) => notify("screenrec: la GPU falló, grabando con el CPU", &e.to_string(), None),
+                Err(e) => notify(&tr!("screenrec: the GPU failed, recording on the CPU", "screenrec: la GPU falló, grabando con el CPU", "screenrec: GPU が失敗したため CPU で録画します"), &e.to_string(), None),
             }
         }
         Ok(Video::Cpu(x264::Encoder::new(w, h, fps)?))
@@ -609,8 +648,8 @@ fn to_mp4(src: &Path, dst: &Path) -> Res<PathBuf> {
     let mut ff = std::process::Command::new("ffmpeg");
     ff.args(["-v", "error", "-y", "-i"]).arg(src);
     ff.args(["-map", "0", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart"]).arg(dst);
-    if !ff.status().map_err(|_| "MP4 necesita ffmpeg (sudo apt install ffmpeg)")?.success() {
-        return Err("ffmpeg no pudo convertir a MP4".into());
+    if !ff.status().map_err(|_| tr!("MP4 needs ffmpeg (sudo apt install ffmpeg)", "MP4 necesita ffmpeg (sudo apt install ffmpeg)", "MP4 には ffmpeg が必要です (sudo apt install ffmpeg)"))?.success() {
+        return Err(tr!("ffmpeg could not convert to MP4", "ffmpeg no pudo convertir a MP4", "ffmpeg で MP4 に変換できませんでした").into());
     }
     std::fs::remove_file(src)?;
     Ok(dst.to_owned())
@@ -628,7 +667,7 @@ fn record(cap: &mut Capture, path: &Path, opts: &RecOpts, mut pill: Option<ui::P
     let (Target::Area(r) | Target::Window(_, r)) = target;
     let (w, h) = (((r.2 - r.0) & !1) as usize, ((r.3 - r.1) & !1) as usize); // 4:2:0 needs even sizes
     if w < 64 || h < 64 {
-        return Err("el área es muy pequeña para grabar (mínimo 64×64)".into());
+        return Err(tr!("the area is too small to record (minimum 64×64)", "el área es muy pequeña para grabar (mínimo 64×64)", "録画するには領域が小さすぎます (最小 64×64)").into());
     }
     let mut enc = Video::new(cap.frame(), w, h, opts.fps.unwrap_or(60), opts.gpu)?; // whole screen buffer: covers any area
     let fps = opts.fps.unwrap_or(if matches!(enc, Video::Gpu(_)) { 60 } else { 30 });
@@ -649,7 +688,7 @@ fn record(cap: &mut Capture, path: &Path, opts: &RecOpts, mut pill: Option<ui::P
     // A video without sound beats no video: audio trouble only gets reported.
     let mut sound = opts.sound.and_then(|(output, mic, app)| {
         audio::Audio::start(output, mic, app).unwrap_or_else(|e| {
-            notify("screenrec: grabando sin sonido", &e.to_string(), None);
+            notify(&tr!("screenrec: recording without sound", "screenrec: grabando sin sonido", "screenrec: 音声なしで録画します"), &e.to_string(), None);
             None
         })
     });
@@ -672,7 +711,15 @@ fn record(cap: &mut Capture, path: &Path, opts: &RecOpts, mut pill: Option<ui::P
         Ok(())
     };
     let tick = Duration::from_secs(1) / fps;
-    eprintln!("grabando {w}x{h} a {fps} fps máx. en {} (Ctrl+C para terminar)", path.display());
+    eprintln!(
+        "{}",
+        tr!(
+            "recording {w}x{h} at {fps} fps max. to {} (Ctrl+C to stop)",
+            "grabando {w}x{h} a {fps} fps máx. en {} (Ctrl+C para terminar)",
+            "{w}x{h} を最大 {fps} fps で {} に録画中 (Ctrl+C で停止)",
+            path.display()
+        )
+    );
 
     let t0 = Instant::now();
     let mut last = t0 - tick;
@@ -769,6 +816,14 @@ fn record(cap: &mut Capture, path: &Path, opts: &RecOpts, mut pill: Option<ui::P
 fn notify(title: &str, body: &str, icon: Option<&Path>) {
     let icon = icon.map_or("media-record".into(), |p| p.display().to_string());
     let _ = std::process::Command::new("notify-send").args(["-a", "screenrec", "-i", &icon, title, body]).spawn();
+}
+
+fn shot_prefix() -> String {
+    tr!("screenshot", "captura", "スクリーンショット")
+}
+
+fn rec_prefix() -> String {
+    tr!("recording", "grabacion", "録画")
 }
 
 fn default_path(xdg_dir: &str, prefix: &str, ext: &str) -> PathBuf {

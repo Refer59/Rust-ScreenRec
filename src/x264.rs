@@ -40,8 +40,8 @@ impl Encoder {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|_| "grabar sin GPU necesita ffmpeg (sudo apt install ffmpeg)")?;
-        let (stdin, mut out) = (child.stdin.take(), child.stdout.take().ok_or("ffmpeg sin stdout")?);
+            .map_err(|_| tr!("recording without a GPU needs ffmpeg (sudo apt install ffmpeg)", "grabar sin GPU necesita ffmpeg (sudo apt install ffmpeg)", "GPU なしの録画には ffmpeg が必要です (sudo apt install ffmpeg)"))?;
+        let (stdin, mut out) = (child.stdin.take(), child.stdout.take().ok_or(tr!("ffmpeg has no stdout", "ffmpeg sin stdout", "ffmpeg の stdout がありません"))?);
         let (tx, units) = channel();
         std::thread::spawn(move || {
             let (mut buf, mut chunk) = (Vec::new(), vec![0u8; 1 << 16]);
@@ -78,8 +78,8 @@ impl Encoder {
     /// Send the frame stamped `ts`. Returns the frames x264 finished meanwhile,
     /// with their stamps: it runs alongside, a frame or so behind.
     pub fn encode(&mut self, ts: u64) -> Res<Vec<(u64, Vec<u8>)>> {
-        let stdin = self.stdin.as_mut().ok_or("ffmpeg ya terminó")?;
-        stdin.write_all(&self.yuv).map_err(|_| "ffmpeg dejó de codificar (¿tiene libx264?)")?;
+        let stdin = self.stdin.as_mut().ok_or(tr!("ffmpeg already exited", "ffmpeg ya terminó", "ffmpeg はすでに終了しています"))?;
+        stdin.write_all(&self.yuv).map_err(|_| tr!("ffmpeg stopped encoding (does it have libx264?)", "ffmpeg dejó de codificar (¿tiene libx264?)", "ffmpeg のエンコードが停止しました (libx264 はありますか?)"))?;
         self.pending.push_back(ts);
         let mut done = vec![];
         while let Ok(unit) = self.units.try_recv() {

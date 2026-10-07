@@ -152,9 +152,11 @@ impl Canvas {
     }
 }
 
-/// The desktop's UI font (Ubuntu here); without one the panel just has no labels.
-pub fn load_font() -> Option<FontVec> {
-    let out = std::process::Command::new("fc-match").args(["-f", "%{file}", "Ubuntu"]).output().ok()?;
+/// The desktop's UI font (Ubuntu here), or a Japanese one; without one the
+/// panel just has no labels.
+pub fn load_font(ja: bool) -> Option<FontVec> {
+    let name = if ja { "sans-serif:lang=ja" } else { "Ubuntu" };
+    let out = std::process::Command::new("fc-match").args(["-f", "%{file}", name]).output().ok()?;
     FontVec::try_from_vec(std::fs::read(String::from_utf8(out.stdout).ok()?).ok()?).ok()
 }
 
@@ -296,7 +298,12 @@ pub fn panel(s: &PanelState) -> Canvas {
             Mode::Window => icon_window(&mut c, cx, iy, WHITE, bg),
         }
         if let Some(f) = s.font {
-            c.text(f, &format!("{m:?}"), 15.0, cx, TOP + 86.0, 0.5, WHITE);
+            let label = match m {
+                Mode::Selection => tr!("Selection", "Selección", "選択範囲"),
+                Mode::Screen => tr!("Screen", "Pantalla", "画面"),
+                Mode::Window => tr!("Window", "Ventana", "ウィンドウ"),
+            };
+            c.text(f, &label, 15.0, cx, TOP + 86.0, 0.5, WHITE);
             if let (Mode::Window, Some(name)) = (m, &s.window) {
                 let name = Canvas::fit(f, name, 12.0, 92.0 - Canvas::width(f, "()", 12.0));
                 c.text(f, &format!("({name})"), 12.0, cx, TOP + 101.0, 0.5, gray(0.7));
@@ -346,11 +353,12 @@ pub enum SetHit {
     ImageFormat(usize),
     Pointer,
     Shortcut,
+    Lang(usize),
 }
 
 // Settings modal geometry.
 pub const SET_W: usize = 360;
-pub const SET_H: usize = 448;
+pub const SET_H: usize = 546;
 const SW: f32 = SET_W as f32;
 const SEG: (f32, f32) = (94.0, 130.0); // sound source segmented control, y range
 const ROW_MIC: f32 = 160.0;
@@ -359,6 +367,7 @@ const ROW_GPU: f32 = 260.0;
 const ROW_SHOT: f32 = 316.0;
 const ROW_POINTER: f32 = 360.0;
 const ROW_KEY: f32 = 416.0;
+const LANG_SEG: (f32, f32) = (494.0, 530.0); // language segmented control, y range
 const PICK: (f32, f32) = (SW - 160.0, SW - 24.0); // two-option picker (MKV|MP4, PNG|JPG), x range
 
 pub struct SettingsState<'a> {
@@ -385,6 +394,9 @@ pub fn settings_hit(x: i16, y: i16) -> Option<SetHit> {
     }
     if (SEG.0..SEG.1).contains(&y) {
         return Some(SetHit::Output((((x - 24.0) / ((SW - 48.0) / 3.0)) as usize).min(2)));
+    }
+    if (LANG_SEG.0..LANG_SEG.1).contains(&y) {
+        return Some(SetHit::Lang((((x - 24.0) / ((SW - 48.0) / 3.0)) as usize).min(2)));
     }
     let pick = (PICK.0..PICK.1).contains(&x).then(|| ((x - PICK.0) / ((PICK.1 - PICK.0) / 2.0)) as usize);
     let row = [ROW_MIC, ROW_VIDEO, ROW_GPU, ROW_SHOT, ROW_POINTER, ROW_KEY].into_iter().position(|cy| (y - cy).abs() <= 18.0)?;
@@ -438,34 +450,40 @@ pub fn settings(s: &SettingsState) -> Canvas {
         }
     }
     let sound = (SEG.0 + SEG.1) / 2.0;
-    segmented(&mut c, s.font, (24.0, SW - 24.0), sound, &["None", "System", "Window"], s.output, hov_i(SetHit::Output));
+    segmented(&mut c, s.font, (24.0, SW - 24.0), sound, &[&tr!("None", "Ninguno", "なし"), &tr!("System", "Sistema", "システム"), &tr!("Window", "Ventana", "ウィンドウ")], s.output, hov_i(SetHit::Output));
+    let lang = (LANG_SEG.0 + LANG_SEG.1) / 2.0;
+    let langs = [tr!("English", "Inglés", "英語"), tr!("Spanish", "Español", "スペイン語"), tr!("Japanese", "Japonés", "日本語")];
+    let on = crate::i18n::LANGS.iter().position(|&l| l == crate::i18n::lang()).unwrap();
+    segmented(&mut c, s.font, (24.0, SW - 24.0), lang, &langs.each_ref().map(String::as_str), on, hov_i(SetHit::Lang));
     switch(&mut c, SW - 24.0, ROW_MIC, s.mic, true);
     segmented(&mut c, s.font, PICK, ROW_VIDEO, &["MKV", "MP4"], s.mp4 as usize, hov_i(SetHit::VideoFormat));
     switch(&mut c, SW - 24.0, ROW_GPU, s.gpu && s.gpu_found, s.gpu_found);
     segmented(&mut c, s.font, PICK, ROW_SHOT, &["PNG", "JPG"], s.jpg as usize, hov_i(SetHit::ImageFormat));
     switch(&mut c, SW - 24.0, ROW_POINTER, s.pointer, true);
-    for y in [188.0, 288.0, 388.0] {
+    for y in [188.0, 288.0, 388.0, 444.0] {
         c.paint(gray(0.2), line(24.0, y, SW - 24.0, y, 0.5));
     }
 
     // shortcut: shows the current one; click, then press the new keys
     let (key_bg, key) = match (s.capturing, hov(SetHit::Shortcut)) {
-        (true, _) => ((0.21, 0.52, 0.89, 1.0), "Press keys…".to_owned()),
+        (true, _) => ((0.21, 0.52, 0.89, 1.0), tr!("Press keys…", "Pulsa las teclas…", "キーを押してください…")),
         (false, true) => (gray(0.30), s.shortcut.clone()),
         (false, false) => (gray(0.24), s.shortcut.clone()),
     };
     c.paint(key_bg, rrect(PICK.0, ROW_KEY - 16.0, PICK.1, ROW_KEY + 16.0, 9.0));
 
     if let Some(f) = s.font {
-        c.text(f, "Settings", 19.0, 24.0, 38.0, 0.0, WHITE);
-        c.text(f, "Sound", 14.0, 24.0, 82.0, 0.0, gray(0.6));
-        let gpu_note = if s.gpu_found { "NVENC" } else { "not found" };
-        for (label, cy) in [("Microphone", ROW_MIC), ("Video format", ROW_VIDEO), ("Use GPU", ROW_GPU)] {
-            c.text(f, label, 15.0, 24.0, cy + 5.0, 0.0, WHITE);
+        c.text(f, &tr!("Settings", "Ajustes", "設定"), 19.0, 24.0, 38.0, 0.0, WHITE);
+        c.text(f, &tr!("Sound", "Sonido", "サウンド"), 14.0, 24.0, 82.0, 0.0, gray(0.6));
+        c.text(f, &tr!("Language", "Idioma", "言語"), 14.0, 24.0, 482.0, 0.0, gray(0.6));
+        let gpu_note = if s.gpu_found { "NVENC".to_owned() } else { tr!("not found", "no encontrada", "見つかりません") };
+        let use_gpu = tr!("Use GPU", "Usar GPU", "GPU を使用");
+        for (label, cy) in [(tr!("Microphone", "Micrófono", "マイク"), ROW_MIC), (tr!("Video format", "Formato de video", "動画形式"), ROW_VIDEO), (use_gpu.clone(), ROW_GPU)] {
+            c.text(f, &label, 15.0, 24.0, cy + 5.0, 0.0, WHITE);
         }
-        c.text(f, gpu_note, 12.0, 24.0 + Canvas::width(f, "Use GPU ", 15.0), ROW_GPU + 5.0, 0.0, gray(0.55));
-        for (label, cy) in [("Screenshot format", ROW_SHOT), ("Show pointer", ROW_POINTER), ("Shortcut", ROW_KEY)] {
-            c.text(f, label, 15.0, 24.0, cy + 5.0, 0.0, WHITE);
+        c.text(f, &gpu_note, 12.0, 24.0 + Canvas::width(f, &format!("{use_gpu} "), 15.0), ROW_GPU + 5.0, 0.0, gray(0.55));
+        for (label, cy) in [(tr!("Screenshot format", "Formato de captura", "スクリーンショット形式"), ROW_SHOT), (tr!("Show pointer", "Mostrar puntero", "ポインターを表示"), ROW_POINTER), (tr!("Shortcut", "Atajo", "ショートカット"), ROW_KEY)] {
+            c.text(f, &label, 15.0, 24.0, cy + 5.0, 0.0, WHITE);
         }
         c.text(f, &key, 15.0, (PICK.0 + PICK.1) / 2.0, ROW_KEY + 5.0, 0.5, WHITE);
     }
@@ -508,14 +526,14 @@ pub struct Win {
 impl Win {
     pub fn new(cap: &Capture, x: i32, y: i32, canvas: Canvas, events: EventMask) -> Res<Self> {
         let conn = &cap.conn;
-        let screen = conn.setup().roots.iter().find(|s| s.root == cap.root).ok_or("sin pantalla")?;
+        let screen = conn.setup().roots.iter().find(|s| s.root == cap.root).ok_or(tr!("no screen", "sin pantalla", "画面がありません"))?;
         let visual = screen
             .allowed_depths
             .iter()
             .filter(|d| d.depth == 32)
             .flat_map(|d| &d.visuals)
             .find(|v| v.class == VisualClass::TRUE_COLOR)
-            .ok_or("el servidor X no tiene visual ARGB (¿sin compositor?)")?
+            .ok_or(tr!("the X server has no ARGB visual (no compositor?)", "el servidor X no tiene visual ARGB (¿sin compositor?)", "X サーバーに ARGB ビジュアルがありません (コンポジターなし?)"))?
             .visual_id;
         let cmap = conn.generate_id()?;
         conn.create_colormap(ColormapAlloc::NONE, cmap, cap.root, visual)?;

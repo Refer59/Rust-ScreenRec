@@ -91,7 +91,7 @@ impl Mkv {
         let n = nals(first);
         let find = |t| n.iter().find(|nal| nal[0] & 0x1F == t).copied();
         let (Some(sps), Some(pps)) = (find(7), find(8)) else {
-            return Err(io::Error::other("el primer frame no trae SPS/PPS"));
+            return Err(io::Error::other(tr!("the first frame has no SPS/PPS", "el primer frame no trae SPS/PPS", "最初のフレームに SPS/PPS がありません")));
         };
         let mut avcc = vec![1, sps[1], sps[2], sps[3], 0xFF, 0xE1];
         avcc.extend((sps.len() as u16).to_be_bytes());

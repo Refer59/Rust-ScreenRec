@@ -178,7 +178,7 @@ impl Capture {
         let (conn, screen) = x11rb::connect(None)?;
         let s = &conn.setup().roots[screen];
         if s.root_depth != 24 {
-            return Err(format!("profundidad de color {} no soportada (solo 24)", s.root_depth).into());
+            return Err(tr!("color depth {} not supported (only 24)", "profundidad de color {} no soportada (solo 24)", "色深度 {} には対応していません (24 のみ)", s.root_depth).into());
         }
         let (root, sw, sh) = (s.root, s.width_in_pixels as usize, s.height_in_pixels as usize);
         conn.xfixes_query_version(5, 0)?.reply()?;
@@ -188,7 +188,7 @@ impl Capture {
             libc::mmap(std::ptr::null_mut(), sw * sh * 4, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd.as_raw_fd(), 0)
         };
         if buf == libc::MAP_FAILED {
-            return Err("mmap del segmento SHM falló".into());
+            return Err(tr!("mmap of the SHM segment failed", "mmap del segmento SHM falló", "SHM セグメントの mmap に失敗しました").into());
         }
         let view = View { w: sw, h: sh, x0: 0, y0: 0 };
         Ok(Capture {

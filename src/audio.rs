@@ -59,7 +59,7 @@ impl Drop for Source {
 fn parec(target: &str, lag: i64) -> Res<Source> {
     let args = ["--raw", "--format=s16le", "--rate=48000", "--channels=2", "--latency-msec=20", "--client-name=screenrec", target];
     let mut child = Command::new("parec").args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
-    let mut out = child.stdout.take().ok_or("parec sin stdout")?;
+    let mut out = child.stdout.take().ok_or(tr!("parec has no stdout", "parec sin stdout", "parec の stdout がありません"))?;
     let (tx, rx) = channel();
     std::thread::spawn(move || {
         let mut b = [0u8; FRAME * 4];

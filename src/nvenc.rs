@@ -140,7 +140,7 @@ impl Encoder {
             reg: null_mut(),
             out: null_mut(),
         };
-        let d = driver().ok_or("no hay driver NVIDIA (NVENC)")?;
+        let d = driver().ok_or(tr!("no NVIDIA driver (NVENC)", "no hay driver NVIDIA (NVENC)", "NVIDIA ドライバーがありません (NVENC)"))?;
         unsafe {
             let mut dev = 0;
             cu(d, (d.init)(0), "cuInit")?;
@@ -152,17 +152,17 @@ impl Encoder {
             if (d.host_register)(host.as_ptr() as *mut c_void, host.len(), 0) == 0 {
                 e.pinned = host.as_ptr() as *mut c_void;
             } else {
-                eprintln!("aviso: no se pudo fijar el buffer de captura; subir frames a la GPU costará más CPU");
+                eprintln!("{}", tr!("warning: could not pin the capture buffer; uploading frames to the GPU will cost more CPU", "aviso: no se pudo fijar el buffer de captura; subir frames a la GPU costará más CPU", "警告: キャプチャバッファを固定できませんでした。GPU へのフレーム転送で CPU 負荷が増えます"));
             }
 
             let mut max = 0;
             (d.max_version)(&mut max);
             if max < (NVENCAPI_MAJOR_VERSION << 4 | NVENCAPI_MINOR_VERSION) {
-                return Err("driver NVIDIA demasiado viejo: hace falta NVENC 12.1 (driver 530+)".into());
+                return Err(tr!("NVIDIA driver too old: NVENC 12.1 is needed (driver 530+)", "driver NVIDIA demasiado viejo: hace falta NVENC 12.1 (driver 530+)", "NVIDIA ドライバーが古すぎます: NVENC 12.1 (ドライバー 530 以上) が必要です").into());
             }
             e.api.version = ver(2);
             if (d.create_instance)(&mut e.api) != NV_ENC_SUCCESS {
-                return Err("NvEncodeAPICreateInstance falló".into());
+                return Err(tr!("NvEncodeAPICreateInstance failed", "NvEncodeAPICreateInstance falló", "NvEncodeAPICreateInstance が失敗しました").into());
             }
             let mut p: NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS = zeroed();
             p.version = ver(1);
@@ -254,7 +254,7 @@ impl Encoder {
             height: (y1 - y0) as usize,
             ..unsafe { zeroed() }
         };
-        let d = driver().ok_or("no hay driver NVIDIA")?;
+        let d = driver().ok_or(tr!("no NVIDIA driver", "no hay driver NVIDIA", "NVIDIA ドライバーがありません"))?;
         cu(d, unsafe { (d.memcpy_2d)(&c) }, "cuMemcpy2D")
     }
 
