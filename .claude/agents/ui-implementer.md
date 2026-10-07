@@ -18,7 +18,8 @@ Software-rendered `Canvas` in `src/ui.rs` (SDF shapes, `ab_glyph` text), the sel
 2. User-facing text goes through `tr!` with natural English, Spanish and Japanese.
 3. The recording pill is un-blended from captured frames (see `/home/refer59/.claude/projects/-home-refer59-orca-projects-Rust-ScreenRec/memory/screenrec-x11-quirks.md`). If you touch the pill, keep that working and keep its tests passing.
 4. Get `cargo build --release`, `cargo test` and `cargo clippy --all-targets` clean.
-5. Render every affected surface offscreen to PNG (an `#[ignore]` test or a small example calling `ui::panel(...)` / `ui::settings(...)` / `ui::pill(...)`, saved with the `png` crate) into a temp dir: en/es/ja × the relevant states (normal, hover, selected, focus). Look at each one with the Read tool and fix obvious defects (clipping, overlaps, misaligned text, missing Japanese glyphs) before you report.
+5. Load the `ui-taste` skill with the Skill tool and apply its `craft` checks (`.claude/skills/ui-taste/reference/craft.md`) to what you built.
+6. Render every affected surface offscreen to PNG (an `#[ignore]` test or a small example calling `ui::panel(...)` / `ui::settings(...)` / `ui::pill(...)`, saved with the `png` crate) into a temp dir: en/es/ja × the relevant states (normal, hover, selected, focus). Look at each one with the Read tool and fix obvious defects (clipping, overlaps, misaligned text, missing Japanese glyphs) before you report.
 
 ## Rules
 - Don't commit; the lead reviews and commits. Don't use Orca and don't contact other agents.
