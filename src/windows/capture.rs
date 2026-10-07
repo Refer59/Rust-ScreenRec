@@ -280,9 +280,11 @@ impl Capture {
 
     /// No damage events: after a capture that found nothing, sleep `timeout`
     /// (the caller already slept until the tick, so after a change don't).
-    pub fn wait(&mut self, timeout: Duration) -> Res<()> {
+    /// Takes a Duration or an Option of one (None: no limit, so one poll
+    /// interval here, as nothing says when the screen changes).
+    pub fn wait(&mut self, timeout: impl Into<Option<Duration>>) -> Res<()> {
         if self.still {
-            std::thread::sleep(timeout);
+            std::thread::sleep(timeout.into().unwrap_or(Duration::from_millis(16)));
         }
         Ok(())
     }

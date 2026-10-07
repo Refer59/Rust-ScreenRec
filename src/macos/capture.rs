@@ -254,9 +254,11 @@ impl Capture {
     /// No damage events: after a still screen, wait `timeout` before looking
     /// again; after a change, look again at once (record() already paces
     /// itself to the frame rate).
-    pub fn wait(&mut self, timeout: Duration) -> Res<()> {
+    /// Takes a Duration or an Option of one (None: no limit, so one poll
+    /// interval here, as nothing says when the screen changes).
+    pub fn wait(&mut self, timeout: impl Into<Option<Duration>>) -> Res<()> {
         if self.still {
-            std::thread::sleep(timeout);
+            std::thread::sleep(timeout.into().unwrap_or(Duration::from_millis(16)));
         }
         Ok(())
     }
