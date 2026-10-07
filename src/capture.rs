@@ -14,10 +14,11 @@ use crate::frame::{Rect, Rows, View, draw, shows};
 pub use crate::frame::Sprite;
 use std::os::fd::AsRawFd;
 use std::time::Duration;
-use x11rb::connection::Connection;
+use x11rb::connection::{Connection, RequestConnection as _};
 use x11rb::protocol::Event;
 use x11rb::protocol::composite::{ConnectionExt as _, Redirect};
 use x11rb::protocol::damage::{ConnectionExt as _, ReportLevel};
+use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::shm::ConnectionExt as _;
 use x11rb::protocol::xfixes::ConnectionExt as _;
 use x11rb::protocol::xproto::{ChangeWindowAttributesAux, ConnectionExt as _, CreateGCAux, EventMask, GrabMode, GrabStatus, ImageFormat, Rectangle};
@@ -139,6 +140,25 @@ impl Capture {
             draw_pointer: true,
             follow: None,
         })
+    }
+
+    /// Whether the whole screen can be read. Not under Wayland: Xwayland only
+    /// has X11 apps' windows, everything else would come out black. Xwayland
+    /// 23.1+ has an extension saying so; every version names its outputs
+    /// XWAYLAND0, XWAYLAND1...
+    pub fn screen_readable(&self) -> Res<()> {
+        let c = &self.conn;
+        let first = c.randr_get_screen_resources_current(self.root).ok().and_then(|r| r.reply().ok()).and_then(|r| r.outputs.first().copied());
+        let named = first.and_then(|o| c.randr_get_output_info(o, CURRENT_TIME).ok()?.reply().ok()).is_some_and(|i| i.name.starts_with(b"XWAYLAND"));
+        if named || c.extension_information("XWAYLAND")?.is_some() {
+            let msg = tr!(
+                "a Wayland session's screen can't be captured yet, only X11 apps' windows (rec --window): log in with \"Ubuntu on Xorg\" (GNOME on Xorg) instead",
+                "aún no se puede capturar la pantalla de una sesión Wayland, solo ventanas de apps X11 (rec --window): inicia sesión con \"Ubuntu en Xorg\" (GNOME en Xorg)",
+                "Wayland セッションの画面はまだキャプチャできません。X11 アプリのウィンドウのみ (rec --window) です: \"Ubuntu on Xorg\" (GNOME on Xorg) でログインしてください"
+            );
+            return Err(msg.into());
+        }
+        Ok(())
     }
 
     /// Capture only this part of the screen from now on (clamped to it).

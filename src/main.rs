@@ -181,6 +181,7 @@ enum Target {
 /// drawn back in on request). X11 has no "leave the cursor out" here, so hide
 /// it and grab until it is verifiably gone.
 fn freeze(cap: &mut Capture) -> Res<(Vec<u8>, Sprite)> {
+    cap.screen_readable()?;
     let (cursor, _) = cap.query_cursor()?;
     let hidden = cap.hide_pointer()?;
     let give_up = Instant::now() + Duration::from_millis(500);
@@ -780,6 +781,7 @@ fn record(cap: &mut Capture, path: &Path, opts: &RecOpts, mut pill: Option<Pill>
             cap.follow_window(id, (r.0, r.1, r.0 + w32, r.1 + h32))?;
         }
         Target::Area(_) => {
+            cap.screen_readable()?;
             cap.track_changes()?;
             if pill.is_some() {
                 settle(cap, gone.as_ref())?;

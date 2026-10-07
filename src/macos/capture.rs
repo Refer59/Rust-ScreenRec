@@ -179,6 +179,11 @@ impl Capture {
         Ok(())
     }
 
+    /// The whole screen can always be read here.
+    pub fn screen_readable(&self) -> Res<()> {
+        Ok(())
+    }
+
     /// Capture only this part of the screen from now on (clamped to it).
     pub fn set_region(&mut self, x: i32, y: i32, w: i32, h: i32) {
         let (x0, y0) = (x.clamp(0, self.sw as i32 - 1), y.clamp(0, self.sh as i32 - 1));
