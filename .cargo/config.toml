@@ -1,0 +1,6 @@
+# Windows: the C runtime goes into screenrec.exe, so it starts on a Windows
+# without the Visual C++ Redistributable (by default Rust's MSVC builds need
+# its VCRUNTIME140.dll). LNK4099: the static CRT's .pdb files are missing
+# where the CRT comes from cargo-xwin; debug info for it isn't needed.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/IGNORE:4099"]
