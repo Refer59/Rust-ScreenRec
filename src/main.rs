@@ -119,9 +119,9 @@ fn install() -> Res<()> {
 
 fn shot(out: Option<&String>) -> Res<()> {
     let mut cap = Capture::new()?;
-    let (screen, _) = freeze(&mut cap)?;
+    freeze(&mut cap)?;
     let path = out.map(PathBuf::from).unwrap_or_else(|| default_path("PICTURES", &shot_prefix(), "png"));
-    save_image(&screen, cap.sw, (0, 0, cap.sw as i32, cap.sh as i32), None, &path)?;
+    save_image(cap.frame(), cap.sw, (0, 0, cap.sw as i32, cap.sh as i32), None, &path)?;
     println!("{}", path.display());
     Ok(())
 }
@@ -177,10 +177,10 @@ enum Target {
     Window(u32, Rect),
 }
 
-/// The whole screen as it is now, without the pointer (returned apart, to be
-/// drawn back in on request). X11 has no "leave the cursor out" here, so hide
-/// it and grab until it is verifiably gone.
-fn freeze(cap: &mut Capture) -> Res<(Vec<u8>, Sprite)> {
+/// The whole screen as it is now, without the pointer, left in `cap.frame()`;
+/// the pointer is returned apart, to be drawn back in on request. X11 has no
+/// "leave the cursor out" here, so hide it and grab until it is verifiably gone.
+fn freeze(cap: &mut Capture) -> Res<Sprite> {
     cap.screen_readable()?;
     let (cursor, _) = cap.query_cursor()?;
     let hidden = cap.hide_pointer()?;
@@ -193,25 +193,35 @@ fn freeze(cap: &mut Capture) -> Res<(Vec<u8>, Sprite)> {
         std::thread::sleep(Duration::from_millis(4));
     }
     cap.show_pointer()?;
-    Ok((cap.frame().to_vec(), cursor))
+    Ok(cursor)
 }
 
 /// Cut `r` out of the BGRX `screen` and save it as PNG, or JPG if the path says so.
 fn save_image(screen: &[u8], sw: usize, r: Rect, cursor: Option<&Sprite>, path: &Path) -> Res<()> {
     let (w, h) = ((r.2 - r.0) as usize, (r.3 - r.1) as usize);
-    let mut img = Vec::with_capacity(w * h * 4);
-    for y in r.1..r.3 {
-        img.extend_from_slice(&screen[(y as usize * sw + r.0 as usize) * 4..][..w * 4]);
-    }
-    if let Some(c) = cursor {
-        frame::draw(&mut img, View { w, h, x0: r.0, y0: r.1 }, c);
-    }
+    let rows = || (r.1..r.3).map(|y| &screen[(y as usize * sw + r.0 as usize) * 4..][..w * 4]);
+    // Full-width rows are already one contiguous image; a cut-out or a
+    // drawn-in pointer needs its own copy.
+    let mut own = Vec::new();
+    let img: &[u8] = if cursor.is_none() && w == sw {
+        &screen[r.1 as usize * sw * 4..r.3 as usize * sw * 4]
+    } else {
+        own.reserve_exact(w * h * 4);
+        rows().for_each(|row| own.extend_from_slice(row));
+        if let Some(c) = cursor {
+            frame::draw(&mut own, View { w, h, x0: r.0, y0: r.1 }, c);
+        }
+        &own
+    };
     if path.extension().is_some_and(|e| e == "jpg" || e == "jpeg") {
         let jpg = jpeg_encoder::Encoder::new_file(path, 90)?;
-        jpg.encode(&img, w as u16, h as u16, jpeg_encoder::ColorType::Bgra)?; // the 4th byte is ignored
+        jpg.encode(img, w as u16, h as u16, jpeg_encoder::ColorType::Bgra)?; // the 4th byte is ignored
         return Ok(());
     }
-    let rgb: Vec<u8> = img.as_chunks::<4>().0.iter().flat_map(|p| [p[2], p[1], p[0]]).collect();
+    let mut rgb = vec![0u8; w * h * 3];
+    for (o, p) in rgb.as_chunks_mut::<3>().0.iter_mut().zip(img.as_chunks::<4>().0) {
+        *o = [p[2], p[1], p[0]];
+    }
     let mut png = png::Encoder::new(std::fs::File::create(path)?, w as u32, h as u32);
     png.set_color(png::ColorType::Rgb);
     png.set_compression(png::Compression::Fast);
@@ -364,7 +374,8 @@ fn gui() -> Res<()> {
     std::thread::spawn(|| ui::set_reduced_motion(shortcut::animations_off())); // a gsettings call: not on the way to the first frame
     let fonts_job = std::thread::spawn(|| (ui::load_font(false), ui::load_bold())); // fc-match runs while the screen is set up
     let mut cap = Capture::new()?;
-    let (screen, cursor) = freeze(&mut cap)?; // screenshots come from this: our UI is never in them
+    let cursor = freeze(&mut cap)?;
+    let screen = cap.frame().to_vec(); // screenshots come from this: our UI is never in them
     let (sw, sh) = (cap.sw as i32, cap.sh as i32);
     let ewmh = select::Ewmh::new(&cap);
     let wins = ewmh.windows(&cap);
