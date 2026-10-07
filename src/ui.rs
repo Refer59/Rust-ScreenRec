@@ -1262,10 +1262,15 @@ pub struct Fade {
     tw: Tween,
     shown: Option<u32>, // the value last set
     on: bool,           // a compositor applies it
+    full: f32,          // ms for a fade all the way
 }
 
 /// A fade all the way, in or out.
 const FADE_MS: f32 = 500.0;
+/// Out before a recording, which can't start while any of the launcher shows: 17
+/// refreshes at 144 Hz, the first taking 16 % of the way and each next one less,
+/// so it still reads as a fade, not a cut. Every ms more delays the recording.
+const REC_FADE_MS: f32 = 120.0;
 
 impl Fade {
     /// Fully transparent until `go`.
@@ -1275,14 +1280,19 @@ impl Fade {
         let cm = conn.intern_atom(false, format!("_NET_WM_CM_S{screen}").as_bytes())?;
         let atom = conn.intern_atom(false, b"_NET_WM_WINDOW_OPACITY")?.reply()?.atom;
         let on = conn.get_selection_owner(cm.reply()?.atom)?.reply()?.owner != x11rb::NONE;
-        Ok(Fade { atom, tw: Tween::new(0.0), shown: None, on })
+        Ok(Fade { atom, tw: Tween::new(0.0), shown: None, on, full: FADE_MS })
     }
 
-    /// Head for opacity `to`: half a second for the whole way, less for part of it;
-    /// at once without a compositor or with reduced motion.
+    /// Head for opacity `to`: half a second for the whole way (see `hurry`), less for
+    /// part of it; at once without a compositor or with reduced motion.
     pub fn go(&mut self, to: f32) {
-        let ms = if self.on { FADE_MS * (to - self.tw.get()).abs() } else { 0.0 };
+        let ms = if self.on { self.full * (to - self.tw.get()).abs() } else { 0.0 };
         self.tw.go(to, ms);
+    }
+
+    /// Fade out quickly from now on: a recording is waiting for the launcher to go.
+    pub fn hurry(&mut self) {
+        self.full = REC_FADE_MS;
     }
 
     pub fn busy(&self) -> bool {

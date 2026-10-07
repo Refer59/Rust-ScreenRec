@@ -802,6 +802,7 @@ fn shutter(mut cap: Capture, ov: &mut select::Overlay, (windows, fade): (&[&ui::
         });
     }
     // A recording waits until the launcher is gone: none of it may end up in the video.
+    fade.hurry();
     fade_out(&cap.conn, fade, &ours)?;
     if STOP.load(Relaxed) {
         return Ok(()); // the shortcut again while it faded: that's a cancel
