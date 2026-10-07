@@ -70,6 +70,28 @@ fn unblend(f: &mut [u8], v: View, o: &Sprite, (ox, oy): (i32, i32), cursor: Opti
     Some(true)
 }
 
+/// Remove the pill from `f`: `cur` at its position or the trail first, then,
+/// if the compositor still shows the look before `set_overlay` (`prev`), that.
+/// Whether `cur` itself was seen (or is not in the frame at all).
+fn unblend_any(f: &mut [u8], v: View, cur: &Sprite, prev: Option<&Sprite>, trail: &[(i32, i32)], cursor: Option<&Sprite>) -> bool {
+    let now = unblend(f, v, cur, (cur.x, cur.y), cursor);
+    let (mut seen, mut failed) = (now == Some(true), now == Some(false));
+    for &p in trail {
+        if seen {
+            break;
+        }
+        match unblend(f, v, cur, p, cursor) {
+            Some(true) => seen = true,
+            Some(false) => failed = true,
+            None => {}
+        }
+    }
+    if let (false, true, Some(pv)) = (seen, failed, prev) {
+        let _ = std::iter::once((cur.x, cur.y)).chain(trail.iter().copied()).any(|p| unblend(f, v, pv, p, cursor) == Some(true));
+    }
+    seen || now.is_none()
+}
+
 /// The window being recorded, read from its own pixmap.
 struct Follow {
     top: u32,         // its top-level window (a child of root): what gets redirected
@@ -96,6 +118,7 @@ pub struct Capture {
     events: Vec<Event>,            // for our windows: clicks, exposes
     /// Our translucent pill; removed from every frame it is found in.
     pub overlay: Option<Sprite>,
+    prev_overlay: Option<Sprite>, // the look before `set_overlay`: the compositor can be a repaint behind
     trail: Vec<(i32, i32)>, // where the pill just was: the compositor can be a frame behind a move
     /// Whether the last grab found the pill on screen (and removed it).
     pub overlay_seen: bool,
@@ -135,6 +158,7 @@ impl Capture {
             pending: None,
             events: vec![],
             overlay: None,
+            prev_overlay: None,
             trail: vec![],
             overlay_seen: false,
             draw_pointer: true,
@@ -209,10 +233,7 @@ impl Capture {
         // `changed` makes a band touching the pill or the cursor cover all of
         // it: the pill is judged as a whole, the cursor blended exactly once.
         if let Some(o) = &self.overlay {
-            let now = unblend(f, bv, o, (o.x, o.y), cursor);
-            self.overlay_seen = now == Some(true)
-                || self.trail.iter().any(|&p| unblend(f, bv, o, p, cursor) == Some(true))
-                || now.is_none(); // not in this frame: nothing to remove
+            self.overlay_seen = unblend_any(f, bv, o, self.prev_overlay.as_ref(), &self.trail, cursor);
         }
         // A software cursor (e.g. on some PRIME laptops) is already in the image.
         if let Some(c) = cursor.filter(|c| self.draw_pointer && !shows(f, bv, c)) {
@@ -224,6 +245,12 @@ impl Capture {
     /// Whether most opaque pixels of `s` are in the last grab, verbatim.
     pub fn shows(&self, s: &Sprite) -> bool {
         shows(self.frame(), self.view, s)
+    }
+
+    /// Redrawn pill: the old look stays removable until the compositor catches up.
+    #[allow(dead_code)] // until the pill timer calls it
+    pub fn set_overlay(&mut self, s: Sprite) {
+        self.prev_overlay = self.overlay.replace(s);
     }
 
     /// Move the pill (already moved on screen); the old spot stays a candidate for a moment.
@@ -463,5 +490,22 @@ mod tests {
         assert_eq!(f[0], 250);
         // Pill outside the frame: nothing to do.
         assert_eq!(unblend(&mut f, v, &pill, (50, 70), None), None);
+    }
+
+    #[test]
+    fn unblend_any_handles_a_repaint_in_flight() {
+        let (old, new) = (0xCC_40_20_10u32, 0xCC_10_50_30u32);
+        let sprite = |p| Sprite { x: 5, y: 7, w: 1, h: 1, argb: vec![p] };
+        let v = View { w: 1, h: 1, x0: 5, y0: 7 };
+        let show = |p: u32, under: u32| [0, 8, 16].map(|s| ((p >> s & 255) + (under as f32 * 0.2).round() as u32) as u8);
+        for (shown, seen) in [(old, false), (new, true)] {
+            let mut f = [0; 4];
+            f[..3].copy_from_slice(&show(shown, 100));
+            // `old` was replaced by `new`; the frame may still show either.
+            assert_eq!(unblend_any(&mut f, v, &sprite(new), Some(&sprite(old)), &[], None), seen);
+            for c in &f[..3] {
+                assert!((*c as i32 - 100).abs() <= 3, "{c}");
+            }
+        }
     }
 }
