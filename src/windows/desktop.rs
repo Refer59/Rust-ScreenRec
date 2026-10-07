@@ -13,7 +13,8 @@ use windows_sys::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, O
 use windows_sys::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows_sys::Win32::System::Ole::{CF_DIB, CF_UNICODETEXT};
 use windows_sys::Win32::System::Threading::{BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess, SetPriorityClass};
-use windows_sys::Win32::UI::Shell::{FOLDERID_Pictures, FOLDERID_Videos, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+use windows_sys::Win32::UI::Shell::{FOLDERID_LocalAppData, FOLDERID_Pictures, FOLDERID_Videos, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+use windows_sys::core::GUID;
 
 /// How to install ffmpeg here, for error messages.
 pub const GET_FFMPEG: &str = "winget install ffmpeg";
@@ -26,7 +27,16 @@ pub fn notify(title: &str, body: &str, _icon: Option<&Path>) {
 /// The user's Pictures or Videos folder (wherever it was moved, e.g. to
 /// OneDrive), else their profile folder.
 pub fn user_dir(xdg_dir: &str) -> PathBuf {
-    let id = if xdg_dir == "PICTURES" { &FOLDERID_Pictures } else { &FOLDERID_Videos };
+    if let Some(dir) = known_folder(if xdg_dir == "PICTURES" { &FOLDERID_Pictures } else { &FOLDERID_Videos }) {
+        return dir;
+    }
+    let home = PathBuf::from(std::env::var_os("USERPROFILE").unwrap_or_else(|| ".".into()));
+    let dir = home.join(if xdg_dir == "PICTURES" { "Pictures" } else { "Videos" });
+    if dir.is_dir() { dir } else { home }
+}
+
+/// The known folder `id`, if it exists.
+fn known_folder(id: &GUID) -> Option<PathBuf> {
     let mut p = null_mut();
     let hr = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT as u32, null_mut(), &mut p) };
     let known = (hr >= 0 && !p.is_null()).then(|| unsafe {
@@ -34,12 +44,15 @@ pub fn user_dir(xdg_dir: &str) -> PathBuf {
         PathBuf::from(OsString::from_wide(std::slice::from_raw_parts(p, len)))
     });
     unsafe { CoTaskMemFree(p.cast()) }; // even on failure, says the documentation
-    if let Some(dir) = known.filter(|d| d.is_dir()) {
-        return dir;
-    }
-    let home = PathBuf::from(std::env::var_os("USERPROFILE").unwrap_or_else(|| ".".into()));
-    let dir = home.join(if xdg_dir == "PICTURES" { "Pictures" } else { "Videos" });
-    if dir.is_dir() { dir } else { home }
+    known.filter(|d| d.is_dir())
+}
+
+/// Where we keep files we can always download again (the OCR's runtime and
+/// models): %LOCALAPPDATA%\screenrec (local, not roaming: they are big).
+#[allow(dead_code)] // until the OCR downloads into it
+pub fn cache_dir() -> PathBuf {
+    let local = known_folder(&FOLDERID_LocalAppData).or_else(|| std::env::var_os("LOCALAPPDATA").map(PathBuf::from));
+    local.unwrap_or_else(|| ".".into()).join("screenrec")
 }
 
 /// Unix time `secs` as local (year, month, day, hour, minute, second).

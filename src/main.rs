@@ -19,6 +19,7 @@ mod nvenc;
 mod nvenc_sys;
 #[cfg(target_os = "linux")]
 mod select;
+mod service;
 #[cfg(target_os = "linux")]
 mod shortcut;
 #[cfg(target_os = "linux")]

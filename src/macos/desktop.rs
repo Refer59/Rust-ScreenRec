@@ -42,6 +42,13 @@ pub fn user_dir(xdg_dir: &str) -> PathBuf {
     if dir.is_dir() { dir } else { home }
 }
 
+/// Where we keep files we can always download again (the OCR's runtime and
+/// models): ~/Library/Caches/screenrec.
+#[allow(dead_code)] // until the OCR downloads into it
+pub fn cache_dir() -> PathBuf {
+    PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into())).join("Library/Caches/screenrec")
+}
+
 /// Unix time `secs` as local (year, month, day, hour, minute, second).
 pub fn local_time(secs: u64) -> (i32, i32, i32, i32, i32, i32) {
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
