@@ -453,22 +453,30 @@ fn gui() -> Res<()> {
             };
         }
         for mut ev in cap.take_events()? {
-            // The panels' transparent margins and the badge are click-through: the overlay gets those events.
+            // The panels' transparent margins and the badge are click-through: the overlay gets those
+            // events, or the panel where the settings' margin overhangs it (its close button).
             let body = |id: u32, x: i16, y: i16| id != bid && (id != pid || ui::panel_body_has(scale, x, y)) && (id != mid || ui::settings_body_has(scale, x, y));
+            let under = |id: u32, rx: i16, ry: i16| {
+                let (x, y) = ((rx as i32 - px) as i16, (ry as i32 - py) as i16);
+                if id == mid && ui::panel_body_has(scale, x, y) { (pid, x, y) } else { (ov.win, rx, ry) }
+            };
             match &mut ev {
                 Event::ButtonPress(e) => {
                     ring = false;
                     if !body(e.event, e.event_x, e.event_y) {
-                        (thru, e.event, e.event_x, e.event_y) = (true, ov.win, e.root_x, e.root_y);
+                        let to = under(e.event, e.root_x, e.root_y);
+                        (thru, e.event, e.event_x, e.event_y) = (to.0 == ov.win, to.0, to.1, to.2);
                     }
                 }
                 Event::ButtonRelease(e) if thru || !body(e.event, e.event_x, e.event_y) => {
                     (thru, e.event, e.event_x, e.event_y) = (false, ov.win, e.root_x, e.root_y);
                 }
                 Event::MotionNotify(e) if thru || !body(e.event, e.event_x, e.event_y) => {
-                    (redraw, st.hover) = (redraw || (e.event == pid && st.hover.is_some()), if e.event == pid { None } else { st.hover });
-                    (restyle, set.hover) = (restyle || (e.event == mid && set.hover.is_some()), if e.event == mid { None } else { set.hover });
-                    (e.event, e.event_x, e.event_y) = (ov.win, e.root_x, e.root_y);
+                    let to = if thru { (ov.win, e.root_x, e.root_y) } else { under(e.event, e.root_x, e.root_y) };
+                    let off = to.0 == ov.win; // on neither card
+                    (redraw, st.hover) = (redraw || (off && st.hover.is_some()), if off { None } else { st.hover });
+                    (restyle, set.hover) = (restyle || set.hover.is_some(), None);
+                    (e.event, e.event_x, e.event_y) = to;
                 }
                 _ => {}
             }
