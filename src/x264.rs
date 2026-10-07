@@ -94,7 +94,14 @@ pub struct Encoder {
 /// Where the access unit after the first one starts (each opens with a
 /// delimiter NAL, see `Codec`; NAL payloads never contain 00 00 01).
 fn next_unit(b: &[u8]) -> Option<usize> {
-    (4..b.len().saturating_sub(3)).find(|&i| b[i..i + 4] == [0, 0, 1, 9]).map(|i| if b[i - 1] == 0 { i - 1 } else { i })
+    let mut i = 4;
+    while let Some(z) = crate::mkv::start_code(b, i) {
+        if *b.get(z + 3)? == 9 {
+            return Some(if b[z - 1] == 0 { z - 1 } else { z });
+        }
+        i = z + 1;
+    }
+    None
 }
 
 impl Encoder {
@@ -117,6 +124,14 @@ impl Encoder {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|_| tr!("recording without a GPU needs ffmpeg ({})", "grabar sin GPU necesita ffmpeg ({})", "GPU なしの録画には ffmpeg が必要です ({})", crate::desktop::GET_FFMPEG))?;
+        // A 3 MB frame through the default 64 KB pipe is ~48 wakeups; 1 MB cuts
+        // that to 3. On failure the pipe just keeps its default size.
+        #[cfg(target_os = "linux")]
+        if let Some(i) = &child.stdin {
+            use std::os::fd::AsRawFd;
+            // SAFETY: fcntl on a pipe fd we own; F_SETPIPE_SZ only resizes it.
+            unsafe { libc::fcntl(i.as_raw_fd(), libc::F_SETPIPE_SZ, 1 << 20) };
+        }
         let (stdin, mut out) = (child.stdin.take(), child.stdout.take().ok_or(tr!("ffmpeg has no stdout", "ffmpeg sin stdout", "ffmpeg の stdout がありません"))?);
         let (tx, units) = channel();
         std::thread::spawn(move || {
@@ -177,28 +192,133 @@ impl Encoder {
 }
 
 /// BGRX rows (from `src`, `stride` apart) into the I420 planes `ys`, `us`,
-/// `vs`, which cover the same row pairs. Pixels are read as u32 so the loops
-/// vectorize with plain SSE2: luma walks both rows of a pair in one loop (two
-/// independent streams), chroma sums each 2x2 block with red and blue side by
-/// side in one u32 and does the matrix in i16.
+/// `vs`, which cover the same row pairs. AVX2 where the CPU has it, else the
+/// portable code; both give the same bytes.
 fn convert(src: &[u8], stride: usize, w: usize, ys: &mut [u8], us: &mut [u8], vs: &mut [u8]) {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: the CPU has AVX2, checked just above.
+        return unsafe { avx2::convert(src, stride, w, ys, us, vs) };
+    }
+    convert_scalar(src, stride, w, ys, us, vs)
+}
+
+fn convert_scalar(src: &[u8], stride: usize, w: usize, ys: &mut [u8], us: &mut [u8], vs: &mut [u8]) {
     let rows = ys.chunks_exact_mut(2 * w).zip(us.chunks_exact_mut(w / 2)).zip(vs.chunks_exact_mut(w / 2));
     for (((ypair, ur), vr), j) in rows.zip((0..).step_by(2)) {
         let (top, bot) = (&src[j * stride..][..w * 4], &src[(j + 1) * stride..][..w * 4]);
         let (ya, yb) = ypair.split_at_mut(w);
-        for (((p, q), y), z) in top.as_chunks::<4>().0.iter().zip(bot.as_chunks::<4>().0).zip(ya).zip(yb) {
-            (*y, *z) = (luma(*p), luma(*q));
+        pair(top, bot, ya, yb, ur, vr);
+    }
+}
+
+/// One row pair. Pixels are read as u32 so the loops vectorize with plain
+/// SSE2: luma walks both rows in one loop (two independent streams), chroma
+/// sums each 2x2 block with red and blue side by side in one u32 and does the
+/// matrix in i16.
+#[inline(always)]
+fn pair(top: &[u8], bot: &[u8], ya: &mut [u8], yb: &mut [u8], ur: &mut [u8], vr: &mut [u8]) {
+    for (((p, q), y), z) in top.as_chunks::<4>().0.iter().zip(bot.as_chunks::<4>().0).zip(ya).zip(yb) {
+        (*y, *z) = (luma(*p), luma(*q));
+    }
+    for (((a, b), u), v) in top.as_chunks::<8>().0.iter().zip(bot.as_chunks::<8>().0).zip(ur).zip(vr) {
+        let px = |s: &[u8; 8], i: usize| u32::from_le_bytes([s[i], s[i + 1], s[i + 2], s[i + 3]]);
+        let (p0, p1, q0, q1) = (px(a, 0), px(a, 4), px(b, 0), px(b, 4));
+        // 2x2 averages; red and blue summed side by side in one u32
+        let rb = (p0 & 0xFF00FF) + (p1 & 0xFF00FF) + (q0 & 0xFF00FF) + (q1 & 0xFF00FF) + 0x20002;
+        let g = ((p0 >> 8 & 0xFF) + (p1 >> 8 & 0xFF) + (q0 >> 8 & 0xFF) + (q1 >> 8 & 0xFF) + 2) >> 2;
+        let (r, g, bl) = ((rb >> 18) as i16, g as i16, (rb >> 2 & 0x3FFF) as i16);
+        *u = ((-26 * r - 86 * g + 112 * bl + 128) >> 8) as u8 ^ 0x80; // ^0x80: +128
+        *v = ((112 * r - 102 * g - 10 * bl + 128) >> 8) as u8 ^ 0x80;
+    }
+}
+
+/// `convert_scalar` 32 pixels at a time with the same integer formulas; the
+/// last `w % 32` columns of each row go through `pair`.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+mod avx2 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    #[target_feature(enable = "avx2")]
+    pub(super) fn convert(src: &[u8], stride: usize, w: usize, ys: &mut [u8], us: &mut [u8], vs: &mut [u8]) {
+        let n = w & !31;
+        let rows = ys.chunks_exact_mut(2 * w).zip(us.chunks_exact_mut(w / 2)).zip(vs.chunks_exact_mut(w / 2));
+        for (((ypair, ur), vr), j) in rows.zip((0..).step_by(2)) {
+            let (top, bot) = (&src[j * stride..][..w * 4], &src[(j + 1) * stride..][..w * 4]);
+            let (ya, yb) = ypair.split_at_mut(w);
+            let blocks = top.as_chunks::<128>().0.iter().zip(bot.as_chunks::<128>().0);
+            let outs = ya.as_chunks_mut::<32>().0.iter_mut().zip(yb.as_chunks_mut::<32>().0).zip(ur.as_chunks_mut::<16>().0).zip(vr.as_chunks_mut::<16>().0);
+            for ((t, b), (((y, z), u), v)) in blocks.zip(outs) {
+                let (t, b) = (load(t), load(b));
+                *y = luma32(t);
+                *z = luma32(b);
+                (*u, *v) = matrix([average(t[0], b[0]), average(t[1], b[1]), average(t[2], b[2]), average(t[3], b[3])]);
+            }
+            super::pair(&top[n * 4..], &bot[n * 4..], &mut ya[n..], &mut yb[n..], &mut ur[n / 2..], &mut vr[n / 2..]);
         }
-        for (((a, b), u), v) in top.as_chunks::<8>().0.iter().zip(bot.as_chunks::<8>().0).zip(ur).zip(vr) {
-            let px = |s: &[u8; 8], i: usize| u32::from_le_bytes([s[i], s[i + 1], s[i + 2], s[i + 3]]);
-            let (p0, p1, q0, q1) = (px(a, 0), px(a, 4), px(b, 0), px(b, 4));
-            // 2x2 averages; red and blue summed side by side in one u32
-            let rb = (p0 & 0xFF00FF) + (p1 & 0xFF00FF) + (q0 & 0xFF00FF) + (q1 & 0xFF00FF) + 0x20002;
-            let g = ((p0 >> 8 & 0xFF) + (p1 >> 8 & 0xFF) + (q0 >> 8 & 0xFF) + (q1 >> 8 & 0xFF) + 2) >> 2;
-            let (r, g, bl) = ((rb >> 18) as i16, g as i16, (rb >> 2 & 0x3FFF) as i16);
-            *u = ((-26 * r - 86 * g + 112 * bl + 128) >> 8) as u8 ^ 0x80; // ^0x80: +128
-            *v = ((112 * r - 102 * g - 10 * bl + 128) >> 8) as u8 ^ 0x80;
-        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn load(p: &[u8; 128]) -> [__m256i; 4] {
+        // SAFETY: 128 bytes read unaligned from a 128-byte array; any bits are a valid __m256i.
+        unsafe { p.as_ptr().cast::<[__m256i; 4]>().read_unaligned() }
+    }
+
+    /// (47R + 157G + 16B + 4224) >> 8 for 8 pixels, as i32. BGRX becomes BGRG
+    /// so one maddubs gives 16B + 78G and 47R + 79G (both fit i16).
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn luma8(p: __m256i) -> __m256i {
+        let k = _mm256_setr_epi8(0, 1, 2, 1, 4, 5, 6, 5, 8, 9, 10, 9, 12, 13, 14, 13, 0, 1, 2, 1, 4, 5, 6, 5, 8, 9, 10, 9, 12, 13, 14, 13);
+        let s = _mm256_maddubs_epi16(_mm256_shuffle_epi8(p, k), _mm256_set1_epi32(0x4F2F_4E10)); // 16, 78, 47, 79
+        _mm256_srli_epi32(_mm256_add_epi32(_mm256_madd_epi16(s, _mm256_set1_epi16(1)), _mm256_set1_epi32(4224)), 8)
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn luma32(p: [__m256i; 4]) -> [u8; 32] {
+        let y = _mm256_packus_epi16(_mm256_packs_epi32(luma8(p[0]), luma8(p[1])), _mm256_packs_epi32(luma8(p[2]), luma8(p[3])));
+        let y = _mm256_permutevar8x32_epi32(y, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
+        // SAFETY: __m256i and [u8; 32] have the same size, any bits are valid.
+        unsafe { std::mem::transmute(y) }
+    }
+
+    /// Rounded 2x2 averages of 8 top and 8 bottom pixels: 4 blocks of B, G, R, X in i16.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn average(t: __m256i, b: __m256i) -> __m256i {
+        // B0 G0 R0 X0 B1 G1 R1 X1 -> B0 B1 G0 G1 R0 R1 X0 X1: maddubs by 1 adds the pixel pair
+        let k = _mm256_setr_epi8(0, 4, 1, 5, 2, 6, 3, 7, 8, 12, 9, 13, 10, 14, 11, 15, 0, 4, 1, 5, 2, 6, 3, 7, 8, 12, 9, 13, 10, 14, 11, 15);
+        let one = _mm256_set1_epi8(1);
+        let s = _mm256_add_epi16(_mm256_maddubs_epi16(_mm256_shuffle_epi8(t, k), one), _mm256_maddubs_epi16(_mm256_shuffle_epi8(b, k), one));
+        _mm256_srli_epi16(_mm256_add_epi16(s, _mm256_set1_epi16(2)), 2)
+    }
+
+    /// (m . BGR + 128) >> 8 of 16 blocks, as i16 in the order 0 1 4 5 8 9 12 13 | 2 3 6 7 10 11 14 15.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn dot(a: [__m256i; 4], m: __m256i) -> __m256i {
+        let h01 = _mm256_hadd_epi32(_mm256_madd_epi16(a[0], m), _mm256_madd_epi16(a[1], m));
+        let h23 = _mm256_hadd_epi32(_mm256_madd_epi16(a[2], m), _mm256_madd_epi16(a[3], m));
+        let r = _mm256_set1_epi32(128);
+        _mm256_packs_epi32(_mm256_srai_epi32(_mm256_add_epi32(h01, r), 8), _mm256_srai_epi32(_mm256_add_epi32(h23, r), 8))
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn matrix(a: [__m256i; 4]) -> ([u8; 16], [u8; 16]) {
+        let u = dot(a, _mm256_setr_epi16(112, -86, -26, 0, 112, -86, -26, 0, 112, -86, -26, 0, 112, -86, -26, 0));
+        let v = dot(a, _mm256_setr_epi16(-10, -102, 112, 0, -10, -102, 112, 0, -10, -102, 112, 0, -10, -102, 112, 0));
+        let uv = _mm256_permute4x64_epi64(_mm256_packs_epi16(u, v), 0xD8); // U | V
+        let k = _mm256_setr_epi8(0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15, 0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15);
+        let uv = _mm256_xor_si256(_mm256_shuffle_epi8(uv, k), _mm256_set1_epi8(-128)); // ^0x80: +128
+        // SAFETY: __m256i and [[u8; 16]; 2] have the same size, any bits are valid.
+        let [u, v]: [[u8; 16]; 2] = unsafe { std::mem::transmute(uv) };
+        (u, v)
     }
 }
 
@@ -232,6 +352,8 @@ mod tests {
         assert_eq!(e.yuv, [235, 235, 235, 235, 128, 128]);
     }
 
+    type Convert = fn(&[u8], usize, usize, &mut [u8], &mut [u8], &mut [u8]);
+
     /// The implementation before the luma/chroma loops were reworked.
     fn convert_ref(src: &[u8], stride: usize, w: usize, ys: &mut [u8], us: &mut [u8], vs: &mut [u8]) {
         let rows = ys.chunks_exact_mut(2 * w).zip(us.chunks_exact_mut(w / 2)).zip(vs.chunks_exact_mut(w / 2));
@@ -257,62 +379,33 @@ mod tests {
         }
     }
 
+    /// Both paths (on an AVX2 machine `convert` is the AVX2 one) against the
+    /// reference: odd tails, padded strides, extremes and noise.
     #[test]
     fn convert_matches_reference() {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        println!("avx2: {}", std::arch::is_x86_feature_detected!("avx2"));
         let mut seed = 0x9E37_79B9_7F4A_7C15u64;
-        for (w, h, pad) in [(64, 8, 0), (130, 6, 12), (2, 2, 4), (1920, 4, 64)] {
+        let cases = [(2, 2, 4), (6, 4, 0), (8, 2, 8), (10, 6, 4), (16, 2, 0), (30, 2, 0), (32, 4, 0), (34, 2, 8), (62, 2, 0), (64, 8, 0), (66, 4, 4), (130, 6, 12), (1920, 4, 64), (1920, 2, 0)];
+        for (w, h, pad) in cases {
             let stride = w * 4 + pad;
-            let src: Vec<u8> = (0..stride * h)
-                .map(|_| {
-                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                    (seed >> 56) as u8
-                })
-                .collect();
-            let planes = |f: fn(&[u8], usize, usize, &mut [u8], &mut [u8], &mut [u8])| {
-                let (mut y, mut u, mut v) = (vec![0; w * h], vec![0; w * h / 4], vec![0; w * h / 4]);
-                f(&src, stride, w, &mut y, &mut u, &mut v);
-                (y, u, v)
-            };
-            assert!(planes(convert) == planes(convert_ref), "{w}x{h} stride {stride}");
-        }
-    }
-
-    // TEMPORARY: old vs new, same binary, back to back.
-    #[test]
-    fn tmp_time_convert() {
-        let (w, h) = (std::hint::black_box(1920usize), 1080usize);
-        let mut seed = 1u64;
-        let host: Vec<u8> = (0..w * h * 4)
-            .map(|_| {
-                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                (seed >> 56) as u8
-            })
-            .collect();
-        let mut e = Encoder { child: Command::new("true").spawn().unwrap(), stdin: None, units: channel().1, pending: VecDeque::new(), yuv: vec![0; w * h * 3 / 2], w, h };
-        let mut yuv = vec![0u8; w * h * 3 / 2];
-        let mut old = |host: &[u8]| {
-            let (ys, uv) = yuv.split_at_mut(w * h);
-            let (us, vs) = uv.split_at_mut(w * h / 4);
-            convert_ref(host, w * 4, w, ys, us, vs);
-        };
-        old(&host);
-        e.upload(&host, w * 4, (0, h as i32));
-        let (mut ta, mut tb) = (vec![], vec![]);
-        for _ in 0..10 {
-            let t = std::time::Instant::now();
-            for _ in 0..20 {
-                old(std::hint::black_box(&host));
+            for fill in [Some(0u8), Some(255), None] {
+                let src: Vec<u8> = (0..stride * h)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        fill.unwrap_or((seed >> 56) as u8)
+                    })
+                    .collect();
+                let planes = |f: Convert| {
+                    let (mut y, mut u, mut v) = (vec![0; w * h], vec![0; w * h / 4], vec![0; w * h / 4]);
+                    f(&src, stride, w, &mut y, &mut u, &mut v);
+                    (y, u, v)
+                };
+                let want = planes(convert_ref);
+                assert!(planes(convert) == want, "{w}x{h} stride {stride} {fill:?}");
+                assert!(planes(convert_scalar) == want, "scalar {w}x{h} stride {stride} {fill:?}");
             }
-            ta.push(t.elapsed().as_secs_f64() * 1e3 / 20.0);
-            let t = std::time::Instant::now();
-            for _ in 0..20 {
-                e.upload(std::hint::black_box(&host), w * 4, (0, h as i32));
-            }
-            tb.push(t.elapsed().as_secs_f64() * 1e3 / 20.0);
         }
-        ta.sort_by(f64::total_cmp);
-        tb.sort_by(f64::total_cmp);
-        println!("TIMING old med {:.3} best {:.3} | new med {:.3} best {:.3} ms/upload", ta[5], ta[0], tb[5], tb[0]);
     }
 
     #[test]
@@ -320,5 +413,38 @@ mod tests {
         let s = [0, 0, 0, 1, 9, 0xF0, 0, 0, 1, 0x65, 7, 0, 0, 0, 1, 9, 0xF0, 0, 0, 1, 0x41, 8];
         assert_eq!(next_unit(&s), Some(11)); // the second delimiter, with its 4-byte start code
         assert_eq!(next_unit(&s[11..]), None);
+    }
+
+    /// The splitter before it used `mkv::start_code`.
+    fn next_unit_ref(b: &[u8]) -> Option<usize> {
+        (4..b.len().saturating_sub(3)).find(|&i| b[i..i + 4] == [0, 0, 1, 9]).map(|i| if b[i - 1] == 0 { i - 1 } else { i })
+    }
+
+    #[test]
+    fn next_unit_matches_reference() {
+        let tricky = [0, 0, 1, 9, 0, 0, 0, 1, 9, 0, 0, 1, 0x65, 0, 0, 0, 0, 1, 9, 7, 0, 0, 1, 0, 0, 1, 9, 0, 1, 9, 0, 0, 0, 0, 0, 1, 0x65, 0, 9, 0, 0, 1, 1, 9, 0, 0, 0, 1, 9, 0, 0, 1, 9, 0, 0, 0, 1, 0, 0, 1];
+        for n in 0..=tricky.len() {
+            for s in 0..n.min(8) {
+                assert_eq!(next_unit(&tricky[s..n]), next_unit_ref(&tricky[s..n]), "{s}..{n}");
+            }
+        }
+        let mut seed = 7u64;
+        let mut b = vec![];
+        while b.len() < 1 << 16 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            match seed >> 58 {
+                0 => b.extend([0, 0, 1, 9]),
+                1 => b.extend([0, 0, 0, 1, 9]),
+                2 => b.extend([0, 0, 1, 0x65]),
+                3..=6 => b.push(0),
+                _ => b.push((seed >> 40) as u8),
+            }
+        }
+        let mut i = 0;
+        while let Some(c) = next_unit_ref(&b[i..]) {
+            assert_eq!(next_unit(&b[i..]), Some(c));
+            i += c.max(1);
+        }
+        assert_eq!(next_unit(&b[i..]), None);
     }
 }
