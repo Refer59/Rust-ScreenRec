@@ -1002,6 +1002,7 @@ fn record(cap: &mut Capture, path: &Path, opts: &RecOpts, mut pill: Option<Pill>
 }
 
 /// `path` with the home folder written `~`, for messages.
+#[cfg(target_os = "linux")] // only the launcher's notifications use it
 fn tilde(path: &Path) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     match path.strip_prefix(&home) {
