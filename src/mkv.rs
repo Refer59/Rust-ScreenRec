@@ -5,8 +5,7 @@
 //! (unknown-size elements are legal).
 
 use std::fs::File;
-use std::io::{self, Write};
-use std::os::unix::fs::FileExt;
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::Path;
 
 const UNKNOWN_SIZE: [u8; 8] = [0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
@@ -129,8 +128,12 @@ impl Mkv {
         self.f.write_all(b)
     }
 
+    /// Overwrite bytes at `at`, then carry on appending at the end.
     fn patch(&self, at: u64, b: &[u8]) -> io::Result<()> {
-        self.f.write_all_at(b, at)
+        let mut f = &self.f;
+        f.seek(SeekFrom::Start(at))?;
+        f.write_all(b)?;
+        f.seek(SeekFrom::Start(self.pos)).map(drop)
     }
 
     /// Append one encoded video frame (Annex B), `ts` in ms.
