@@ -69,12 +69,13 @@ pub const CURSOR_CROSS: usize = 1;
 const GLYPHS: [u16; 7] = [68, 34, 52, 134, 136, 12, 14]; // left_ptr crosshair fleur and the four corners
 
 /// Fullscreen override-redirect window showing the frozen screen. Its
-/// background pixmap is the canvas: we redraw into it, then ClearArea.
+/// background pixmap is the canvas: we redraw into it, then ClearArea. The
+/// frozen screen itself is the capture buffer, left alone from `freeze` until
+/// a recording starts, so callers pass `cap.frame()` in rather than a copy.
 pub struct Overlay {
     pub win: u32,
     pix: u32,
     gc: u32,
-    frozen: Vec<u8>,
     w: usize,
     h: usize,
     shown: (Option<Rect>, bool), // highlighted area, with handles?
@@ -101,7 +102,7 @@ fn shm_segment(cap: &Capture) -> Res<Option<(u32, *mut u8)>> {
 }
 
 impl Overlay {
-    pub fn new(cap: &Capture, frozen: Vec<u8>, area: Option<Rect>, handles: bool) -> Res<Self> {
+    pub fn new(cap: &Capture, area: Option<Rect>, handles: bool) -> Res<Self> {
         let c = &cap.conn;
         let (w, h) = (cap.sw, cap.sh);
         let pix = c.generate_id()?;
@@ -117,7 +118,7 @@ impl Overlay {
             c.create_glyph_cursor(id, font, font, g, g + 1, 0, 0, 0, 0xffff, 0xffff, 0xffff)?;
             cursors.push(id);
         }
-        let mut o = Overlay { win: 0, pix, gc, frozen, w, h, shown: (area, handles), cursors, cursor: CURSOR_ARROW, scale: 1.0, shm };
+        let mut o = Overlay { win: 0, pix, gc, w, h, shown: (area, handles), cursors, cursor: CURSOR_ARROW, scale: 1.0, shm };
         o.win = c.generate_id()?;
         let events = EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION | EventMask::KEY_PRESS;
         let aux = CreateWindowAux::new().background_pixmap(pix).override_redirect(1).event_mask(events).cursor(o.cursors[0]);
@@ -126,19 +127,27 @@ impl Overlay {
         Ok(o)
     }
 
-    pub fn show(&mut self, conn: &impl Connection) -> Res<()> {
-        self.put(conn, (0, 0, self.w as i32, self.h as i32))?;
+    pub fn show(&mut self, conn: &impl Connection, frozen: &[u8]) -> Res<()> {
+        self.put(conn, frozen, (0, 0, self.w as i32, self.h as i32))?;
         conn.map_window(self.win)?;
         Ok(())
     }
 
-    /// The screen as it was at launch (BGRX, no pointer).
-    pub fn frozen(&self) -> &[u8] {
-        &self.frozen
+    /// Take the overlay down for good: window, pixmap and shared segment go
+    /// (a recording is about to start; the launcher needs none of it any more).
+    pub fn release(&mut self, conn: &impl Connection) -> Res<()> {
+        conn.unmap_window(self.win)?;
+        conn.free_pixmap(self.pix)?;
+        if let Some((seg, p)) = self.shm.take() {
+            conn.shm_detach(seg)?;
+            // SAFETY: `p` is our mapping of w*h*4 bytes and nothing uses it after this.
+            unsafe { libc::munmap(p.cast(), self.w * self.h * 4) };
+        }
+        Ok(())
     }
 
     /// Highlight `area` (None: dim everything), with corner handles or not.
-    pub fn set(&mut self, conn: &impl Connection, area: Option<Rect>, handles: bool) -> Res<()> {
+    pub fn set(&mut self, conn: &impl Connection, frozen: &[u8], area: Option<Rect>, handles: bool) -> Res<()> {
         if (area, handles) == self.shown {
             return Ok(());
         }
@@ -155,7 +164,7 @@ impl Overlay {
         let (w, h) = (self.w as i32, self.h as i32);
         let on_screen = |r: Rect| (r.0.max(0), r.1.max(0), r.2.min(w), r.3.min(h));
         for r in dirty.into_iter().map(on_screen).filter(|r| r.0 < r.2 && r.1 < r.3) {
-            self.put(conn, r)?;
+            self.put(conn, frozen, r)?;
             conn.clear_area(false, self.win, r.0 as i16, r.1 as i16, (r.2 - r.0) as u16, (r.3 - r.1) as u16)?;
         }
         Ok(())
@@ -177,7 +186,7 @@ impl Overlay {
 
     /// Render `r` into the pixmap: through the shared segment when there is one,
     /// else by PutImage in bands that keep requests small.
-    fn put(&mut self, conn: &impl Connection, r: Rect) -> Res<()> {
+    fn put(&mut self, conn: &impl Connection, frozen: &[u8], r: Rect) -> Res<()> {
         let rw = (r.2 - r.0) as usize;
         if let Some((seg, p)) = self.shm {
             // SAFETY: `p` maps w*h*4 bytes for as long as `self` lives, and `&mut self`
@@ -186,7 +195,7 @@ impl Overlay {
             // which is written to the socket after these writes; a later band over the
             // same rows only ever makes a queued request copy newer pixels.
             let map = unsafe { std::slice::from_raw_parts_mut(p, self.w * self.h * 4) };
-            self.render_into(r, &mut map[(r.1 as usize * self.w + r.0 as usize) * 4..], self.w * 4);
+            self.render_into(frozen, r, &mut map[(r.1 as usize * self.w + r.0 as usize) * 4..], self.w * 4);
             let (w, h, rh) = (self.w as u16, self.h as u16, (r.3 - r.1) as u16);
             conn.shm_put_image(self.pix, self.gc, w, h, r.0 as u16, r.1 as u16, rw as u16, rh, r.0 as i16, r.1 as i16, 24, u8::from(ImageFormat::Z_PIXMAP), false, seg, 0)?;
             return Ok(());
@@ -194,21 +203,21 @@ impl Overlay {
         let band = ((2 << 20) / (rw * 4)).max(1) as i32;
         for y in (r.1..r.3).step_by(band as usize) {
             let y1 = (y + band).min(r.3);
-            let data = self.render((r.0, y, r.2, y1));
+            let data = self.render(frozen, (r.0, y, r.2, y1));
             conn.put_image(ImageFormat::Z_PIXMAP, self.pix, self.gc, rw as u16, (y1 - y) as u16, r.0 as i16, y as i16, 0, 24, &data)?;
         }
         Ok(())
     }
 
-    fn render(&self, r: Rect) -> Vec<u8> {
+    fn render(&self, frozen: &[u8], r: Rect) -> Vec<u8> {
         let rw = (r.2 - r.0) as usize * 4;
         let mut out = vec![0u8; rw * (r.3 - r.1) as usize];
-        self.render_into(r, &mut out, rw);
+        self.render_into(frozen, r, &mut out, rw);
         out
     }
 
     /// Render `r`, its row k at `out[k * stride..][..rw * 4]`.
-    fn render_into(&self, (x0, y0, x1, y1): Rect, out: &mut [u8], stride: usize) {
+    fn render_into(&self, frozen: &[u8], (x0, y0, x1, y1): Rect, out: &mut [u8], stride: usize) {
         let (area, handles) = self.shown;
         let rw = (x1 - x0) as usize;
         if rw == 0 || y1 <= y0 {
@@ -222,7 +231,7 @@ impl Overlay {
         // Row by row, as spans: dim | edge | border | inside | border | edge | dim.
         for y in y0..y1 {
             let dst = &mut out[(y - y0) as usize * stride..][..rw * 4];
-            let src = &self.frozen[(y as usize * self.w + x0 as usize) * 4..][..rw * 4];
+            let src = &frozen[(y as usize * self.w + x0 as usize) * 4..][..rw * 4];
             let (mut e0, mut b0, mut i0, mut i1, mut b1, mut e1) = (x1, x1, x1, x1, x1, x1); // all dim
             if let Some(a) = area.filter(|a| y >= a.1 - bw - 1 && y < a.3 + bw + 1) {
                 let cl = |v: i32, lo: i32, hi: i32| v.clamp(lo, hi.max(lo));
@@ -416,8 +425,8 @@ pub fn drag(g: Grip, x: i32, y: i32, (sw, sh): (i32, i32)) -> Rect {
 /// The overlay as it would look over `frozen` (BGRX), for offscreen previews.
 #[cfg(test)]
 pub fn preview(frozen: Vec<u8>, w: usize, h: usize, area: Option<Rect>, handles: bool) -> Vec<u8> {
-    let o = Overlay { win: 0, pix: 0, gc: 0, frozen, w, h, shown: (area, handles), cursors: vec![], cursor: 0, scale: 1.25, shm: None };
-    o.render((0, 0, w as i32, h as i32))
+    let o = Overlay { win: 0, pix: 0, gc: 0, w, h, shown: (area, handles), cursors: vec![], cursor: 0, scale: 1.25, shm: None };
+    o.render(&frozen, (0, 0, w as i32, h as i32))
 }
 
 #[cfg(test)]
@@ -439,7 +448,7 @@ mod tests {
     }
 
     /// The per-pixel `render` this module used to have: the reference.
-    fn render_ref(o: &Overlay, (x0, y0, x1, y1): Rect) -> Vec<u8> {
+    fn render_ref(o: &Overlay, frozen: &[u8], (x0, y0, x1, y1): Rect) -> Vec<u8> {
         let (area, handles) = o.shown;
         let (rw, sc) = ((x1 - x0) as usize, o.scale);
         let bw = border(sc, handles);
@@ -450,7 +459,7 @@ mod tests {
         let white = |v: u8| (dim(v) as u16 + (255 - dim(v) as u16) * lift / 100) as u8;
         let grow = |a: Rect, m: i32| (a.0 - m, a.1 - m, a.2 + m, a.3 + m);
         for y in y0..y1 {
-            let row = &o.frozen[(y as usize * o.w + x0 as usize) * 4..][..rw * 4];
+            let row = &frozen[(y as usize * o.w + x0 as usize) * 4..][..rw * 4];
             for (x, p) in (x0..).zip(row.as_chunks::<4>().0) {
                 match area {
                     Some(a) if contains(a, x, y) => out.extend_from_slice(p),
@@ -483,7 +492,7 @@ mod tests {
         out
     }
 
-    fn overlay(w: usize, h: usize, shown: (Option<Rect>, bool)) -> Overlay {
+    fn overlay(w: usize, h: usize, shown: (Option<Rect>, bool)) -> (Overlay, Vec<u8>) {
         let mut seed = 12345u32;
         let frozen = (0..w * h * 4)
             .map(|_| {
@@ -491,7 +500,7 @@ mod tests {
                 (seed >> 24) as u8
             })
             .collect();
-        Overlay { win: 0, pix: 0, gc: 0, frozen, w, h, shown, cursors: vec![], cursor: 0, scale: 1.0, shm: None }
+        (Overlay { win: 0, pix: 0, gc: 0, w, h, shown, cursors: vec![], cursor: 0, scale: 1.0, shm: None }, frozen)
     }
 
     #[test]
@@ -520,13 +529,13 @@ mod tests {
             (19, 11, 21, 31),
             (30, 18, 31, 19),
         ];
-        let mut o = overlay(w, h, (None, false));
+        let (mut o, frozen) = overlay(w, h, (None, false));
         for (a, scale) in areas.into_iter().flat_map(|a| [(a, 1.0), (a, 1.25)]) {
             o.scale = scale;
             for handles in [false, true] {
                 o.shown = (a, handles);
                 for r in rects {
-                    assert!(o.render(r) == render_ref(&o, r), "area {a:?} handles {handles} scale {scale} rect {r:?}");
+                    assert!(o.render(&frozen, r) == render_ref(&o, &frozen, r), "area {a:?} handles {handles} scale {scale} rect {r:?}");
                 }
             }
         }
@@ -536,15 +545,15 @@ mod tests {
     fn render_into_with_stride() {
         let (w, h) = (64, 40);
         let rects = [(0, 0, 64, 40), (5, 3, 50, 37), (31, 0, 32, 40), (17, 9, 23, 15), (42, 27, 64, 40), (0, 19, 64, 20), (30, 18, 30, 21)];
-        let mut o = overlay(w, h, (None, false));
+        let (mut o, frozen) = overlay(w, h, (None, false));
         for a in [None, Some((20, 12, 44, 30)), Some((-10, 10, 30, 30)), Some((30, 18, 33, 21))] {
             for handles in [false, true] {
                 o.shown = (a, handles);
                 for r in rects {
                     let fill: Vec<u8> = (0..w * h * 4).map(|i| (i * 7 % 251) as u8).collect();
                     let mut buf = fill.clone();
-                    o.render_into(r, &mut buf[(r.1 as usize * w + r.0 as usize) * 4..], w * 4);
-                    let want = o.render(r);
+                    o.render_into(&frozen, r, &mut buf[(r.1 as usize * w + r.0 as usize) * 4..], w * 4);
+                    let want = o.render(&frozen, r);
                     let rw = (r.2 - r.0) as usize * 4;
                     for y in 0..h as i32 {
                         for x in 0..w as i32 {
@@ -577,7 +586,7 @@ mod tests {
             ((-20, -10, 60, 50), (-15, -10, 70, 60)),  // partly off-screen
             ((60, 50, 70, 60), (61, 50, 71, 60)),      // too small for a core
         ];
-        let mut o = overlay(w, h, (None, false));
+        let (mut o, frozen) = overlay(w, h, (None, false));
         let full = (0, 0, w as i32, h as i32);
         for (old, new, scale) in pairs.into_iter().flat_map(|(a, b)| [(a, b, 1.0), (a, b, 1.25)]) {
             o.scale = scale;
@@ -585,10 +594,10 @@ mod tests {
                 let m = o.margin(handles);
                 let bands = dirty_bands(old, new, m);
                 o.shown = (Some(old), handles);
-                let mut pix = render_ref(&o, full);
+                let mut pix = render_ref(&o, &frozen, full);
                 let before = pix.clone();
                 o.shown = (Some(new), handles);
-                let after = render_ref(&o, full);
+                let after = render_ref(&o, &frozen, full);
                 let u = (old.0.min(new.0) - m, old.1.min(new.1) - m, old.2.max(new.2) + m, old.3.max(new.3) + m);
                 for (i, b) in bands.iter().enumerate() {
                     assert!(b.0 >= u.0 && b.1 >= u.1 && b.2 <= u.2 && b.3 <= u.3, "{b:?} outside {u:?}");
@@ -610,7 +619,7 @@ mod tests {
                     if r.0 >= r.2 || r.1 >= r.3 {
                         continue;
                     }
-                    let data = o.render(r);
+                    let data = o.render(&frozen, r);
                     let rw = (r.2 - r.0) as usize * 4;
                     for (y, row) in (r.1..).zip(data.chunks_exact(rw)) {
                         let i = (y as usize * w + r.0 as usize) * 4;

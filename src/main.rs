@@ -374,8 +374,7 @@ fn gui() -> Res<()> {
     std::thread::spawn(|| ui::set_reduced_motion(shortcut::animations_off())); // a gsettings call: not on the way to the first frame
     let fonts_job = std::thread::spawn(|| (ui::load_font(false), ui::load_bold())); // fc-match runs while the screen is set up
     let mut cap = Capture::new()?;
-    let cursor = freeze(&mut cap)?;
-    let screen = cap.frame().to_vec(); // screenshots come from this: our UI is never in them
+    let cursor = freeze(&mut cap)?; // the buffer keeps that screen until a recording starts: overlay and screenshots read it
     let (sw, sh) = (cap.sw as i32, cap.sh as i32);
     let ewmh = select::Ewmh::new(&cap);
     let wins = ewmh.windows(&cap);
@@ -396,7 +395,7 @@ fn gui() -> Res<()> {
     };
 
     let scale = ui_scale(&cap);
-    let mut ov = select::Overlay::new(&cap, screen, area(&last, hovered), last.mode == Mode::Selection)?;
+    let mut ov = select::Overlay::new(&cap, area(&last, hovered), last.mode == Mode::Selection)?;
     ov.scale = scale;
     let name_of = |cap: &Capture, w: Option<(Rect, u32)>| w.and_then(|(_, id)| ewmh.name(cap, id));
     let cjk = || match i18n::lang() {
@@ -431,7 +430,7 @@ fn gui() -> Res<()> {
     (set.output, set.mic, set.pointer) = (audio::OUTPUTS.iter().position(|&o| o == last.output).unwrap_or(0), last.mic, last.pointer);
     (set.mp4, set.jpg, set.gpu) = (last.mp4, last.jpg, last.gpu);
     let mut modal = ui::Win::new(&cap, mx, my, ui::Canvas::new(ui::SW, ui::SH, scale), mask)?; // drawn and mapped by the gear
-    ov.show(&cap.conn)?;
+    ov.show(&cap.conn, cap.frame())?;
     if badge_at.is_some() {
         badge.show(&cap.conn)?;
     }
@@ -646,7 +645,7 @@ fn gui() -> Res<()> {
                     None => None,
                 };
                 let app = app.and_then(|id| ewmh.pid(&cap, id));
-                return shutter(cap, &ov, &[&panel, &modal, &badge], target, &last, &cursor, app, (fonts(), scale));
+                return shutter(cap, &mut ov, &[&panel, &modal, &badge], target, &last, &cursor, app, (fonts(), scale));
             }
         }
         if reshape {
@@ -654,7 +653,7 @@ fn gui() -> Res<()> {
             if st.mode != Mode::Selection {
                 ov.set_cursor(&cap.conn, select::CURSOR_ARROW)?;
             }
-            ov.set(&cap.conn, area(&last, picked.or(hovered)), st.mode == Mode::Selection)?;
+            ov.set(&cap.conn, cap.frame(), area(&last, picked.or(hovered)), st.mode == Mode::Selection)?;
             let want = badge_want(&last, picked.or(hovered), &window);
             if want != badge_at {
                 match &want {
@@ -694,17 +693,17 @@ fn gui() -> Res<()> {
 /// (`app`: the process whose sound "Window" means).
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
-fn shutter(mut cap: Capture, ov: &select::Overlay, windows: &[&ui::Win], target: Option<Target>, last: &Last, cursor: &Sprite, app: Option<u32>, (fonts, scale): ((Option<&ab_glyph::FontVec>, Option<&ab_glyph::FontVec>), f32)) -> Res<()> {
+fn shutter(mut cap: Capture, ov: &mut select::Overlay, windows: &[&ui::Win], target: Option<Target>, last: &Last, cursor: &Sprite, app: Option<u32>, (fonts, scale): ((Option<&ab_glyph::FontVec>, Option<&ab_glyph::FontVec>), f32)) -> Res<()> {
     let Some(target) = target else { return Ok(()) }; // Window mode with no window picked
     let (Target::Area(r) | Target::Window(_, r)) = target;
     last.save();
     if !last.record {
         let path = default_path("PICTURES", &shot_prefix(), if last.jpg { "jpg" } else { "png" });
-        save_image(ov.frozen(), cap.sw, r, last.pointer.then_some(cursor), &path)?;
+        save_image(cap.frame(), cap.sw, r, last.pointer.then_some(cursor), &path)?;
         notify(&tr!("Screenshot saved", "Captura guardada", "スクリーンショットを保存しました"), &tilde(&path), Some(&path));
         return Ok(());
     }
-    cap.conn.unmap_window(ov.win)?;
+    ov.release(&cap.conn)?;
     for w in windows {
         cap.conn.unmap_window(w.id)?;
     }
