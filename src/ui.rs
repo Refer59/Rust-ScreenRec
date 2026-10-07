@@ -1438,7 +1438,7 @@ mod preview {
         let (latin, ja) = (load_font(false), load_font(true));
         for (lang, tag) in [(Lang::En, "en"), (Lang::Es, "es"), (Lang::Ja, "ja")] {
             i18n::set(lang);
-            let (font, cjk) = if lang == Lang::Ja { (ja.as_ref(), None) } else { (latin.as_ref(), None) };
+            let (font, cjk) = if lang == Lang::Ja { (ja.as_ref(), None) } else { (latin.as_ref(), ja.as_ref()) };
             let panel_state = |mode, record, hover, open, focus| {
                 let mut s = PanelState::new(mode, record, font, SCALE);
                 (s.hover, s.settings_open, s.focus) = (hover, open, focus);
