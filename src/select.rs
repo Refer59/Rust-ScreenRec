@@ -12,7 +12,12 @@ use x11rb::wrapper::ConnectionExt as _;
 pub use crate::frame::Rect;
 
 const HANDLE: i32 = 11; // corner handle radius
-const BORDER: i32 = 2;
+const ACCENT: [u8; 3] = [0x4D, 0x7A, 0xFF]; // tangerine #FF7A4D, BGR
+
+/// Border width in device pixels.
+fn border(scale: f32) -> i32 {
+    ((2.0 * scale).round() as i32).max(1)
+}
 
 fn union(a: Option<Rect>, b: Option<Rect>) -> Option<Rect> {
     match (a, b) {
@@ -42,6 +47,8 @@ pub struct Overlay {
     shown: (Option<Rect>, bool), // highlighted area, with handles?
     cursors: Vec<u32>,
     cursor: usize,
+    /// UI scale (logical to device px); set between `new` and `show`.
+    pub scale: f32,
 }
 
 impl Overlay {
@@ -60,8 +67,7 @@ impl Overlay {
             c.create_glyph_cursor(id, font, font, g, g + 1, 0, 0, 0, 0xffff, 0xffff, 0xffff)?;
             cursors.push(id);
         }
-        let mut o = Overlay { win: 0, pix, gc, frozen, w, h, shown: (area, handles), cursors, cursor: CURSOR_ARROW };
-        o.put(c, (0, 0, w as i32, h as i32))?;
+        let mut o = Overlay { win: 0, pix, gc, frozen, w, h, shown: (area, handles), cursors, cursor: CURSOR_ARROW, scale: 1.0 };
         o.win = c.generate_id()?;
         let events = EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION | EventMask::KEY_PRESS;
         let aux = CreateWindowAux::new().background_pixmap(pix).override_redirect(1).event_mask(events).cursor(o.cursors[0]);
@@ -71,6 +77,7 @@ impl Overlay {
     }
 
     pub fn show(&self, conn: &impl Connection) -> Res<()> {
+        self.put(conn, (0, 0, self.w as i32, self.h as i32))?;
         conn.map_window(self.win)?;
         Ok(())
     }
@@ -86,7 +93,7 @@ impl Overlay {
             return Ok(());
         }
         let reach = |(a, hd): (Option<Rect>, bool)| {
-            let m = if hd { HANDLE + 2 } else { BORDER + 1 };
+            let m = if hd { (11.0 * self.scale).ceil() as i32 + 3 } else { border(self.scale) + 2 };
             a.map(|r| (r.0 - m, r.1 - m, r.2 + m, r.3 + m))
         };
         let dirty = union(reach(self.shown), reach((area, handles)));
@@ -121,32 +128,36 @@ impl Overlay {
 
     fn render(&self, (x0, y0, x1, y1): Rect) -> Vec<u8> {
         let (area, handles) = self.shown;
-        let rw = (x1 - x0) as usize;
+        let (rw, sc) = ((x1 - x0) as usize, self.scale);
+        let bw = border(sc);
         let mut out = Vec::with_capacity(rw * (y1 - y0) as usize * 4);
         let dim = |v: u8| (v as u16 * 140 / 255) as u8;
+        let edge = |v: u8| (dim(v) as u16 * 65 / 100) as u8; // black at 35% over the dim
+        let grow = |a: Rect, m: i32| (a.0 - m, a.1 - m, a.2 + m, a.3 + m);
         for y in y0..y1 {
             let row = &self.frozen[(y as usize * self.w + x0 as usize) * 4..][..rw * 4];
             for (x, p) in (x0..).zip(row.as_chunks::<4>().0) {
                 match area {
                     Some(a) if contains(a, x, y) => out.extend_from_slice(p),
-                    Some(a) if contains((a.0 - BORDER, a.1 - BORDER, a.2 + BORDER, a.3 + BORDER), x, y) => {
-                        out.extend_from_slice(&[255, 255, 255, 0])
-                    }
+                    Some(a) if contains(grow(a, bw), x, y) => out.extend_from_slice(&[ACCENT[0], ACCENT[1], ACCENT[2], 0]),
+                    Some(a) if contains(grow(a, bw + 1), x, y) => out.extend_from_slice(&[edge(p[0]), edge(p[1]), edge(p[2]), 0]),
                     _ => out.extend_from_slice(&[dim(p[0]), dim(p[1]), dim(p[2]), 0]),
                 }
             }
         }
         if let (Some(a), true) = (area, handles) {
+            let reach = (11.0 * sc).ceil() as i32 + 3;
+            let disc = |d: f32, r: f32, soft: f32| ((r + soft / 2.0 - d) / soft).clamp(0.0, 1.0);
             for (cx, cy) in [(a.0, a.1), (a.2, a.1), (a.0, a.3), (a.2, a.3)] {
-                for y in (cy - HANDLE - 2).max(y0)..(cy + HANDLE + 3).min(y1) {
-                    for x in (cx - HANDLE - 2).max(x0)..(cx + HANDLE + 3).min(x1) {
+                for y in (cy - reach).max(y0)..(cy + reach).min(y1) {
+                    for x in (cx - reach).max(x0)..(cx + reach).min(x1) {
                         let d = ((x - cx) as f32 + 0.5).hypot((y - cy) as f32 + 0.5);
-                        let shade = (HANDLE as f32 + 2.0 - d).clamp(0.0, 1.0) * 0.3; // soft dark rim, visible on white
-                        let fill = (HANDLE as f32 + 0.5 - d).clamp(0.0, 1.0);
+                        let (shadow, ring, fill) = (0.28 * disc(d, 10.5 * sc, 1.5), disc(d, 9.0 * sc, 1.0), disc(d, 6.5 * sc, 1.0));
                         let i = ((y - y0) as usize * rw + (x - x0) as usize) * 4;
-                        for v in &mut out[i..i + 3] {
-                            let dark = *v as f32 * (1.0 - shade);
-                            *v = (255.0 * fill + dark * (1.0 - fill)).round() as u8;
+                        for (v, acc) in out[i..i + 3].iter_mut().zip(ACCENT) {
+                            let c = *v as f32 * (1.0 - shadow);
+                            let c = c + (acc as f32 - c) * ring;
+                            *v = (c + (255.0 - c) * fill).round() as u8;
                         }
                     }
                 }
@@ -290,7 +301,7 @@ pub fn drag(g: Grip, x: i32, y: i32, (sw, sh): (i32, i32)) -> Rect {
 /// The overlay as it would look over `frozen` (BGRX), for offscreen previews.
 #[cfg(test)]
 pub fn preview(frozen: Vec<u8>, w: usize, h: usize, area: Option<Rect>, handles: bool) -> Vec<u8> {
-    let o = Overlay { win: 0, pix: 0, gc: 0, frozen, w, h, shown: (area, handles), cursors: vec![], cursor: 0 };
+    let o = Overlay { win: 0, pix: 0, gc: 0, frozen, w, h, shown: (area, handles), cursors: vec![], cursor: 0, scale: 1.25 };
     o.render((0, 0, w as i32, h as i32))
 }
 
@@ -311,4 +322,5 @@ mod tests {
         // Outside: a new selection from the press point.
         assert_eq!(drag(grip(sel, 10, 10), 40, 5, (1920, 1080)), (10, 5, 40, 10));
     }
+
 }
