@@ -369,11 +369,12 @@ fn gui() -> Res<()> {
     let wins = ewmh.windows(&cap);
     let window_at = |x: i32, y: i32| wins.iter().copied().find(|&(r, _)| select::contains(r, x, y));
     let mut last = Last::load(sw, sh);
-    let (latin, ja) = (ui::load_font(false), std::cell::OnceCell::new());
+    let ((latin, latin_bold), ja) = (std::thread::scope(|s| (ui::load_font(false), s.spawn(ui::load_bold).join().ok().flatten())), std::cell::OnceCell::new());
     let font = || match i18n::lang() {
         i18n::Lang::Ja => ja.get_or_init(|| ui::load_font(true)).as_ref(),
         _ => latin.as_ref(),
     };
+    let fonts = || (font(), if i18n::lang() == i18n::Lang::Ja { font() } else { latin_bold.as_ref().or(font()) }); // regular, medium
     let pointer = cap.conn.query_pointer(cap.root)?.reply()?;
     let (mut hovered, mut picked) = (window_at(pointer.root_x as i32, pointer.root_y as i32), None);
     let area = |last: &Last, w: Option<(Rect, u32)>| match last.mode {
@@ -390,23 +391,29 @@ fn gui() -> Res<()> {
         i18n::Lang::Ja => None,
         _ => ja.get_or_init(|| ui::load_font(true)).as_ref(), // loaded when the settings first open
     };
-    let mut st = ui::PanelState::new(last.mode, last.record, font(), scale);
-    st.window = name_of(&cap, hovered);
+    let mut st = ui::PanelState::new(last.mode, last.record, fonts(), scale);
+    let mut window = name_of(&cap, hovered); // the name of the window Window mode would take, for the badge
     st.reveal();
     let ((px, py), (mx, my)) = ui::place(sw, sh, scale);
     let mask = EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION | EventMask::LEAVE_WINDOW;
-    // The size badge sits under the panel in the stack (made first); only Selection shows it.
-    let gap = (14.0 * scale).round() as i32; // clear of the corner handle
-    let badge_for = |r: Rect| {
-        let c = ui::badge(r.2 - r.0, r.3 - r.1, font(), scale);
-        (ui::badge_pos(r, (c.w as i32, c.h as i32), (sw, sh), gap), c)
+    // The size badge sits under the panel in the stack (made first): the selection's size,
+    // or the window's name and size; Screen mode has none.
+    let gap = (14.0 * scale).round() as i32; // clear of the corner brackets
+    let badge_for = |(r, name): &(Rect, Option<String>)| {
+        let c = ui::badge(r.2 - r.0, r.3 - r.1, name.as_deref(), font(), scale);
+        (ui::badge_pos(*r, (c.w as i32, c.h as i32), (sw, sh), gap, ui::panel_rect(sw, sh, scale)), c)
     };
-    let ((bx, by), bc) = badge_for(last.sel);
+    let badge_want = |last: &Last, w: Option<(Rect, u32)>, name: &Option<String>| match last.mode {
+        Mode::Selection => Some((last.sel, None)),
+        Mode::Window => w.map(|(r, _)| (r, name.clone())),
+        Mode::Screen => None,
+    };
+    let mut badge_at = badge_want(&last, hovered, &window); // what it shows, if mapped
+    let ((bx, by), bc) = badge_for(&badge_at.clone().unwrap_or((last.sel, None)));
     let mut badge = ui::Win::new(&cap, bx, by, bc, EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION)?;
-    let mut badge_at = (last.mode == Mode::Selection).then_some(last.sel); // what it shows, if mapped
     let mut panel = ui::Win::new(&cap, px, py, ui::panel(&st), mask)?;
     let shortcut_now = || shortcut::get().map_or(tr!("none", "ninguno", "なし"), |a| shortcut::pretty(&a));
-    let mut set = ui::SettingsState::new(font(), None, scale);
+    let mut set = ui::SettingsState::new(fonts(), None, scale);
     (set.output, set.mic, set.pointer, set.shortcut) = (audio::OUTPUTS.iter().position(|&o| o == last.output).unwrap_or(0), last.mic, last.pointer, shortcut_now());
     (set.mp4, set.jpg, set.gpu, set.gpu_found) = (last.mp4, last.jpg, last.gpu, nvenc::available());
     set.settle();
@@ -495,8 +502,8 @@ fn gui() -> Res<()> {
                     match st.mode {
                         Mode::Selection => grip = Some((select::grip(last.sel, x, y), last.sel)),
                         Mode::Window => {
-                            (picked, reshape, redraw) = (window_at(x, y), true, true);
-                            st.window = name_of(&cap, picked);
+                            (picked, reshape) = (window_at(x, y), true);
+                            window = name_of(&cap, picked);
                         }
                         Mode::Screen => {}
                     }
@@ -508,8 +515,8 @@ fn gui() -> Res<()> {
                         (Mode::Selection, Some((g, _))) => (last.sel, reshape) = (select::drag(g, x, y, (sw, sh)), true),
                         (Mode::Selection, None) => ov.set_cursor(&cap.conn, select::grip_cursor(last.sel, x, y))?,
                         (Mode::Window, _) if picked.is_none() && window_at(x, y) != hovered => {
-                            (hovered, reshape, redraw) = (window_at(x, y), true, true);
-                            st.window = name_of(&cap, hovered);
+                            (hovered, reshape) = (window_at(x, y), true);
+                            window = name_of(&cap, hovered);
                         }
                         _ => {}
                     }
@@ -600,7 +607,8 @@ fn gui() -> Res<()> {
                         SetHit::Shortcut => set.capturing = true,
                         SetHit::Lang(i) => {
                             i18n::set(i18n::LANGS[i]);
-                            (st.font, set.font, set.cjk, set.shortcut, redraw) = (font(), font(), cjk(), shortcut_now(), true);
+                            ((st.font, st.bold), (set.font, set.bold)) = (fonts(), fonts());
+                            (set.cjk, set.shortcut, redraw, reshape, badge_at) = (cjk(), shortcut_now(), true, true, None); // the badge, in the new font
                         }
                     }
                     // Settings stick at once, also when the launcher is then closed.
@@ -624,7 +632,7 @@ fn gui() -> Res<()> {
                     None => None,
                 };
                 let app = app.and_then(|id| ewmh.pid(&cap, id));
-                return shutter(cap, &ov, &[&panel, &modal, &badge], target, &last, &cursor, app, (font(), scale));
+                return shutter(cap, &ov, &[&panel, &modal, &badge], target, &last, &cursor, app, (fonts(), scale));
             }
         }
         if reshape {
@@ -633,15 +641,13 @@ fn gui() -> Res<()> {
                 ov.set_cursor(&cap.conn, select::CURSOR_ARROW)?;
             }
             ov.set(&cap.conn, area(&last, picked.or(hovered)), st.mode == Mode::Selection)?;
-            let want = (st.mode == Mode::Selection).then_some(last.sel);
+            let want = badge_want(&last, picked.or(hovered), &window);
             if want != badge_at {
-                match want {
-                    Some(r) => {
-                        let ((x, y), c) = badge_for(r);
+                match &want {
+                    Some(b) => {
+                        let ((x, y), c) = badge_for(b);
                         badge.reset(&cap.conn, x, y, c)?;
-                        if badge_at.is_none() {
-                            cap.conn.map_window(bid)?;
-                        }
+                        cap.conn.map_window(bid)?;
                     }
                     None => {
                         cap.conn.unmap_window(bid)?;
@@ -674,7 +680,7 @@ fn gui() -> Res<()> {
 /// (`app`: the process whose sound "Window" means).
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
-fn shutter(mut cap: Capture, ov: &select::Overlay, windows: &[&ui::Win], target: Option<Target>, last: &Last, cursor: &Sprite, app: Option<u32>, (font, scale): (Option<&ab_glyph::FontVec>, f32)) -> Res<()> {
+fn shutter(mut cap: Capture, ov: &select::Overlay, windows: &[&ui::Win], target: Option<Target>, last: &Last, cursor: &Sprite, app: Option<u32>, (fonts, scale): ((Option<&ab_glyph::FontVec>, Option<&ab_glyph::FontVec>), f32)) -> Res<()> {
     let Some(target) = target else { return Ok(()) }; // Window mode with no window picked
     let (Target::Area(r) | Target::Window(_, r)) = target;
     last.save();
@@ -689,7 +695,7 @@ fn shutter(mut cap: Capture, ov: &select::Overlay, windows: &[&ui::Win], target:
         cap.conn.unmap_window(w.id)?;
     }
     cap.conn.ungrab_keyboard(CURRENT_TIME)?;
-    let pill = ui::Pill::new(&cap, font, scale)?;
+    let pill = ui::Pill::new(&cap, fonts, scale)?;
     cap.overlay = Some(pill.win.sprite());
     cap.draw_pointer = last.pointer;
     let path = default_path("VIDEOS", &rec_prefix(), "mkv");

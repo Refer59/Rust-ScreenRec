@@ -46,6 +46,6 @@ screenrec install                          # set up the GNOME shortcut
 
 `rec` records until Ctrl+C or SIGTERM. Max FPS is 60 on the GPU and 30 on the CPU; `--cpu` forces CPU encoding. Files go to your Pictures and Videos folders by default.
 
-In the launcher, pick Area, Screen or Window, then screenshot or recording. Enter or Space captures and Esc closes. Tab and the arrow keys move a focus ring over the controls; with the ring showing, Enter or Space activates the focused one. While you drag an area, its size is shown below it.
+In the launcher, pick Area, Screen or Window, then screenshot or recording. Enter or Space captures and Esc closes. Tab and the arrow keys move a focus ring over the controls; with the ring showing, Enter or Space activates the focused one. While you drag an area, its size is shown below it; in Window mode it shows the window's name and size.
 
 The interface is in English, Spanish or Japanese. Pick one in the launcher's ⚙ settings; until you do, it follows your locale (`LANG`).

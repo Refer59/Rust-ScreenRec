@@ -29,22 +29,22 @@ type Rgba = (f32, f32, f32, f32);
 const fn hex(v: u32) -> Rgba {
     ((v >> 16 & 255) as f32 / 255.0, (v >> 8 & 255) as f32 / 255.0, (v & 255) as f32 / 255.0, 1.0)
 }
+// A camera for the screen: a near-black body, white controls, and two colours
+// with one job each. Text is at least 6:1 on every surface it sits on.
 const WHITE: Rgba = hex(0xFFFFFF);
-const BG: Rgba = hex(0x221D1B);
-const WELL: Rgba = hex(0x2E2826);
-const HOVER: Rgba = hex(0x352E2B);
-const RAISED: Rgba = hex(0x463C38);
-const TEXT: Rgba = hex(0xF6EFEA);
-const TEXT2: Rgba = hex(0xB8ADA6);
-const TEXT3: Rgba = hex(0x958982);
-const ACCENT: Rgba = hex(0xFF7A4D);
-const ACCENT_HI: Rgba = hex(0xFF8F66);
-const ON_ACCENT: Rgba = hex(0x2A1710);
-const RECORD: Rgba = hex(0xD93A32);
-const RECORD_HI: Rgba = hex(0xC2302A);
-const SWITCH_OFF: Rgba = hex(0x4D4440);
+const BLACK: Rgba = hex(0x0C0C0D);
+const WELL: Rgba = hex(0x1F1F22);
+const WELL_HI: Rgba = hex(0x2C2C31);
+const THUMB: Rgba = hex(0x3A3A40);
+const TEXT: Rgba = hex(0xF4F4F5);
+const TEXT2: Rgba = hex(0xA1A1A8);
+const DISABLED: Rgba = hex(0x55555C);
+/// The chosen mode and the keyboard focus, nothing else.
+const YELLOW: Rgba = hex(0xFFD23F);
+/// Video: the shutter and REC.
+const RED: Rgba = hex(0xFF3B30);
 const HAIRLINE: Rgba = (1.0, 1.0, 1.0, 0.07);
-const DIVIDER: Rgba = (1.0, 1.0, 1.0, 0.06);
+const DIVIDER: Rgba = (1.0, 1.0, 1.0, 0.07);
 
 fn mix(a: Rgba, b: Rgba, t: f32) -> Rgba {
     let l = |x: f32, y: f32| x + (y - x) * t;
@@ -415,6 +415,50 @@ impl Canvas {
             x += sf.h_advance(id);
         }
     }
+
+    /// Each letter's advance, plus `track` after all but the last; digits get cells
+    /// as wide as '0' when `tabular`, so a changing number doesn't jitter.
+    fn advances(font: &FontVec, s: &str, px: f32, track: f32, tabular: bool) -> Vec<f32> {
+        let cell = Self::width(font, "0", px);
+        let n = s.chars().count();
+        let adv = |(i, ch): (usize, char)| {
+            let w = if tabular && ch.is_ascii_digit() { cell } else { Self::width(font, ch.encode_utf8(&mut [0; 4]), px) };
+            w + if i + 1 < n { track } else { 0.0 }
+        };
+        s.chars().enumerate().map(adv).collect()
+    }
+
+    /// `text`, laid out letter by letter by `advances`.
+    #[allow(clippy::too_many_arguments)]
+    fn spaced(&mut self, font: &FontVec, s: &str, px: f32, (x, baseline): (f32, f32), align: f32, (track, tabular): (f32, bool), color: Rgba) {
+        let adv = Self::advances(font, s, px, track, tabular);
+        let mut x = x - adv.iter().sum::<f32>() * align;
+        for (ch, w) in s.chars().zip(adv) {
+            self.text(font, ch.encode_utf8(&mut [0; 4]), px, x, baseline, 0.0, color);
+            x += w;
+        }
+    }
+
+    /// Draw with `f` around (cx, cy), `k` times the size.
+    fn scaled(&mut self, (cx, cy): (f32, f32), k: f32, f: impl FnOnce(&mut Self)) {
+        let (sc, o) = (self.scale, self.origin);
+        (self.scale, self.origin) = (sc * k, ((cx + o.0) / k, (cy + o.1) / k));
+        f(self);
+        (self.scale, self.origin) = (sc, o);
+    }
+}
+
+fn spaced_width(font: &FontVec, s: &str, px: f32, track: f32, tabular: bool) -> f32 {
+    Canvas::advances(font, s, px, track, tabular).iter().sum()
+}
+
+/// Small labels set like a camera's: tracked capitals in Latin scripts,
+/// Japanese as written with a little air. Returns (text, size, tracking).
+fn caps(s: &str, px: f32) -> (String, f32, f32) {
+    match crate::i18n::lang() {
+        crate::i18n::Lang::Ja => (s.to_owned(), px + 1.0, 0.6),
+        _ => (s.to_uppercase(), px, px * 0.1),
+    }
 }
 
 fn pack(r: f32, g: f32, b: f32) -> u32 {
@@ -425,44 +469,20 @@ fn pack(r: f32, g: f32, b: f32) -> u32 {
 /// The desktop's UI font (Ubuntu here), or a Japanese one; without one the
 /// panel just has no labels.
 pub fn load_font(ja: bool) -> Option<FontVec> {
-    let name = if ja { "sans-serif:lang=ja" } else { "Ubuntu" };
+    fc_font(if ja { "sans-serif:lang=ja" } else { "Ubuntu" })
+}
+
+/// Its medium weight, for the mode words and titles in Latin scripts.
+pub fn load_bold() -> Option<FontVec> {
+    fc_font("Ubuntu:medium")
+}
+
+fn fc_font(name: &str) -> Option<FontVec> {
     let out = std::process::Command::new("fc-match").args(["-f", "%{file}", name]).output().ok()?;
     FontVec::try_from_vec(std::fs::read(String::from_utf8(out.stdout).ok()?).ok()?).ok()
 }
 
 // Icons, line art in GNOME's symbolic style. `bg` is what's behind them, for cut-outs.
-
-fn icon_selection(c: &mut Canvas, cx: f32, cy: f32, col: Rgba) {
-    let (x0, y0, x1, y1) = (cx - 13.0, cy - 10.0, cx + 13.0, cy + 10.0);
-    for i in 0..4 {
-        let t = 5.5 + i as f32 * 5.0; // dashes between the corner dots
-        if t + 2.5 < 26.0 {
-            c.paint(col, line(x0 + t, y0, x0 + t + 2.5, y0, 1.0));
-            c.paint(col, line(x0 + t, y1, x0 + t + 2.5, y1, 1.0));
-        }
-        if t + 2.5 < 20.0 {
-            c.paint(col, line(x0, y0 + t, x0, y0 + t + 2.5, 1.0));
-            c.paint(col, line(x1, y0 + t, x1, y0 + t + 2.5, 1.0));
-        }
-    }
-    for (x, y) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
-        c.paint(col, circle(x, y, 2.8));
-    }
-}
-
-fn icon_screen(c: &mut Canvas, cx: f32, cy: f32, col: Rgba) {
-    c.paint(col, stroke(rrect(cx - 14.0, cy - 11.0, cx + 14.0, cy + 7.0, 2.5), 2.0));
-    c.paint(col, line(cx, cy + 8.0, cx, cy + 11.5, 1.0));
-    c.paint(col, line(cx - 6.5, cy + 12.0, cx + 6.5, cy + 12.0, 1.1));
-}
-
-fn icon_window(c: &mut Canvas, cx: f32, cy: f32, col: Rgba, bg: Rgba) {
-    c.paint(col, stroke(rrect(cx - 2.0, cy - 13.0, cx + 13.0, cy + 1.0, 2.0), 2.0));
-    c.paint(col, rrect(cx - 2.0, cy - 13.0, cx + 13.0, cy - 8.5, 2.0));
-    c.paint(bg, rrect(cx - 14.0, cy - 5.0, cx + 4.0, cy + 12.0, 2.0));
-    c.paint(col, stroke(rrect(cx - 13.0, cy - 4.0, cx + 3.0, cy + 11.0, 2.0), 2.0));
-    c.paint(col, rrect(cx - 13.0, cy - 4.0, cx + 3.0, cy + 0.5, 2.0));
-}
 
 fn icon_camera(c: &mut Canvas, cx: f32, cy: f32, col: Rgba, bg: Rgba) {
     c.paint(col, rrect(cx - 4.0, cy - 8.0, cx + 4.0, cy - 3.0, 1.5));
@@ -532,18 +552,23 @@ fn shadow(c: &mut Canvas, w_: f32, h_: f32, r: f32) {
 /// The one look of both cards: soft shadow, body, 1 px hairline inside its edge.
 fn card(c: &mut Canvas, w: f32, h: f32, r: f32) {
     shadow(c, w, h, r);
-    c.paint(BG, rrect(0.0, 0.0, w, h, r));
+    c.paint(BLACK, rrect(0.0, 0.0, w, h, r));
     c.paint(HAIRLINE, stroke(rrect(0.5, 0.5, w - 0.5, h - 0.5, r - 0.5), 1.0));
 }
 
-fn cross(c: &mut Canvas, x: f32, y: f32, r: f32, half: f32) {
-    c.paint(TEXT, line(x - r, y - r, x + r, y + r, half));
-    c.paint(TEXT, line(x - r, y + r, x + r, y - r, half));
+/// A round close button: `h` is how hovered it is.
+fn close_button(c: &mut Canvas, g: Geo, h: f32) {
+    let Geo::Disc(x, y, r) = g else { unreachable!() };
+    c.paint(mix(WELL, WELL_HI, h), circle(x, y, r));
+    c.paint(HAIRLINE, stroke(circle(x, y, r - 0.5), 1.0));
+    let col = mix(TEXT2, TEXT, h);
+    c.paint(col, line(x - 4.5, y - 4.5, x + 4.5, y + 4.5, 1.1));
+    c.paint(col, line(x - 4.5, y + 4.5, x + 4.5, y - 4.5, 1.1));
 }
 
-/// The 2 px accent ring, 3 px clear of `g`.
+/// The 2 px yellow ring, 3 px clear of `g`.
 fn focus_ring(c: &mut Canvas, g: Geo) {
-    c.paint(ACCENT, stroke(g.grow(3.0).shape(), 2.0));
+    c.paint(YELLOW, stroke(g.grow(3.0).shape(), 2.0));
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -555,6 +580,14 @@ pub enum Mode {
 
 pub const MODES: [Mode; 3] = [Mode::Selection, Mode::Screen, Mode::Window];
 
+fn mode_name(m: Mode) -> String {
+    match m {
+        Mode::Selection => tr!("Area", "Área", "範囲"),
+        Mode::Screen => tr!("Screen", "Pantalla", "画面"),
+        Mode::Window => tr!("Window", "Ventana", "ウィンドウ"),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Hit {
     Close,
@@ -565,44 +598,51 @@ pub enum Hit {
     Settings,
 }
 
-/// Keyboard focus order.
-pub const PANEL_ORDER: [Hit; 8] = [Hit::Mode(Mode::Selection), Hit::Mode(Mode::Screen), Hit::Mode(Mode::Window), Hit::Shot, Hit::Cast, Hit::Settings, Hit::Shutter, Hit::Close];
+/// Keyboard focus order: the strip of modes, then the bottom row left to right.
+pub const PANEL_ORDER: [Hit; 8] = [Hit::Mode(Mode::Selection), Hit::Mode(Mode::Screen), Hit::Mode(Mode::Window), Hit::Shot, Hit::Cast, Hit::Shutter, Hit::Settings, Hit::Close];
 
 // Panel geometry, in logical px. The body sits in a transparent margin for its shadow.
 const M: f32 = 24.0;
-const BODY: (f32, f32) = (372.0, 204.0);
-const PW: usize = 420;
-const PH: usize = 252;
+const BODY: (f32, f32) = (400.0, 164.0);
+const BODY_R: f32 = 32.0;
+const PW: usize = 448;
+const PH: usize = 212;
 const SBODY: (f32, f32) = (340.0, 478.0);
+const SBODY_R: f32 = 28.0;
 const SW: usize = 388;
 const SH: usize = 526;
+/// Each mode word's cell: a third of the strip, 75 tall (as big as the old 110×88 tiles).
+const CELL: (f32, f32) = ((BODY.0 - 12.0) / 3.0, 75.0);
+const ROW: f32 = 118.0; // the bottom row's centre: photo|video, shutter, gear
+const SHUTTER: (f32, f32) = (BODY.0 / 2.0, ROW);
 
-fn tile_x(i: usize) -> f32 {
-    12.0 + 119.0 * i as f32
+fn cell_x(i: usize) -> f32 {
+    6.0 + CELL.0 * i as f32
 }
 
 /// What a control looks like (and where its focus ring goes).
 fn shape_of(h: Hit) -> Geo {
     match h {
         Hit::Mode(m) => {
-            let x = tile_x(MODES.iter().position(|&n| n == m).unwrap());
-            Geo::Rect(x, 12.0, x + 110.0, 100.0, 18.0)
+            let x = cell_x(MODES.iter().position(|&n| n == m).unwrap());
+            Geo::Rect(x, 6.0, x + CELL.0, 6.0 + CELL.1, 22.0)
         }
-        Hit::Shot => Geo::Rect(15.0, 119.0, 58.0, 153.0, 17.0),
-        Hit::Cast => Geo::Rect(58.0, 119.0, 101.0, 153.0, 17.0),
-        Hit::Settings => Geo::Disc(132.0, 136.0, 20.0),
-        Hit::Shutter => Geo::Rect(196.0, 114.0, 360.0, 158.0, 22.0),
-        Hit::Close => Geo::Disc(368.0, 4.0, 15.0),
+        Hit::Shot => Geo::Rect(39.0, ROW - 17.0, 82.0, ROW + 17.0, 17.0),
+        Hit::Cast => Geo::Rect(82.0, ROW - 17.0, 125.0, ROW + 17.0, 17.0),
+        Hit::Shutter => Geo::Disc(SHUTTER.0, SHUTTER.1, 31.0),
+        Hit::Settings => Geo::Disc(BODY.0 - 82.0, ROW, 20.0),
+        Hit::Close => Geo::Disc(BODY.0 - 4.0, 4.0, 14.0),
     }
 }
 
-/// Where a control answers clicks: its look, a little bigger for the small round ones.
+/// Where a control answers clicks: its look, a little bigger for the small ones.
 fn hit_of(h: Hit) -> Geo {
     match h {
-        Hit::Shot => Geo::Rect(12.0, 116.0, 58.0, 156.0, 20.0),
-        Hit::Cast => Geo::Rect(58.0, 116.0, 104.0, 156.0, 20.0),
-        Hit::Settings => Geo::Disc(132.0, 136.0, 22.0),
-        Hit::Close => Geo::Disc(368.0, 4.0, 19.0),
+        Hit::Shot => Geo::Rect(34.0, ROW - 22.0, 82.0, ROW + 22.0, 22.0),
+        Hit::Cast => Geo::Rect(82.0, ROW - 22.0, 130.0, ROW + 22.0, 22.0),
+        Hit::Shutter => Geo::Disc(SHUTTER.0, SHUTTER.1, 34.0),
+        Hit::Settings => Geo::Disc(BODY.0 - 82.0, ROW, 25.0),
+        Hit::Close => Geo::Disc(BODY.0 - 4.0, 4.0, 18.0),
         _ => shape_of(h),
     }
 }
@@ -623,11 +663,11 @@ pub fn place(sw: i32, sh: i32, scale: f32) -> ((i32, i32), (i32, i32)) {
 pub struct PanelState<'a> {
     pub mode: Mode,
     pub record: bool,
-    /// Name of the window Window mode would record, shown under its label.
-    pub window: Option<String>,
     pub hover: Option<Hit>,
     pub settings_open: bool,
     pub font: Option<&'a FontVec>,
+    /// The medium weight (or `font` again), for the mode words.
+    pub bold: Option<&'a FontVec>,
     /// Keyboard focus (None while the ring is hidden).
     pub focus: Option<Hit>,
     pub scale: f32,
@@ -636,16 +676,16 @@ pub struct PanelState<'a> {
 
 struct PanelTw {
     appear: Tween,
-    mode: Tween, // fractional index of the highlighted tile
+    mode: Tween, // fractional index of the chosen mode
     record: Tween,
     hover: Hov<Hit>,
 }
 
 impl<'a> PanelState<'a> {
-    pub fn new(mode: Mode, record: bool, font: Option<&'a FontVec>, scale: f32) -> Self {
+    pub fn new(mode: Mode, record: bool, (font, bold): (Option<&'a FontVec>, Option<&'a FontVec>), scale: f32) -> Self {
         let ix = MODES.iter().position(|&m| m == mode).unwrap() as f32;
         let tw = PanelTw { appear: Tween::new(1.0), mode: Tween::io(ix), record: Tween::io(record as u8 as f32), hover: Hov::new() };
-        PanelState { mode, record, window: None, hover: None, settings_open: false, font, focus: None, scale, tw }
+        PanelState { mode, record, hover: None, settings_open: false, font, bold, focus: None, scale, tw }
     }
 
     /// Aim the tweens at the current state; call before every render.
@@ -687,103 +727,53 @@ pub fn panel_hit(scale: f32, x: i16, y: i16) -> Option<Hit> {
 /// Whether device px (x, y) is on the panel's card or a control (the close button overhangs); the rest of the canvas is transparent.
 pub fn panel_body_has(scale: f32, x: i16, y: i16) -> bool {
     let (x, y) = (x as f32 / scale - M, y as f32 / scale - M);
-    sd_rrect(x, y, (0.0, 0.0, BODY.0, BODY.1), 26.0) <= 0.0 || PANEL_ORDER.into_iter().any(|h| hit_of(h).has(x, y))
+    sd_rrect(x, y, (0.0, 0.0, BODY.0, BODY.1), BODY_R) <= 0.0 || PANEL_ORDER.into_iter().any(|h| hit_of(h).has(x, y))
 }
 
+/// The launcher, laid out like a phone camera: the modes as a strip of words,
+/// the shutter in the middle, photo|video on its left and the settings on its right.
 pub fn panel(s: &PanelState) -> Canvas {
     let mut c = Canvas::new(PW, PH, s.scale);
     let t = &s.tw;
     let a = t.appear.get();
     (c.alpha, c.origin) = (a, (M, M + (1.0 - a) * 14.0));
-    card(&mut c, BODY.0, BODY.1, 26.0);
+    card(&mut c, BODY.0, BODY.1, BODY_R);
     let (idx, rec) = (t.mode.get(), t.record.get());
     let hv = |h| t.hover.amt(h);
 
-    let Geo::Rect(_, y0, _, y1, r) = shape_of(Hit::Mode(Mode::Selection)) else { unreachable!() };
-    let hx = tile_x(0) + 119.0 * idx;
-    c.paint(RAISED, rrect(hx, y0, hx + 110.0, y1, r));
+    // the modes: words in big cells; the chosen one yellow, with a dot that slides
+    let mid = |i: f32| cell_x(0) + CELL.0 * (i + 0.5);
     for (i, &m) in MODES.iter().enumerate() {
-        let (x0, cx) = (tile_x(i), tile_x(i) + 55.0);
+        let Geo::Rect(x0, y0, x1, y1, r) = shape_of(Hit::Mode(m)) else { unreachable!() };
         let (h, sel) = (hv(Hit::Mode(m)), (1.0 - (idx - i as f32).abs()).clamp(0.0, 1.0));
-        c.paint(fade(HOVER, h * (1.0 - sel)), rrect(x0, y0, x0 + 110.0, y1, r));
-        let bg = mix(mix(BG, HOVER, h * (1.0 - sel)), RAISED, sel);
-        let icon = mix(mix(TEXT2, TEXT, h), ACCENT, sel);
-        match m {
-            Mode::Selection => icon_selection(&mut c, cx, 44.0, icon),
-            Mode::Screen => icon_screen(&mut c, cx, 44.0, icon),
-            Mode::Window => icon_window(&mut c, cx, 44.0, icon, bg),
-        }
-        if let Some(f) = s.font {
-            let label = match m {
-                Mode::Selection => tr!("Area", "Área", "範囲"),
-                Mode::Screen => tr!("Screen", "Pantalla", "画面"),
-                Mode::Window => tr!("Window", "Ventana", "ウィンドウ"),
-            };
-            c.text(f, &label, 15.0, cx, 77.0, 0.5, mix(TEXT2, TEXT, h.max(sel)));
-            if let (Mode::Window, Some(name)) = (m, &s.window) {
-                c.text(f, &Canvas::fit(f, name, 12.0, 96.0), 12.0, cx, 92.0, 0.5, TEXT2);
-            }
+        c.paint(fade(WHITE, 0.06 * h), rrect(x0, y0, x1, y1, r));
+        if let Some(f) = s.bold.or(s.font) {
+            let (word, px, track) = caps(&mode_name(m), 13.0);
+            c.spaced(f, &word, px, (mid(i as f32), 44.0), 0.5, (track, false), mix(mix(TEXT2, TEXT, h), YELLOW, sel));
         }
     }
+    c.paint(YELLOW, circle(mid(idx), 55.0, 2.5));
 
-    // screenshot | screencast
-    c.paint(WELL, rrect(12.0, 116.0, 104.0, 156.0, 20.0));
-    c.paint(RAISED, rrect(15.0 + 43.0 * rec, 119.0, 58.0 + 43.0 * rec, 153.0, 17.0));
+    // photo | video
+    c.paint(WELL, rrect(36.0, ROW - 20.0, 128.0, ROW + 20.0, 20.0));
+    c.paint(THUMB, rrect(39.0 + 43.0 * rec, ROW - 17.0, 82.0 + 43.0 * rec, ROW + 17.0, 17.0));
     let on = |h: Hit, w: f32| mix(mix(TEXT2, TEXT, hv(h)), TEXT, w);
-    icon_camera(&mut c, 36.5, 136.0, on(Hit::Shot, 1.0 - rec), mix(WELL, RAISED, 1.0 - rec));
-    icon_video(&mut c, 79.5, 136.0, on(Hit::Cast, rec));
+    icon_camera(&mut c, 60.5, ROW, on(Hit::Shot, 1.0 - rec), mix(WELL, THUMB, 1.0 - rec));
+    c.scaled((103.5, ROW), 0.9, |c| icon_video(c, 0.0, 0.0, on(Hit::Cast, rec)));
+
+    // the shutter: white for a photo, red for video; the disc draws in a little under the pointer
+    let (sx, sy) = SHUTTER;
+    c.paint(TEXT, stroke(circle(sx, sy, 29.0), 3.5));
+    c.paint(mix(TEXT, RED, rec), circle(sx, sy, 24.0 - 2.0 * hv(Hit::Shutter)));
 
     // settings
-    let open = s.settings_open;
-    let (gh, gbg) = (hv(Hit::Settings), if open { RAISED } else { mix(BG, HOVER, hv(Hit::Settings)) });
-    c.paint(if open { RAISED } else { fade(HOVER, gh) }, circle(132.0, 136.0, 20.0));
-    icon_gear(&mut c, 132.0, 136.0, if open { ACCENT } else { mix(TEXT2, TEXT, gh) }, gbg);
+    let (open, gh) = (s.settings_open, hv(Hit::Settings));
+    let Geo::Disc(gx, gy, gr) = shape_of(Hit::Settings) else { unreachable!() };
+    let gbg = if open { THUMB } else { mix(WELL, WELL_HI, gh) };
+    c.paint(gbg, circle(gx, gy, gr));
+    c.scaled((gx, gy), 0.85, |c| icon_gear(c, 0.0, 0.0, if open { TEXT } else { mix(TEXT2, TEXT, gh) }, gbg));
 
-    // the primary action: Capture, or Record
-    let h = hv(Hit::Shutter);
-    c.paint(mix(mix(ACCENT, RECORD, rec), mix(ACCENT_HI, RECORD_HI, rec), h), rrect(196.0, 114.0, 360.0, 158.0, 22.0));
-    let ink = mix(ON_ACCENT, WHITE, rec);
-    let labels = s.font.map(|f| {
-        let l = [tr!("Capture", "Capturar", "撮影"), tr!("Record", "Grabar", "録画")].map(|l| Canvas::fit(f, &l, 16.0, 85.0));
-        (f, l)
-    });
-    let lw = labels.as_ref().map_or(0.0, |(f, l)| Canvas::width(f, &l[0], 16.0) * (1.0 - rec) + Canvas::width(f, &l[1], 16.0) * rec);
-    let gx = 259.0 - (13.0 + if labels.is_some() { 8.0 + lw } else { 0.0 }) / 2.0;
-    let (gcx, gcy) = (gx + 6.5, 136.0);
-    c.paint(fade(ink, 1.0 - rec), stroke(circle(gcx, gcy, 5.5), 2.0));
-    c.paint(ink, circle(gcx, gcy, 2.5 + 3.5 * rec));
-    if let Some((f, l)) = &labels {
-        c.text(f, &l[0], 16.0, gx + 21.0, 142.0, 0.0, fade(ink, 1.0 - 2.0 * rec)); // one out, then the other in
-        c.text(f, &l[1], 16.0, gx + 21.0, 142.0, 0.0, fade(ink, 2.0 * rec - 1.0));
-    }
-    let (kx, ky) = (335.0, 136.0);
-    c.paint(fade(ink, 0.16), rrect(320.0, 125.0, 350.0, 147.0, 6.0));
-    for (a, b, c2, d) in [(5.0, -5.0, 5.0, 2.0), (5.0, 2.0, -5.0, 2.0), (-5.0, 2.0, -2.0, -1.0), (-5.0, 2.0, -2.0, 5.0)] {
-        c.paint(ink, line(kx + a, ky + b, kx + c2, ky + d, 0.9));
-    }
-
-    // footer: what the mode does, and the way out
-    c.paint(DIVIDER, line(12.0, 170.0, 360.0, 170.0, 0.5));
-    if let Some(f) = s.font {
-        let hint = match s.mode {
-            Mode::Selection => tr!("Drag to pick an area", "Arrastra para elegir un área", "ドラッグで範囲を選択"),
-            Mode::Screen => tr!("The whole screen", "Toda la pantalla", "画面全体"),
-            Mode::Window => tr!("Click a window to pick it", "Haz clic en una ventana", "ウィンドウをクリックして選択"),
-        };
-        c.text(f, &hint, 12.5, 16.0, 191.0, 0.0, TEXT3);
-        let close = tr!("Close", "Cerrar", "閉じる");
-        c.text(f, &close, 12.5, 356.0, 191.0, 1.0, TEXT3);
-        let kr = 356.0 - Canvas::width(f, &close, 12.5) - 6.0;
-        let kl = kr - Canvas::width(f, "Esc", 11.0) - 12.0;
-        c.paint(WELL, rrect(kl, 177.5, kr, 195.5, 5.0));
-        c.text(f, "Esc", 11.0, kl + 6.0, 190.5, 0.0, TEXT2);
-    }
-
-    // close, overhanging the corner
-    let (Geo::Disc(x, y, r), ch) = (shape_of(Hit::Close), hv(Hit::Close)) else { unreachable!() };
-    c.paint(mix(WELL, RAISED, ch), circle(x, y, r));
-    cross(&mut c, x, y, 5.5, 1.2);
-
+    close_button(&mut c, shape_of(Hit::Close), hv(Hit::Close));
     if let Some(g) = s.focus {
         focus_ring(&mut c, shape_of(g));
     }
@@ -889,7 +879,7 @@ pub fn settings_hit(scale: f32, x: i16, y: i16) -> Option<SetHit> {
 /// Like `panel_body_has`, for the settings popover.
 pub fn settings_body_has(scale: f32, x: i16, y: i16) -> bool {
     let (x, y) = (x as f32 / scale - M, y as f32 / scale - M);
-    sd_rrect(x, y, (0.0, 0.0, SBODY.0, SBODY.1), 22.0) <= 0.0 || SETTINGS_ORDER.into_iter().any(|h| set_hit(h).has(x, y))
+    sd_rrect(x, y, (0.0, 0.0, SBODY.0, SBODY.1), SBODY_R) <= 0.0 || SETTINGS_ORDER.into_iter().any(|h| set_hit(h).has(x, y))
 }
 
 pub struct SettingsState<'a> {
@@ -905,6 +895,8 @@ pub struct SettingsState<'a> {
     pub hover: Option<SetHit>,
     pub focus: Option<SetHit>,
     pub font: Option<&'a FontVec>,
+    /// The medium weight (or `font` again), for the title and section labels.
+    pub bold: Option<&'a FontVec>,
     /// A font with 日本語, for the language picker when `font` has none.
     pub cjk: Option<&'a FontVec>,
     pub scale: f32,
@@ -939,7 +931,7 @@ fn lang_ix() -> f32 {
 
 impl<'a> SettingsState<'a> {
     /// All off, with the tweens settled; set the fields, then `settle`.
-    pub fn new(font: Option<&'a FontVec>, cjk: Option<&'a FontVec>, scale: f32) -> Self {
+    pub fn new((font, bold): (Option<&'a FontVec>, Option<&'a FontVec>), cjk: Option<&'a FontVec>, scale: f32) -> Self {
         let tw = SetTw {
             appear: Tween::new(1.0),
             out: Tween::io(0.0),
@@ -951,7 +943,7 @@ impl<'a> SettingsState<'a> {
             lang: Tween::io(lang_ix()),
             hover: Hov::new(),
         };
-        SettingsState { output: 0, mic: false, mp4: false, gpu: false, gpu_found: false, jpg: false, pointer: false, shortcut: String::new(), capturing: false, hover: None, focus: None, font, cjk, scale, tw }
+        SettingsState { output: 0, mic: false, mp4: false, gpu: false, gpu_found: false, jpg: false, pointer: false, shortcut: String::new(), capturing: false, hover: None, focus: None, font, bold, cjk, scale, tw }
     }
 
     pub fn sync(&mut self) {
@@ -982,13 +974,14 @@ impl<'a> SettingsState<'a> {
     }
 }
 
+/// On: a white track with a black knob; off: a grey track with a white one.
 fn switch(c: &mut Canvas, cy: f32, v: f32, enabled: bool) {
     let Geo::Rect(x0, y0, x1, y1, r) = switch_geo(cy) else { unreachable!() };
-    c.paint(if enabled { mix(SWITCH_OFF, ACCENT, v) } else { WELL }, rrect(x0, y0, x1, y1, r));
-    c.paint(if enabled { WHITE } else { TEXT3 }, circle(x0 + 12.0 + 20.0 * v, cy, 9.0));
+    c.paint(if enabled { mix(THUMB, TEXT, v) } else { WELL }, rrect(x0, y0, x1, y1, r));
+    c.paint(if enabled { mix(TEXT, BLACK, v) } else { DISABLED }, circle(x0 + 12.0 + 20.0 * v, cy, 9.0));
 }
 
-/// Segmented control in the rect x0..x1 × `ys`: `labels` in a pill, the thumb at the fractional index `on`.
+/// Segmented control in the rect x0..x1 × `ys`: `labels` in a capsule, the thumb at the fractional index `on`.
 fn segmented(c: &mut Canvas, (x0, x1): (f32, f32), ys: (f32, f32), labels: &[(&str, Option<&FontVec>)], on: f32, hover: &dyn Fn(usize) -> f32) {
     let n = labels.len();
     let Geo::Rect(l, t, r, b, rad) = cell(x0, x1, ys, 1, 0, 0.0) else { unreachable!() };
@@ -996,16 +989,16 @@ fn segmented(c: &mut Canvas, (x0, x1): (f32, f32), ys: (f32, f32), labels: &[(&s
     for i in 0..n {
         let Geo::Rect(l, t, r, b, rad) = cell(x0, x1, ys, n, i, 3.0) else { unreachable!() };
         let sel = (1.0 - (on - i as f32).abs()).clamp(0.0, 1.0);
-        c.paint(fade(HOVER, hover(i) * (1.0 - sel)), rrect(l, t, r, b, rad));
+        c.paint(fade(WHITE, 0.035 * hover(i) * (1.0 - sel)), rrect(l, t, r, b, rad)); // fainter than the thumb
     }
     let Geo::Rect(l, t, r, b, rad) = cell(x0, x1, ys, n, 0, 3.0) else { unreachable!() };
     let dx = (x1 - x0) / n as f32 * on;
-    c.paint(RAISED, rrect(l + dx, t, r + dx, b, rad));
+    c.paint(THUMB, rrect(l + dx, t, r + dx, b, rad));
     for (i, (label, font)) in labels.iter().enumerate() {
         let sel = (1.0 - (on - i as f32).abs()).clamp(0.0, 1.0);
         if let Some(f) = font {
             let cx = x0 + (x1 - x0) / n as f32 * (i as f32 + 0.5);
-            c.text(f, label, 14.0, cx, (ys.0 + ys.1) / 2.0 + 5.0, 0.5, mix(TEXT2, TEXT, sel));
+            c.text(f, label, 14.0, cx, (ys.0 + ys.1) / 2.0 + 5.0, 0.5, mix(mix(TEXT2, TEXT, 0.5 * hover(i)), TEXT, sel));
         }
     }
 }
@@ -1015,7 +1008,7 @@ pub fn settings(s: &SettingsState) -> Canvas {
     let t = &s.tw;
     let a = t.appear.get();
     (c.alpha, c.origin) = (a, (M, M + (1.0 - a) * 10.0));
-    card(&mut c, SBODY.0, SBODY.1, 22.0);
+    card(&mut c, SBODY.0, SBODY.1, SBODY_R);
     let hv = |h| t.hover.amt(h);
     let f = s.font;
     let lbl = |c: &mut Canvas, text: &str, px: f32, x: f32, base: f32, col: Rgba| {
@@ -1023,14 +1016,21 @@ pub fn settings(s: &SettingsState) -> Canvas {
             c.text(f, text, px, x, base, 0.0, col);
         }
     };
+    // a section's name, set like the mode words
+    let section = |c: &mut Canvas, text: &str, base: f32| {
+        if let Some(b) = s.bold.or(f) {
+            let (text, px, track) = caps(text, 11.5);
+            c.spaced(b, &text, px, (20.0, base), 0.0, (track, false), TEXT2);
+        }
+    };
 
-    lbl(&mut c, &tr!("Settings", "Ajustes", "設定"), 18.0, 20.0, 36.0, TEXT);
-    let Geo::Disc(x, y, r) = set_shape(SetHit::Close) else { unreachable!() };
-    c.paint(mix(WELL, RAISED, hv(SetHit::Close)), circle(x, y, r));
-    cross(&mut c, x, y, 5.0, 1.2);
+    if let Some(b) = s.bold.or(f) {
+        c.text(b, &tr!("Settings", "Ajustes", "設定"), 17.0, 20.0, 36.0, 0.0, TEXT);
+    }
+    close_button(&mut c, set_shape(SetHit::Close), hv(SetHit::Close));
 
     // sound
-    lbl(&mut c, &tr!("Sound", "Sonido", "サウンド"), 13.0, 20.0, 74.0, TEXT3);
+    section(&mut c, &tr!("Sound", "Sonido", "サウンド"), 74.0);
     let sound = [tr!("None", "Sin sonido", "なし"), tr!("System", "Sistema", "システム"), tr!("App", "Aplicación", "アプリ")];
     let labels: Vec<(&str, Option<&FontVec>)> = sound.iter().map(|l| (l.as_str(), f)).collect();
     segmented(&mut c, (20.0, 320.0), SEG_OUT, &labels, t.out.get(), &|i| hv(SetHit::Output(i)));
@@ -1039,7 +1039,7 @@ pub fn settings(s: &SettingsState) -> Canvas {
     for (h, cy) in [(SetHit::Mic, ROW_MIC), (SetHit::Gpu, ROW_GPU), (SetHit::Pointer, ROW_POINTER)] {
         if h != SetHit::Gpu || s.gpu_found {
             let Geo::Rect(x0, y0, x1, y1, r) = row_rect(cy) else { unreachable!() };
-            c.paint(fade(HOVER, hv(h)), rrect(x0, y0, x1, y1, r));
+            c.paint(fade(WHITE, 0.05 * hv(h)), rrect(x0, y0, x1, y1, r));
         }
     }
     lbl(&mut c, &tr!("Microphone", "Micrófono", "マイク"), 15.0, 20.0, ROW_MIC + 5.0, TEXT);
@@ -1052,10 +1052,10 @@ pub fn settings(s: &SettingsState) -> Canvas {
     segmented(&mut c, (196.0, 320.0), pick_y(ROW_VIDEO), &[("MKV", f), ("MP4", f)], t.video.get(), &|i| hv(SetHit::VideoFormat(i)));
 
     let use_gpu = tr!("Use GPU", "Usar GPU", "GPU を使う");
-    lbl(&mut c, &use_gpu, 15.0, 20.0, ROW_GPU + 5.0, TEXT);
+    lbl(&mut c, &use_gpu, 15.0, 20.0, ROW_GPU + 5.0, if s.gpu_found { TEXT } else { TEXT2 });
     if let Some(f) = f {
         let note = if s.gpu_found { "NVENC".to_owned() } else { tr!("not available", "no disponible", "利用不可") };
-        c.text(f, &note, 12.0, 20.0 + Canvas::width(f, &use_gpu, 15.0) + 8.0, ROW_GPU + 5.0, 0.0, TEXT3);
+        c.text(f, &note, 12.0, 20.0 + Canvas::width(f, &use_gpu, 15.0) + 8.0, ROW_GPU + 5.0, 0.0, TEXT2);
     }
     switch(&mut c, ROW_GPU, t.gpu.get(), s.gpu_found);
 
@@ -1068,17 +1068,16 @@ pub fn settings(s: &SettingsState) -> Canvas {
     // shortcut: shows the current one; click, then press the new keys
     lbl(&mut c, &tr!("Shortcut", "Atajo", "ショートカット"), 15.0, 20.0, ROW_KEY - 4.0, TEXT);
     let caption = if s.capturing { tr!("Esc to cancel", "Esc para cancelar", "Esc でキャンセル") } else { tr!("Opens screenrec", "Abre screenrec", "screenrec を開く") };
-    lbl(&mut c, &caption, 12.0, 20.0, ROW_KEY + 12.0, TEXT3);
+    lbl(&mut c, &caption, 12.0, 20.0, ROW_KEY + 12.0, TEXT2);
     let Geo::Rect(x0, y0, x1, y1, r) = set_shape(SetHit::Shortcut) else { unreachable!() };
-    let chip = if s.capturing { ACCENT } else { mix(WELL, RAISED, hv(SetHit::Shortcut)) };
-    c.paint(chip, rrect(x0, y0, x1, y1, r));
+    c.paint(if s.capturing { TEXT } else { mix(WELL, WELL_HI, hv(SetHit::Shortcut)) }, rrect(x0, y0, x1, y1, r));
     if let Some(f) = f {
-        let (text, col) = if s.capturing { (tr!("Press keys…", "Presiona…", "キーを入力…"), ON_ACCENT) } else { (s.shortcut.clone(), TEXT) };
+        let (text, col) = if s.capturing { (tr!("Press keys…", "Presiona…", "キーを入力…"), BLACK) } else { (s.shortcut.clone(), TEXT) };
         c.text(f, &Canvas::fit(f, &text, 14.0, 108.0), 14.0, (x0 + x1) / 2.0, ROW_KEY + 5.0, 0.5, col);
     }
 
     // language: each in its own name, so a wrong pick can be undone
-    lbl(&mut c, &tr!("Language", "Idioma", "言語"), 13.0, 20.0, 416.0, TEXT3);
+    section(&mut c, &tr!("Language", "Idioma", "言語"), 416.0);
     let ja = if s.cjk.is_some() || crate::i18n::lang() == crate::i18n::Lang::Ja { "日本語".to_owned() } else { tr!("Japanese", "Japonés", "日本語") };
     let langs = [("English", f), ("Español", f), (ja.as_str(), s.cjk.or(f))];
     segmented(&mut c, (20.0, 320.0), SEG_LANG, &langs, t.lang.get(), &|i| hv(SetHit::Lang(i)));
@@ -1089,11 +1088,28 @@ pub fn settings(s: &SettingsState) -> Canvas {
     c
 }
 
-/// Recording pill button under device x (1 pause/resume, 2 stop).
-pub fn pill_slot(scale: f32, x: i16) -> usize {
-    match x as f32 / scale {
-        x if x < 108.0 => 0,
-        x if x < 140.0 => 1,
+/// The pill's word before the time: REC, or Paused.
+fn pill_label(paused: bool) -> (String, f32, f32) {
+    if paused { caps(&tr!("Paused", "Pausa", "一時停止"), 11.0) } else { ("REC".into(), 11.0, 1.1) }
+}
+
+/// Where the pill's parts go (logical px): the time, the divider, the whole width.
+/// Room for either word, so pausing never moves the buttons.
+fn pill_geo(font: Option<&FontVec>, bold: Option<&FontVec>) -> (f32, f32, f32) {
+    let word = |paused| bold.or(font).map_or(0.0, |f| {
+        let (s, px, track) = pill_label(paused);
+        spaced_width(f, &s, px, track, false)
+    });
+    let time = (28.0 + word(false)).max(16.0 + word(true)) + 10.0;
+    let div = time + 60.0; // H:MM:SS fits
+    (time, div, (div + 62.0).ceil())
+}
+
+/// Recording pill button under device x (1 pause/resume, 2 stop) on a pill whose divider is at `div`.
+pub fn pill_slot(scale: f32, x: i16, div: f32) -> usize {
+    match x as f32 / scale - div {
+        x if x < 0.0 => 0,
+        x if x < 30.0 => 1,
         _ => 2,
     }
 }
@@ -1106,33 +1122,34 @@ fn clock(secs: u64) -> String {
     }
 }
 
-/// The recording pill. Translucent on purpose: total alpha stays <= 0.8
-/// (0.9 on the small dot), so capture.rs can solve the compositor's blend
-/// for the pixels underneath with an error of a couple of levels.
-pub fn pill(paused: bool, secs: u64, font: Option<&FontVec>, scale: f32) -> Canvas {
-    let mut c = Canvas::new(172, 40, scale);
+/// The recording pill, a camera's REC readout: "● REC 0:42 | ❚❚ ■". Translucent
+/// on purpose: total alpha stays <= 0.8 (0.9 on the small dot), so capture.rs
+/// can solve the compositor's blend for the pixels underneath with an error of
+/// a couple of levels.
+pub fn pill(paused: bool, secs: u64, (font, bold): (Option<&FontVec>, Option<&FontVec>), scale: f32) -> Canvas {
+    let (time, div, w) = pill_geo(font, bold);
+    let mut c = Canvas::new(w as usize, 40, scale);
+    c.paint((0.03, 0.03, 0.035, 0.6), rrect(0.0, 0.0, w, 40.0, 20.0));
     let ink = (1.0, 1.0, 1.0, 0.5); // 0.5 over the 0.6 backdrop -> 0.8 total
-    c.paint((0.10, 0.08, 0.07, 0.6), rrect(0.0, 0.0, 172.0, 40.0, 20.0));
-    let dot = if paused { (0.60, 0.57, 0.55, 0.75) } else { (1.0, 0.27, 0.23, 0.75) };
-    c.paint(dot, circle(20.0, 20.0, 6.0));
+    if !paused {
+        c.paint((1.0, 0.27, 0.22, 0.75), circle(18.0, 20.0, 4.5));
+    }
+    if let Some(b) = bold.or(font) {
+        let (word, px, track) = pill_label(paused);
+        c.spaced(b, &word, px, (if paused { 16.0 } else { 28.0 }, 24.0), 0.0, (track, false), ink); // red would be too faint at this alpha
+    }
     if let Some(f) = font {
-        // Tabular digits: each in a cell as wide as '0', so the time doesn't jitter.
-        let cell = Canvas::width(f, "0", 14.0);
-        let mut x = 34.0;
-        for ch in clock(secs).chars() {
-            let s = ch.to_string();
-            c.text(f, &s, 14.0, x, 25.0, 0.0, ink);
-            x += if ch.is_ascii_digit() { cell } else { Canvas::width(f, &s, 14.0) };
-        }
+        c.spaced(f, &clock(secs), 15.0, (time, 25.5), 0.0, (0.0, true), ink);
     }
-    c.paint((1.0, 1.0, 1.0, 0.18), line(106.0, 12.0, 106.0, 28.0, 0.5));
+    c.paint((1.0, 1.0, 1.0, 0.16), line(div, 12.0, div, 28.0, 0.5));
+    let px = div + 17.0;
     if paused {
-        c.poly(ink, &[(121.0, 12.5), (133.0, 20.0), (121.0, 27.5)]);
+        c.poly(ink, &[(px - 4.5, 13.0), (px + 6.5, 20.0), (px - 4.5, 27.0)]);
     } else {
-        c.paint(ink, line(122.0, 14.0, 122.0, 26.0, 1.25));
-        c.paint(ink, line(130.0, 14.0, 130.0, 26.0, 1.25));
+        c.paint(ink, line(px - 3.5, 14.0, px - 3.5, 26.0, 1.3));
+        c.paint(ink, line(px + 3.5, 14.0, px + 3.5, 26.0, 1.3));
     }
-    c.paint(ink, rrect(146.0, 14.0, 158.0, 26.0, 2.5));
+    c.paint(ink, rrect(div + 38.0, 14.0, div + 50.0, 26.0, 2.5));
     c
 }
 
@@ -1212,25 +1229,40 @@ pub fn step<T: Copy + PartialEq>(order: &[T], cur: T, back: bool, skip: impl Fn(
     (1..=n).map(|d| order[(i + if back { n - d } else { d }) % n]).find(|&h| !skip(h)).unwrap_or(cur)
 }
 
-/// The selection size badge: "1280 × 720", a 24 px pill just big enough.
-pub fn badge(w: i32, h: i32, font: Option<&FontVec>, scale: f32) -> Canvas {
-    let text = format!("{w} \u{d7} {h}");
-    let tw = font.map_or(60.0, |f| Canvas::width(f, &text, 12.5));
-    let bw = (tw + 20.0).ceil();
+/// The size badge: "1280 × 720" in tabular digits, so a drag doesn't make it
+/// jitter, after the window's name in Window mode; a 24 px capsule just big enough.
+pub fn badge(w: i32, h: i32, name: Option<&str>, font: Option<&FontVec>, scale: f32) -> Canvas {
+    let dims = format!("{w} \u{d7} {h}");
+    let name = name.zip(font).map(|(n, f)| Canvas::fit(f, n, 12.5, 220.0));
+    let dw = font.map_or(60.0, |f| spaced_width(f, &dims, 12.5, 0.0, true));
+    let nw = name.as_ref().zip(font).map_or(0.0, |(n, f)| Canvas::width(f, n, 12.5) + 8.0);
+    let bw = (nw + dw + 20.0).ceil();
     let mut c = Canvas::new(bw as usize, 24, scale);
-    c.paint(fade(BG, 0.92), rrect(0.0, 0.0, bw, 24.0, 12.0));
+    c.paint(fade(BLACK, 0.9), rrect(0.0, 0.0, bw, 24.0, 12.0));
     c.paint(HAIRLINE, stroke(rrect(0.5, 0.5, bw - 0.5, 23.5, 11.5), 1.0));
     if let Some(f) = font {
-        c.text(f, &text, 12.5, bw / 2.0, 16.5, 0.5, TEXT);
+        if let Some(n) = &name {
+            c.text(f, n, 12.5, 10.0, 16.5, 0.0, TEXT);
+        }
+        c.spaced(f, &dims, 12.5, (10.0 + nw, 16.5), 0.0, (0.0, true), if name.is_some() { TEXT2 } else { TEXT });
     }
     c
 }
 
 /// Where the `b`-sized badge goes for selection `sel` on an `sw`×`sh` screen: `gap` px under
-/// its bottom-left corner, else inside its top-left one; always on screen.
-pub fn badge_pos(sel: Rect, (bw, bh): (i32, i32), (sw, sh): (i32, i32), gap: i32) -> (i32, i32) {
-    let (x, y) = if sel.3 + gap + bh <= sh { (sel.0, sel.3 + gap) } else { (sel.0 + gap, sel.1 + gap) };
-    (x.min(sw - bw).max(0), y.min(sh - bh).max(0))
+/// its bottom-left corner, else (off screen, or behind `avoid`, the panel) inside its top-left one;
+/// always on screen.
+pub fn badge_pos(sel: Rect, (bw, bh): (i32, i32), (sw, sh): (i32, i32), gap: i32, avoid: Rect) -> (i32, i32) {
+    let fit = |(x, y): (i32, i32)| (x.min(sw - bw).max(0), y.min(sh - bh).max(0));
+    let (x, y) = fit((sel.0, sel.3 + gap));
+    let hidden = x < avoid.2 && avoid.0 < x + bw && y < avoid.3 && avoid.1 < y + bh;
+    if sel.3 + gap + bh <= sh && !hidden { (x, y) } else { fit((sel.0 + gap, sel.1 + gap)) }
+}
+
+/// The panel's body on a `sw`×`sh` screen, in device px.
+pub fn panel_rect(sw: i32, sh: i32, scale: f32) -> Rect {
+    let ((x, y), m) = (place(sw, sh, scale).0, (M * scale).round() as i32);
+    (x + m, y + m, x + m + (BODY.0 * scale).round() as i32, y + m + (BODY.1 * scale).round() as i32)
 }
 
 const EDGE: i32 = 20; // where the pill rests, from the screen edge (logical px)
@@ -1255,8 +1287,9 @@ type Glide = (Instant, (i32, i32), (i32, i32));
 /// it glides to the nearest screen edge.
 pub struct Pill<'a> {
     pub win: Win,
-    font: Option<&'a FontVec>,
+    fonts: (Option<&'a FontVec>, Option<&'a FontVec>),
     scale: f32,
+    div: f32, // where the buttons start, logical px
     started: Instant,
     paused: Option<Instant>,
     paused_for: Duration,
@@ -1267,15 +1300,16 @@ pub struct Pill<'a> {
 }
 
 impl<'a> Pill<'a> {
-    pub fn new(cap: &Capture, font: Option<&'a FontVec>, scale: f32) -> Res<Self> {
-        let c = pill(false, 0, font, scale);
+    /// `fonts`: regular and medium, as for the panel.
+    pub fn new(cap: &Capture, fonts: (Option<&'a FontVec>, Option<&'a FontVec>), scale: f32) -> Res<Self> {
+        let c = pill(false, 0, fonts, scale);
         let (sw, sh) = (cap.sw as i32, cap.sh as i32);
         let edge = (EDGE as f32 * scale).round() as i32;
         let (x, y) = (sw - c.w as i32 - edge, sh - c.h as i32 - edge);
         let mask = EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::BUTTON1_MOTION;
         let win = Win::new(cap, x, y, c, mask)?;
         win.show(&cap.conn)?;
-        Ok(Pill { win, font, scale, started: Instant::now(), paused: None, paused_for: Duration::ZERO, secs: 0, screen: (sw, sh), drag: None, glide: None })
+        Ok(Pill { win, fonts, scale, div: pill_geo(fonts.0, fonts.1).1, started: Instant::now(), paused: None, paused_for: Duration::ZERO, secs: 0, screen: (sw, sh), drag: None, glide: None })
     }
 
     pub fn event(&mut self, conn: &impl Connection, ev: &Event) -> Res<PillEvent> {
@@ -1300,7 +1334,7 @@ impl<'a> Pill<'a> {
             Event::ButtonRelease(e) if e.event == self.win.id && e.detail == 1 => match self.drag.take() {
                 Some(d) if d.moved => self.glide = Some((Instant::now(), (self.win.x, self.win.y), self.nearest_edge())),
                 Some(d) => {
-                    return Ok(match pill_slot(self.scale, d.press_x) {
+                    return Ok(match pill_slot(self.scale, d.press_x, self.div) {
                         1 => PillEvent::TogglePause,
                         2 => PillEvent::Stop,
                         _ => PillEvent::None,
@@ -1343,7 +1377,7 @@ impl<'a> Pill<'a> {
             (false, Some(t)) => (self.paused, self.paused_for) = (None, self.paused_for + t.elapsed()),
             _ => {}
         }
-        self.win.redraw(conn, pill(paused, self.secs, self.font, self.scale))
+        self.win.redraw(conn, pill(paused, self.secs, self.fonts, self.scale))
     }
 
     /// Keep the elapsed time current: redraws only when the shown second
@@ -1354,7 +1388,7 @@ impl<'a> Pill<'a> {
             return Ok(false);
         }
         self.secs = secs;
-        self.win.redraw(conn, pill(self.paused.is_some(), secs, self.font, self.scale))?;
+        self.win.redraw(conn, pill(self.paused.is_some(), secs, self.fonts, self.scale))?;
         Ok(true)
     }
 }
@@ -1419,11 +1453,18 @@ mod preview {
         c
     }
 
-    fn set_state<'a>(font: Option<&'a FontVec>, cjk: Option<&'a FontVec>, scale: f32) -> SettingsState<'a> {
-        let mut s = SettingsState::new(font, cjk, scale);
+    type Fonts<'a> = (Option<&'a FontVec>, Option<&'a FontVec>);
+
+    fn set_state<'a>(fonts: Fonts<'a>, cjk: Option<&'a FontVec>, scale: f32) -> SettingsState<'a> {
+        let mut s = SettingsState::new(fonts, cjk, scale);
         (s.output, s.mic, s.mp4, s.gpu, s.gpu_found, s.shortcut) = (1, true, false, true, true, "Ctrl+Shift+S".into());
         s.settle();
         s
+    }
+
+    /// The overlay over the frozen desktop, as premultiplied pixels.
+    fn overlay(frozen: &[u8], (sw, sh): (usize, usize), area: Rect, handles: bool) -> Vec<u32> {
+        crate::select::preview(frozen.to_vec(), sw, sh, Some(area), handles).as_chunks::<4>().0.iter().map(|p| 255 << 24 | u32::from_le_bytes([p[0], p[1], p[2], 0])).collect()
     }
 
     #[test]
@@ -1435,16 +1476,14 @@ mod preview {
         let desk = desktop();
         let frozen: Vec<u8> = desk.px.iter().flat_map(|p| p.to_le_bytes()).collect();
         let (sw, sh) = (desk.w, desk.h);
-        let (latin, ja) = (load_font(false), load_font(true));
+        let (latin, bold, ja) = (load_font(false), load_bold(), load_font(true));
         for (lang, tag) in [(Lang::En, "en"), (Lang::Es, "es"), (Lang::Ja, "ja")] {
             i18n::set(lang);
-            let (font, cjk) = if lang == Lang::Ja { (ja.as_ref(), None) } else { (latin.as_ref(), ja.as_ref()) };
+            let (fonts, cjk) = if lang == Lang::Ja { ((ja.as_ref(), ja.as_ref()), None) } else { ((latin.as_ref(), bold.as_ref()), ja.as_ref()) };
+            let font = fonts.0;
             let panel_state = |mode, record, hover, open, focus| {
-                let mut s = PanelState::new(mode, record, font, SCALE);
+                let mut s = PanelState::new(mode, record, fonts, SCALE);
                 (s.hover, s.settings_open, s.focus) = (hover, open, focus);
-                if mode == Mode::Window {
-                    s.window = Some("Firefox Web Browser".into());
-                }
                 s.settle();
                 s
             };
@@ -1456,7 +1495,8 @@ mod preview {
                 ("shot", panel_state(Mode::Selection, false, None, false, None)),
                 ("rec-hover", panel_state(Mode::Window, true, Some(Hit::Shutter), false, None)),
                 ("screen-gear", panel_state(Mode::Screen, false, Some(Hit::Mode(Mode::Window)), true, None)),
-                ("focus", panel_state(Mode::Selection, true, None, false, Some(Hit::Cast))),
+                ("focus", panel_state(Mode::Selection, true, None, false, Some(Hit::Mode(Mode::Screen)))),
+                ("focus-shutter", panel_state(Mode::Screen, false, None, false, Some(Hit::Shutter))),
                 ("mid", mid),
                 ("appear", fresh),
             ];
@@ -1465,61 +1505,69 @@ mod preview {
                 save(&dir, &format!("panel-{name}-{tag}"), c.w, c.h, &c.px, bg);
             }
             // The languages' own settings views.
-            let c = settings(&set_state(font, cjk, SCALE));
+            let c = settings(&set_state(fonts, cjk, SCALE));
             save(&dir, &format!("settings-default-{tag}"), c.w, c.h, &c.px, bg);
-            let mut listening = set_state(font, if tag == "en" { None } else { ja.as_ref() }, SCALE);
+            let mut listening = set_state(fonts, if tag == "en" { None } else { ja.as_ref() }, SCALE);
             (listening.gpu_found, listening.capturing, listening.hover, listening.pointer) = (false, true, Some(SetHit::Pointer), false);
             listening.settle();
             let c = settings(&listening);
             save(&dir, &format!("settings-listening-{tag}"), c.w, c.h, &c.px, bg);
-            let mut focused = set_state(font, if tag == "es" { ja.as_ref() } else { None }, SCALE);
-            focused.focus = Some(SetHit::Lang(1));
+            let mut focused = set_state(fonts, if tag == "es" { ja.as_ref() } else { None }, SCALE);
+            (focused.focus, focused.hover) = (Some(SetHit::Lang(1)), Some(SetHit::VideoFormat(1)));
+            focused.settle();
             let c = settings(&focused);
             save(&dir, &format!("settings-focus-{tag}"), c.w, c.h, &c.px, bg);
 
             // The whole launcher over the frozen desktop, as the user sees it.
-            let sel = (420, 260, 1240, 720);
-            let mut full: Vec<u32> = crate::select::preview(frozen.clone(), sw, sh, Some(sel), true).as_chunks::<4>().0.iter().map(|p| 255 << 24 | u32::from_le_bytes([p[0], p[1], p[2], 0])).collect();
             let ((px, py), (mx, my)) = place(sw as i32, sh as i32, SCALE);
-            let bc = badge(sel.2 - sel.0, sel.3 - sel.1, font, SCALE);
-            let (bx, by) = badge_pos(sel, (bc.w as i32, bc.h as i32), (sw as i32, sh as i32), (14.0 * SCALE).round() as i32);
-            over(&mut full, sw, &bc, bx as usize, by as usize);
+            let gap = (14.0 * SCALE).round() as i32;
+            let with_badge = |full: &mut Vec<u32>, r: Rect, name: Option<&str>| {
+                let bc = badge(r.2 - r.0, r.3 - r.1, name, font, SCALE);
+                let (bx, by) = badge_pos(r, (bc.w as i32, bc.h as i32), (sw as i32, sh as i32), gap, panel_rect(sw as i32, sh as i32, SCALE));
+                over(full, sw, &bc, bx as usize, by as usize);
+            };
+            let sel = (420, 260, 1240, 720);
+            let mut full = overlay(&frozen, (sw, sh), sel, true);
+            with_badge(&mut full, sel, None);
             over(&mut full, sw, &panel(&panels[0].1), px as usize, py as usize);
             save(&dir, &format!("launcher-{tag}"), sw, sh, &full, bg);
-            over(&mut full, sw, &settings(&set_state(font, cjk, SCALE)), mx as usize, my as usize);
+            over(&mut full, sw, &settings(&set_state(fonts, cjk, SCALE)), mx as usize, my as usize);
             save(&dir, &format!("launcher-settings-{tag}"), sw, sh, &full, bg);
             // A tall selection: the badge goes inside it.
             let sel = (300, 200, 1500, 1060);
-            let mut full: Vec<u32> = crate::select::preview(frozen.clone(), sw, sh, Some(sel), true).as_chunks::<4>().0.iter().map(|p| 255 << 24 | u32::from_le_bytes([p[0], p[1], p[2], 0])).collect();
-            let bc = badge(sel.2 - sel.0, sel.3 - sel.1, font, SCALE);
-            let (bx, by) = badge_pos(sel, (bc.w as i32, bc.h as i32), (sw as i32, sh as i32), (14.0 * SCALE).round() as i32);
-            over(&mut full, sw, &bc, bx as usize, by as usize);
+            let mut full = overlay(&frozen, (sw, sh), sel, true);
+            with_badge(&mut full, sel, None);
             over(&mut full, sw, &panel(&panels[0].1), px as usize, py as usize);
             save(&dir, &format!("launcher-badge-inside-{tag}"), sw, sh, &full, bg);
-        }
-        // The size badge, alone and under a selection.
-        for (lang, tag, font) in [(Lang::En, "en", latin.as_ref()), (Lang::Ja, "ja", ja.as_ref())] {
-            i18n::set(lang);
-            for (w, h) in [(1280, 720), (64, 64), (1920, 1080)] {
-                let c = badge(w, h, font, SCALE);
+            // Window mode: the window framed, its name on the badge.
+            let win = (820, 300, 1700, 900);
+            let mut full = overlay(&frozen, (sw, sh), win, false);
+            with_badge(&mut full, win, Some("Firefox Web Browser"));
+            over(&mut full, sw, &panel(&panel_state(Mode::Window, true, None, false, None)), px as usize, py as usize);
+            save(&dir, &format!("launcher-window-{tag}"), sw, sh, &full, bg);
+            // A selection against the screen's corner: the brackets stay on screen.
+            let sel = (0, 0, 900, 500);
+            let full = overlay(&frozen, (sw, sh), sel, true);
+            save(&dir, &format!("overlay-corner-{tag}"), 1000, 600, &full.chunks_exact(sw).take(600).flat_map(|r| r[..1000].to_vec()).collect::<Vec<_>>(), bg);
+            // The pill over light and dark backgrounds.
+            for (name, paused, secs) in [("recording", false, 42), ("paused", true, 725), ("hour", false, 3723)] {
+                let c = pill(paused, secs, fonts, SCALE);
+                save(&dir, &format!("pill-{name}-light-{tag}"), c.w, c.h, &c.px, [0xf2, 0xf2, 0xf2]);
+                save(&dir, &format!("pill-{name}-dark-{tag}"), c.w, c.h, &c.px, [0x24, 0x24, 0x24]);
+            }
+            // The badge alone, for the selection and for a window.
+            for (w, h, name) in [(1280, 720, None), (64, 64, None), (1920, 1080, None), (880, 600, Some("Firefox Web Browser"))] {
+                let c = badge(w, h, name, font, SCALE);
                 save(&dir, &format!("badge-{w}x{h}-{tag}"), c.w, c.h, &c.px, bg);
             }
-            let c = badge(1280, 720, font, SCALE);
-            save(&dir, &format!("badge-{tag}"), c.w, c.h, &c.px, [0x30, 0x2a, 0x3a]);
         }
         i18n::set(Lang::En);
         let c = panel(&{
-            let mut s = PanelState::new(Mode::Selection, false, latin.as_ref(), 1.0);
+            let mut s = PanelState::new(Mode::Selection, false, (latin.as_ref(), bold.as_ref()), 1.0);
             s.settle();
             s
         });
         save(&dir, "panel-shot-en-1x", c.w, c.h, &c.px, bg);
-        // The pill over light and dark backgrounds.
-        for (name, paused, secs) in [("recording", false, 42), ("paused", true, 725), ("hour", false, 3723)] {
-            let c = pill(paused, secs, latin.as_ref(), SCALE);
-            save(&dir, &format!("pill-{name}-light"), c.w, c.h, &c.px, [0xf2, 0xf2, 0xf2]);
-            save(&dir, &format!("pill-{name}-dark"), c.w, c.h, &c.px, [0x24, 0x24, 0x24]);
-        }
     }
 
     /// `cargo test --release timing -- --ignored --nocapture`
@@ -1527,10 +1575,10 @@ mod preview {
     #[ignore = "timing"]
     fn timing() {
         i18n::set(Lang::En);
-        let font = load_font(false);
-        let mut p = PanelState::new(Mode::Selection, false, font.as_ref(), SCALE);
+        let (font, bold) = (load_font(false), load_bold());
+        let mut p = PanelState::new(Mode::Selection, false, (font.as_ref(), bold.as_ref()), SCALE);
         p.settle();
-        let mut s = set_state(font.as_ref(), None, SCALE);
+        let mut s = set_state((font.as_ref(), bold.as_ref()), None, SCALE);
         s.settle();
         let time = |f: &dyn Fn() -> Canvas| {
             f();
@@ -1556,9 +1604,13 @@ mod preview {
     #[test]
     fn pill_text_and_slots() {
         assert_eq!((clock(42), clock(725), clock(3723)), ("0:42".into(), "12:05".into(), "1:02:03".into()));
-        assert_eq!([0, 107, 108, 139, 140, 171].map(|x| pill_slot(1.0, x)), [0, 0, 1, 1, 2, 2]);
-        assert_eq!(pill_slot(1.25, 134), 0);
-        assert_eq!(pill_slot(1.25, 136), 1);
+        assert_eq!([0, 99, 100, 129, 130, 160].map(|x| pill_slot(1.0, x, 100.0)), [0, 0, 1, 1, 2, 2]);
+        assert_eq!((pill_slot(1.25, 124, 100.0), pill_slot(1.25, 126, 100.0)), (0, 1));
+        // Pausing changes the word, never where the buttons are.
+        let f = (load_font(false), load_bold());
+        let (_, div, w) = pill_geo(f.0.as_ref(), f.1.as_ref());
+        assert_eq!(pill(true, 5, (f.0.as_ref(), f.1.as_ref()), 1.0).w, w as usize);
+        assert!(div + 50.0 < w);
     }
 
     fn bounds(g: Geo) -> (f32, f32, f32, f32) {
@@ -1600,7 +1652,7 @@ mod preview {
             let d = |v: f32| (v * s) as i16;
             assert!(!panel_body_has(s, 1, 1) && !panel_body_has(s, d(M + BODY.0 + 20.0), d(M + BODY.1 + 20.0)));
             assert!(panel_body_has(s, d(M + 30.0), d(M + 30.0)) && panel_body_has(s, d(M + 280.0), d(M + 136.0)));
-            assert!(panel_body_has(s, d(M + 375.0), d(M - 3.0)), "the close button overhangs the card");
+            assert!(panel_body_has(s, d(M + BODY.0 + 4.0), d(M - 4.0)), "the close button overhangs the card");
             assert!(!settings_body_has(s, 1, 1) && !settings_body_has(s, d(M + SBODY.0 + 20.0), d(M + SBODY.1 + 20.0)));
             assert!(settings_body_has(s, d(M + 170.0), d(M + 240.0)) && settings_body_has(s, d(M + 30.0), d(M + 30.0)));
         }
@@ -1608,20 +1660,25 @@ mod preview {
 
     #[test]
     fn badge_placement() {
-        let (b, scr) = ((90, 24), (1920, 1080));
-        assert_eq!(badge_pos((420, 260, 1240, 720), b, scr, 8), (420, 728)); // below, left-aligned
-        assert_eq!(badge_pos((420, 260, 1240, 1070), b, scr, 8), (428, 268)); // no room: inside
-        assert_eq!(badge_pos((1900, 100, 1919, 200), b, scr, 8), (1830, 208)); // clamped right
-        assert_eq!(badge_pos((-30, 100, 200, 200), b, scr, 8), (0, 208)); // and left
-        assert_eq!(badge_pos((0, 0, 1920, 1080), (200, 24), (300, 100), 8), (8, 8)); // flipped, on a small screen
+        let (b, scr, none) = ((90, 24), (1920, 1080), (0, 0, 0, 0));
+        assert_eq!(badge_pos((420, 260, 1240, 720), b, scr, 8, none), (420, 728)); // below, left-aligned
+        assert_eq!(badge_pos((420, 260, 1240, 1070), b, scr, 8, none), (428, 268)); // no room: inside
+        assert_eq!(badge_pos((1900, 100, 1919, 200), b, scr, 8, none), (1830, 208)); // clamped right
+        assert_eq!(badge_pos((-30, 100, 200, 200), b, scr, 8, none), (0, 208)); // and left
+        assert_eq!(badge_pos((0, 0, 1920, 1080), (200, 24), (300, 100), 8, none), (8, 8)); // flipped, on a small screen
+        let panel = panel_rect(1920, 1080, 1.25);
+        assert_eq!(badge_pos((820, 300, 1700, 900), b, scr, 8, panel), (828, 308)); // not behind the panel
+        assert_eq!(badge_pos((1300, 300, 1700, 900), b, scr, 8, panel), (1300, 908)); // beside it is fine
     }
 
     #[test]
     fn badge_is_just_big_enough() {
         let f = load_font(false);
-        let c = badge(1280, 720, f.as_ref(), 1.25);
+        let c = badge(1280, 720, None, f.as_ref(), 1.25);
         assert_eq!(c.h, 30);
         assert!(c.w > 60 && c.w < 120 && c.px.iter().all(|p| p >> 24 > 0 || *p == 0));
+        // Same digit count, same width: dragging doesn't make it jump.
+        assert_eq!(badge(1111, 111, None, f.as_ref(), 1.25).w, badge(1080, 720, None, f.as_ref(), 1.25).w);
     }
 
     #[test]
@@ -1636,11 +1693,12 @@ mod preview {
 
     #[test]
     fn pill_alpha_budget() {
-        let c = pill(false, 3723, load_font(false).as_ref(), SCALE);
+        let (f, b) = (load_font(false), load_bold());
+        let c = pill(false, 3723, (f.as_ref(), b.as_ref()), SCALE);
         let max = c.px.iter().map(|p| p >> 24).max().unwrap();
-        assert!(max <= 230, "{max}"); // 0.9
-        let dotless = pill(true, 12, None, 1.0);
-        assert!(dotless.px.iter().all(|p| p >> 24 <= 230));
+        assert!(max <= 230, "{max}"); // 0.9, the dot
+        let paused = pill(true, 12, (f.as_ref(), b.as_ref()), 1.0);
+        assert!(paused.px.iter().all(|p| p >> 24 <= 205), "only the dot goes past 0.8");
     }
 }
 
@@ -1668,7 +1726,7 @@ mod live {
         let (bx, by) = (sw - bw as i32, sh - bh as i32);
         let backdrop = Win::new(&cap, bx, by, back, EventMask::EXPOSURE).unwrap();
         backdrop.show(&cap.conn).unwrap();
-        let mut pill = Pill::new(&cap, font.as_ref(), scale).unwrap();
+        let mut pill = Pill::new(&cap, (font.as_ref(), None), scale).unwrap();
         cap.overlay = Some(pill.win.sprite());
         cap.draw_pointer = false;
         cap.track_changes().unwrap();
@@ -1712,6 +1770,6 @@ mod live {
     }
 
     fn pill_canvas(secs: u64, font: Option<&FontVec>, scale: f32) -> Canvas {
-        pill(false, secs * 7, font, scale) // a new look every time
+        pill(false, secs * 7, (font, None), scale) // a new look every time
     }
 }
