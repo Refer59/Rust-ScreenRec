@@ -42,6 +42,11 @@ pub fn set(accel: &str) -> Res<()> {
     Ok(())
 }
 
+/// Whether GNOME's "Reduce animation" is on (no gsettings or schema: no).
+pub fn animations_off() -> bool {
+    gsettings(&["get", "org.gnome.desktop.interface", "enable-animations"]).is_ok_and(|v| v == "false")
+}
+
 /// GNOME accelerator for a key press: unshifted keysym plus modifier mask.
 /// None for a lone modifier (wait for the real key).
 pub fn accel(keysym: u32, state: u16) -> Option<String> {

@@ -45,7 +45,7 @@ use x11rb::connection::Connection;
 #[cfg(target_os = "linux")]
 use x11rb::protocol::Event;
 #[cfg(target_os = "linux")]
-use x11rb::protocol::xproto::{ConnectionExt as _, EventMask, GrabMode, GrabStatus};
+use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, EventMask, GrabMode, GrabStatus};
 
 pub type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -321,6 +321,14 @@ const KEY_ESCAPE: u32 = 0xff1b;
 #[cfg(target_os = "linux")]
 const KEY_ENTERS: [u32; 3] = [0xff0d, 0xff8d, 0x20]; // Return, KP_Enter, space
 
+/// The desktop's UI scale: Xft.dpi / 96 (GNOME's text scaling sets it), else 1.
+#[cfg(target_os = "linux")]
+fn ui_scale(cap: &Capture) -> f32 {
+    let db = cap.conn.get_property(false, cap.root, AtomEnum::RESOURCE_MANAGER, AtomEnum::STRING, 0, 1 << 16).ok().and_then(|r| r.reply().ok());
+    let dpi = db.and_then(|p| String::from_utf8_lossy(&p.value).lines().find_map(|l| l.strip_prefix("Xft.dpi:")?.trim().parse::<f32>().ok()));
+    dpi.map_or(1.0, |d| (d / 96.0).clamp(1.0, 3.0))
+}
+
 /// Grab the keyboard so the launcher gets its keys. Best effort: the
 /// shortcut that launched us may hold a grab for a moment.
 #[cfg(target_os = "linux")]
@@ -340,6 +348,7 @@ fn grab_keyboard(cap: &Capture, win: u32) -> Res<()> {
 #[cfg(target_os = "linux")]
 fn gui() -> Res<()> {
     let Some(_lock) = single_instance()? else { return Ok(()) };
+    std::thread::spawn(|| ui::set_reduced_motion(shortcut::animations_off())); // a gsettings call: not on the way to the first frame
     let mut cap = Capture::new()?;
     let (screen, cursor) = freeze(&mut cap)?; // screenshots come from this: our UI is never in them
     let (sw, sh) = (cap.sw as i32, cap.sh as i32);
@@ -360,34 +369,25 @@ fn gui() -> Res<()> {
         Mode::Window => w.map(|(r, _)| r),
     };
 
+    let scale = ui_scale(&cap);
     let mut ov = select::Overlay::new(&cap, screen, area(&last, hovered), last.mode == Mode::Selection)?;
+    ov.scale = scale;
     let name_of = |cap: &Capture, w: Option<(Rect, u32)>| w.and_then(|(_, id)| ewmh.name(cap, id));
-    let mut st = ui::PanelState {
-        mode: last.mode,
-        record: last.record,
-        window: name_of(&cap, hovered),
-        hover: None,
-        settings_open: false,
-        font: font(),
+    let cjk = || match i18n::lang() {
+        i18n::Lang::Ja => None,
+        _ => ja.get_or_init(|| ui::load_font(true)).as_ref(), // loaded when the settings first open
     };
-    let (px, py) = ((sw - ui::PANEL_W as i32) / 2, sh - ui::PANEL_H as i32 - 48);
+    let mut st = ui::PanelState::new(last.mode, last.record, font(), scale);
+    st.window = name_of(&cap, hovered);
+    st.reveal();
+    let ((px, py), (mx, my)) = ui::place(sw, sh, scale);
     let mask = EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::POINTER_MOTION | EventMask::LEAVE_WINDOW;
     let mut panel = ui::Win::new(&cap, px, py, ui::panel(&st), mask)?;
     let shortcut_now = || shortcut::get().map_or(tr!("none", "ninguno", "なし"), |a| shortcut::pretty(&a));
-    let mut set = ui::SettingsState {
-        output: audio::OUTPUTS.iter().position(|&o| o == last.output).unwrap_or(0),
-        mic: last.mic,
-        pointer: last.pointer,
-        shortcut: shortcut_now(),
-        capturing: false,
-        mp4: last.mp4,
-        jpg: last.jpg,
-        gpu: last.gpu,
-        gpu_found: nvenc::available(),
-        hover: None,
-        font: font(),
-    };
-    let (mx, my) = ((sw - ui::SET_W as i32) / 2, py + ui::PANEL_TOP - ui::SET_H as i32 - 14);
+    let mut set = ui::SettingsState::new(font(), None, scale);
+    (set.output, set.mic, set.pointer, set.shortcut) = (audio::OUTPUTS.iter().position(|&o| o == last.output).unwrap_or(0), last.mic, last.pointer, shortcut_now());
+    (set.mp4, set.jpg, set.gpu, set.gpu_found) = (last.mp4, last.jpg, last.gpu, nvenc::available());
+    set.settle();
     let mut modal = ui::Win::new(&cap, mx, my, ui::settings(&set), mask)?; // mapped by the gear
     ov.show(&cap.conn)?;
     panel.show(&cap.conn)?;
@@ -395,8 +395,9 @@ fn gui() -> Res<()> {
     grab_keyboard(&cap, ov.win)?;
 
     let mut grip: Option<(select::Grip, Rect)> = None; // dragging, and the selection before it
+    let (mut moving, mut moving_set) = (true, false); // animating: the next frame is due
     loop {
-        cap.wait(Duration::from_millis(50))?;
+        cap.wait(Duration::from_millis(if moving || moving_set { 8 } else { 50 }))?;
         let (mut redraw, mut reshape, mut restyle) = (false, false, false); // panel, overlay, settings
         for ev in cap.take_events()? {
             let shoot = match ev {
@@ -406,12 +407,12 @@ fn gui() -> Res<()> {
                     false
                 }
                 Event::MotionNotify(e) if e.event == panel.id => {
-                    let h = ui::panel_hit(e.event_x, e.event_y);
+                    let h = ui::panel_hit(scale, e.event_x, e.event_y);
                     (redraw, st.hover) = (redraw || h != st.hover, h);
                     false
                 }
                 Event::MotionNotify(e) if e.event == modal.id => {
-                    let h = ui::settings_hit(e.event_x, e.event_y);
+                    let h = ui::settings_hit(scale, e.event_x, e.event_y);
                     (restyle, set.hover) = (restyle || h != set.hover, h);
                     false
                 }
@@ -425,7 +426,7 @@ fn gui() -> Res<()> {
                 }
                 Event::ButtonPress(e) if e.event == panel.id && e.detail == 1 => {
                     redraw = true;
-                    let hit = ui::panel_hit(e.event_x, e.event_y);
+                    let hit = ui::panel_hit(scale, e.event_x, e.event_y);
                     match hit {
                         Some(Hit::Close) => return Ok(()),
                         Some(Hit::Mode(m)) => (st.mode, reshape) = (m, true),
@@ -436,7 +437,10 @@ fn gui() -> Res<()> {
                             cap.conn.unmap_window(modal.id)?;
                         }
                         Some(Hit::Settings) => {
-                            (st.settings_open, set.shortcut, set.capturing) = (true, shortcut_now(), false);
+                            (st.settings_open, set.shortcut, set.capturing, set.cjk) = (true, shortcut_now(), false, cjk());
+                            (set.hover, set.focus) = (None, None);
+                            set.settle();
+                            set.reveal();
                             modal.redraw(&cap.conn, ui::settings(&set))?;
                             cap.conn.map_window(modal.id)?;
                         }
@@ -446,7 +450,7 @@ fn gui() -> Res<()> {
                 }
                 Event::ButtonPress(e) if e.event == modal.id && e.detail == 1 => {
                     restyle = true;
-                    match ui::settings_hit(e.event_x, e.event_y) {
+                    match ui::settings_hit(scale, e.event_x, e.event_y) {
                         Some(SetHit::Close) => {
                             (st.settings_open, set.capturing, redraw) = (false, false, true);
                             cap.conn.unmap_window(modal.id)?;
@@ -460,7 +464,7 @@ fn gui() -> Res<()> {
                         Some(SetHit::Shortcut) => set.capturing = true,
                         Some(SetHit::Lang(i)) => {
                             i18n::set(i18n::LANGS[i]);
-                            (st.font, set.font, set.shortcut, redraw) = (font(), font(), shortcut_now(), true);
+                            (st.font, set.font, set.cjk, set.shortcut, redraw) = (font(), font(), cjk(), shortcut_now(), true);
                         }
                         None => {}
                     }
@@ -547,7 +551,7 @@ fn gui() -> Res<()> {
                     None => None,
                 };
                 let app = app.and_then(|id| ewmh.pid(&cap, id));
-                return shutter(cap, &ov, &[&panel, &modal], target, &last, &cursor, app);
+                return shutter(cap, &ov, &[&panel, &modal], target, &last, &cursor, app, (font(), scale));
             }
         }
         if reshape {
@@ -557,12 +561,18 @@ fn gui() -> Res<()> {
             }
             ov.set(&cap.conn, area(&last, picked.or(hovered)), st.mode == Mode::Selection)?;
         }
-        if redraw {
+        st.sync();
+        if redraw || moving || st.busy() {
             panel.redraw(&cap.conn, ui::panel(&st))?;
         }
-        if restyle && st.settings_open {
-            modal.redraw(&cap.conn, ui::settings(&set))?;
+        moving = st.busy();
+        if st.settings_open {
+            set.sync();
+            if restyle || moving_set || set.busy() {
+                modal.redraw(&cap.conn, ui::settings(&set))?;
+            }
         }
+        moving_set = st.settings_open && set.busy();
     }
 }
 
@@ -570,7 +580,8 @@ fn gui() -> Res<()> {
 /// UI down and record the target live, with the sound picked in the settings
 /// (`app`: the process whose sound "Window" means).
 #[cfg(target_os = "linux")]
-fn shutter(mut cap: Capture, ov: &select::Overlay, windows: &[&ui::Win], target: Option<Target>, last: &Last, cursor: &Sprite, app: Option<u32>) -> Res<()> {
+#[allow(clippy::too_many_arguments)]
+fn shutter(mut cap: Capture, ov: &select::Overlay, windows: &[&ui::Win], target: Option<Target>, last: &Last, cursor: &Sprite, app: Option<u32>, (font, scale): (Option<&ab_glyph::FontVec>, f32)) -> Res<()> {
     let Some(target) = target else { return Ok(()) }; // Window mode with no window picked
     let (Target::Area(r) | Target::Window(_, r)) = target;
     last.save();
@@ -585,7 +596,7 @@ fn shutter(mut cap: Capture, ov: &select::Overlay, windows: &[&ui::Win], target:
         cap.conn.unmap_window(w.id)?;
     }
     cap.conn.ungrab_keyboard(CURRENT_TIME)?;
-    let pill = ui::Pill::new(&cap)?;
+    let pill = ui::Pill::new(&cap, font, scale)?;
     cap.overlay = Some(pill.win.sprite());
     cap.draw_pointer = last.pointer;
     let path = default_path("VIDEOS", &rec_prefix(), "mkv");
@@ -630,7 +641,7 @@ fn pump_pill(cap: &mut Capture, pill: &mut Option<Pill>, paused: &mut Option<Ins
             PillEvent::TogglePause if paused.is_some() => {
                 *paused_for += paused.take().unwrap().elapsed();
                 p.set_paused(&cap.conn, false)?;
-                cap.overlay = Some(p.win.sprite());
+                cap.set_overlay(p.win.sprite());
                 settle(cap, None)?; // compositor must show this look before we remove it
             }
             PillEvent::TogglePause => {
@@ -647,6 +658,9 @@ fn pump_pill(cap: &mut Capture, pill: &mut Option<Pill>, paused: &mut Option<Ins
     if let Some(p) = pill.as_mut() {
         p.animate(&cap.conn)?;
         cap.move_overlay(p.win.x, p.win.y);
+        if p.tick(&cap.conn)? {
+            cap.set_overlay(p.win.sprite()); // the old look stays removable until it's off screen
+        }
     }
     Ok(())
 }

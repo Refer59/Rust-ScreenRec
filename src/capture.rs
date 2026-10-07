@@ -248,7 +248,6 @@ impl Capture {
     }
 
     /// Redrawn pill: the old look stays removable until the compositor catches up.
-    #[allow(dead_code)] // until the pill timer calls it
     pub fn set_overlay(&mut self, s: Sprite) {
         self.prev_overlay = self.overlay.replace(s);
     }
