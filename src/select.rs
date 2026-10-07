@@ -322,5 +322,4 @@ mod tests {
         // Outside: a new selection from the press point.
         assert_eq!(drag(grip(sel, 10, 10), 40, 5, (1920, 1080)), (10, 5, 40, 10));
     }
-
 }
