@@ -42,17 +42,39 @@ fn void(len: usize) -> Vec<u8> {
     v
 }
 
+/// Index of the first zero byte, 8 bytes at a time.
+fn zero(b: &[u8]) -> Option<usize> {
+    const LO: u64 = u64::from_ne_bytes([0x01; 8]);
+    const HI: u64 = u64::from_ne_bytes([0x80; 8]);
+    let (chunks, tail) = b.as_chunks::<8>();
+    for (k, c) in chunks.iter().enumerate() {
+        let v = u64::from_ne_bytes(*c);
+        if v.wrapping_sub(LO) & !v & HI != 0 {
+            return c.iter().position(|&x| x == 0).map(|p| k * 8 + p);
+        }
+    }
+    tail.iter().position(|&x| x == 0).map(|p| chunks.len() * 8 + p)
+}
+
+/// Index of the first `00 00 01` at or after `i`.
+fn start_code(b: &[u8], mut i: usize) -> Option<usize> {
+    while i + 3 <= b.len() {
+        let z = i + zero(&b[i..b.len() - 2])?;
+        if b[z + 1] == 0 && b[z + 2] == 1 {
+            return Some(z);
+        }
+        i = z + 1;
+    }
+    None
+}
+
 /// NAL units of an Annex B stream.
 fn nals(b: &[u8]) -> Vec<&[u8]> {
     let mut starts = vec![];
     let mut i = 0;
-    while i + 3 <= b.len() {
-        if b[i..i + 3] == [0, 0, 1] {
-            starts.push(i + 3);
-            i += 3;
-        } else {
-            i += 1;
-        }
+    while let Some(z) = start_code(b, i) {
+        starts.push(z + 3);
+        i = z + 3;
     }
     let ends = starts.iter().skip(1).map(|&s| s - 3).chain([b.len()]);
     starts
@@ -139,23 +161,26 @@ impl Mkv {
     /// Append one encoded video frame (Annex B), `ts` in ms.
     pub fn frame(&mut self, ts: u64, key: bool, annexb: &[u8]) -> io::Result<()> {
         // SPS/PPS/AUD live in CodecPrivate; the rest goes length-prefixed.
-        let mut data = vec![];
-        for nal in nals(annexb).into_iter().filter(|n| !matches!(n[0] & 0x1F, 7..=9)) {
-            data.extend((nal.len() as u32).to_be_bytes());
-            data.extend_from_slice(nal);
-        }
-        self.block(1, ts, key, &data)
+        let n: Vec<_> = nals(annexb).into_iter().filter(|n| !matches!(n[0] & 0x1F, 7..=9)).collect();
+        let len = n.iter().map(|nal| 4 + nal.len()).sum();
+        self.block(1, ts, key, len, |out| {
+            for nal in n {
+                out.extend((nal.len() as u32).to_be_bytes());
+                out.extend_from_slice(nal);
+            }
+        })
     }
 
     /// Append one Opus packet, `ts` in ms.
     pub fn audio(&mut self, ts: u64, packet: &[u8]) -> io::Result<()> {
-        self.block(2, ts, false, packet)
+        self.block(2, ts, false, packet.len(), |out| out.extend_from_slice(packet))
     }
 
     /// Video keyframes start a cluster (and get a cue); so does a block too
     /// far from the cluster's timestamp for the 16-bit relative one. Audio
     /// trails video by ~0.1 s, so relative timestamps can be negative.
-    fn block(&mut self, track: u8, ts: u64, key: bool, data: &[u8]) -> io::Result<()> {
+    /// `fill` appends the `len` payload bytes.
+    fn block(&mut self, track: u8, ts: u64, key: bool, len: usize, fill: impl FnOnce(&mut Vec<u8>)) -> io::Result<()> {
         let mut out = vec![];
         if key || self.cluster.is_none_or(|(_, t)| (ts as i64 - t as i64).abs() > 30_000) {
             self.close_cluster()?;
@@ -168,10 +193,11 @@ impl Mkv {
         }
         let rel = (ts as i64 - self.cluster.unwrap().1 as i64) as i16;
         let flags = if key || track != 1 { 0x80 } else { 0 }; // every Opus packet decodes on its own
+        out.reserve(1 + 8 + 4 + len);
         out.extend(id(0xA3));
-        out.extend(size(4 + data.len()));
+        out.extend(size(4 + len));
         out.extend([0x80 | track, (rel >> 8) as u8, rel as u8, flags]);
-        out.extend_from_slice(data);
+        fill(&mut out);
         self.put(&out)
     }
 
@@ -210,5 +236,72 @@ mod tests {
         assert_eq!(void(11).len(), 11);
         let s = [0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3, 0, 0, 0, 1, 0x65, 4, 0, 0];
         assert_eq!(nals(&s), [&[0x67, 1, 2][..], &[0x68, 3], &[0x65, 4]]);
+    }
+
+    /// The original byte-by-byte scan, kept as the reference.
+    fn nals_ref(b: &[u8]) -> Vec<&[u8]> {
+        let mut starts = vec![];
+        let mut i = 0;
+        while i + 3 <= b.len() {
+            if b[i..i + 3] == [0, 0, 1] {
+                starts.push(i + 3);
+                i += 3;
+            } else {
+                i += 1;
+            }
+        }
+        let ends = starts.iter().skip(1).map(|&s| s - 3).chain([b.len()]);
+        starts
+            .iter()
+            .zip(ends)
+            .map(|(&s, e)| {
+                let mut nal = &b[s..e];
+                while let [rest @ .., 0] = nal {
+                    nal = rest;
+                }
+                nal
+            })
+            .filter(|n| !n.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn nals_match_reference() {
+        let mut cases: Vec<Vec<u8>> = vec![
+            vec![],
+            vec![0],
+            vec![0, 0],
+            vec![0, 0, 1],
+            vec![0, 0, 0, 1],
+            vec![0, 0, 1, 0x65, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            vec![0, 0, 0, 1, 0x67, 1, 0, 0, 0, 0, 0, 1, 0x68, 2, 0, 0, 1, 0x65, 3, 0, 0, 0],
+            vec![0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1],
+            vec![0x41, 0, 7, 0, 0, 2, 9, 0, 0, 3, 0, 0, 1, 0x41, 0, 0, 3, 1, 0, 0, 2, 0, 5, 0],
+            vec![9, 9, 9, 0, 0, 1, 0x65, 0, 1, 0, 0, 0, 0, 1, 0x41],
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 0, 0],
+        ];
+        // every length 0..=40 of a stream with start codes near chunk edges
+        let base = [0, 0, 0, 1, 0x67, 5, 6, 7, 0, 0, 1, 0x68, 0, 0, 2, 0, 0, 0, 1, 0x65, 1, 2, 3, 4, 5, 6, 7, 0, 0, 1, 0x41, 0, 0, 3, 8, 9, 0, 0, 1, 0x01, 0];
+        cases.extend((0..=base.len()).map(|n| base[..n].to_vec()));
+        // pseudo-random 20 KB, mostly nonzero, with zeros and start codes sprinkled in
+        let mut x = 12345u32;
+        let mut rnd = || {
+            x = x.wrapping_mul(1103515245).wrapping_add(12345);
+            x >> 16
+        };
+        let mut r = vec![];
+        while r.len() < 20_000 {
+            match rnd() % 64 {
+                0 => r.extend([0, 0, 1]),
+                1 => r.extend([0, 0, 0, 1]),
+                2 => r.extend([0, 0, rnd() as u8 % 4]),
+                3..=6 => r.push(0),
+                _ => r.push(rnd() as u8),
+            }
+        }
+        cases.push(r);
+        for c in &cases {
+            assert_eq!(nals(c), nals_ref(c), "{c:?}");
+        }
     }
 }
