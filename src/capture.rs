@@ -425,13 +425,15 @@ impl Capture {
         Ok(std::mem::take(&mut self.events))
     }
 
-    /// Sleep until the screen changes, an event arrives, or `timeout` passes.
-    pub fn wait(&mut self, timeout: Duration) -> Res<()> {
+    /// Sleep until the screen changes, an event arrives, or `timeout` passes
+    /// (a Duration, or an Option of one: None means no limit).
+    pub fn wait(&mut self, timeout: impl Into<Option<Duration>>) -> Res<()> {
         self.conn.flush()?; // small requests (moves, repaints) sit in a buffer until then
         self.drain_events()?;
         if self.pending.is_none() && self.events.is_empty() {
+            let ms = timeout.into().map_or(-1, |t| t.as_millis().min(i32::MAX as u128) as i32);
             let mut fd = libc::pollfd { fd: self.conn.stream().as_raw_fd(), events: libc::POLLIN, revents: 0 };
-            unsafe { libc::poll(&mut fd, 1, timeout.as_millis() as i32) };
+            unsafe { libc::poll(&mut fd, 1, ms) };
             self.drain_events()?;
         }
         Ok(())

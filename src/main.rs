@@ -432,7 +432,7 @@ fn gui() -> Res<()> {
     let (pid, mid, bid) = (panel.id, modal.id, badge.id);
     let mut thru = false; // a press began in a transparent margin: the drag belongs to the overlay
     loop {
-        cap.wait(Duration::from_millis(if moving || moving_set { 8 } else { 50 }))?;
+        cap.wait((moving || moving_set).then_some(Duration::from_millis(8)))?; // the next animation frame, else sleep until an event
         let (mut redraw, mut reshape, mut restyle) = (false, false, false); // panel, overlay, settings
         macro_rules! close_settings {
             () => {
@@ -968,7 +968,7 @@ fn record(cap: &mut Capture, path: &Path, opts: &RecOpts, mut pill: Option<Pill>
             if let Some(d) = (last + tick).checked_duration_since(Instant::now()) {
                 std::thread::sleep(d);
             }
-            cap.wait(tick)?;
+            cap.wait(Some(tick))?;
             // Nothing changed -> no capture, no encode: a still screen costs ~0.
             let Some(rows) = cap.changed()? else { continue };
             last = Instant::now();
