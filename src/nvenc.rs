@@ -4,9 +4,10 @@
 //! at runtime: without one the program still runs, and records on the CPU.
 
 use crate::Res;
+use crate::dylib::{self, sym};
 use crate::nvenc_sys::*;
 use std::ffi::{CStr, c_char, c_void};
-use std::mem::{transmute_copy, zeroed};
+use std::mem::zeroed;
 use std::ptr::null_mut;
 use std::sync::OnceLock;
 
@@ -49,17 +50,16 @@ struct Driver {
     create_instance: unsafe extern "C" fn(*mut NV_ENCODE_API_FUNCTION_LIST) -> NVENCSTATUS,
 }
 
-/// `name` from `lib` as the function pointer type `F`.
-unsafe fn sym<F>(lib: *mut c_void, name: &CStr) -> Option<F> {
-    let p = unsafe { libc::dlsym(lib, name.as_ptr()) };
-    (!p.is_null()).then(|| unsafe { transmute_copy::<*mut c_void, F>(&p) })
-}
+/// The CUDA driver and NVENC libraries (no NVIDIA driver on macOS).
+#[cfg(not(windows))]
+const LIBS: [&CStr; 2] = [c"libcuda.so.1", c"libnvidia-encode.so.1"];
+#[cfg(windows)]
+const LIBS: [&CStr; 2] = [c"nvcuda.dll", c"nvEncodeAPI64.dll"];
 
 fn driver() -> Option<&'static Driver> {
     static D: OnceLock<Option<Driver>> = OnceLock::new();
     let load = || unsafe {
-        let open = |lib: &CStr| Some(libc::dlopen(lib.as_ptr(), libc::RTLD_NOW)).filter(|h| !h.is_null());
-        let (cuda, nvenc) = (open(c"libcuda.so.1")?, open(c"libnvidia-encode.so.1")?);
+        let (cuda, nvenc) = (dylib::open(LIBS[0])?, dylib::open(LIBS[1])?);
         Some(Driver {
             init: sym(cuda, c"cuInit")?,
             device_get: sym(cuda, c"cuDeviceGet")?,

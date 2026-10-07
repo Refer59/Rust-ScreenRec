@@ -6,6 +6,7 @@
 mod i18n;
 mod audio;
 mod capture;
+mod dylib;
 mod frame;
 mod mkv;
 mod nvenc;

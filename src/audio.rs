@@ -4,10 +4,12 @@
 //! doesn't change.
 
 use crate::Res;
+use crate::dylib::{self, sym};
 use std::collections::VecDeque;
-use std::ffi::c_void;
+use std::ffi::{CStr, c_void};
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Instant;
 
@@ -29,12 +31,34 @@ pub enum Output {
 
 pub const OUTPUTS: [Output; 3] = [Output::None, Output::System, Output::Window];
 
-#[link(name = "libopus.so.0", kind = "dylib", modifiers = "+verbatim")]
-unsafe extern "C" {
-    fn opus_encoder_create(fs: i32, channels: i32, application: i32, error: *mut i32) -> *mut c_void;
-    fn opus_encoder_ctl(st: *mut c_void, request: i32, ...) -> i32;
-    fn opus_encode(st: *mut c_void, pcm: *const i16, frame_size: i32, data: *mut u8, max_data_bytes: i32) -> i32;
-    fn opus_encoder_destroy(st: *mut c_void);
+/// libopus, loaded at run time: without it we record without sound.
+struct Opus {
+    encoder_create: unsafe extern "C" fn(fs: i32, channels: i32, application: i32, error: *mut i32) -> *mut c_void,
+    encoder_ctl: unsafe extern "C" fn(st: *mut c_void, request: i32, ...) -> i32,
+    encode: unsafe extern "C" fn(st: *mut c_void, pcm: *const i16, frame_size: i32, data: *mut u8, max_data_bytes: i32) -> i32,
+    encoder_destroy: unsafe extern "C" fn(st: *mut c_void),
+}
+
+#[cfg(target_os = "linux")]
+const OPUS_LIBS: &[&CStr] = &[c"libopus.so.0"];
+#[cfg(target_os = "macos")]
+const OPUS_LIBS: &[&CStr] = &[c"libopus.0.dylib", c"/opt/homebrew/lib/libopus.0.dylib", c"/usr/local/lib/libopus.0.dylib"];
+#[cfg(windows)]
+const OPUS_LIBS: &[&CStr] = &[c"opus.dll", c"libopus-0.dll"];
+
+fn opus() -> Res<&'static Opus> {
+    static O: OnceLock<Option<Opus>> = OnceLock::new();
+    let load = || unsafe {
+        let lib = OPUS_LIBS.iter().find_map(|n| dylib::open(n))?;
+        Some(Opus {
+            encoder_create: sym(lib, c"opus_encoder_create")?,
+            encoder_ctl: sym(lib, c"opus_encoder_ctl")?,
+            encode: sym(lib, c"opus_encode")?,
+            encoder_destroy: sym(lib, c"opus_encoder_destroy")?,
+        })
+    };
+    let missing = || tr!("sound needs the Opus library (libopus)", "el sonido necesita la biblioteca Opus (libopus)", "音声には Opus ライブラリ (libopus) が必要です");
+    O.get_or_init(load).as_ref().ok_or_else(|| missing().into())
 }
 const OPUS_APPLICATION_AUDIO: i32 = 2049;
 const OPUS_SET_BITRATE: i32 = 4002;
@@ -129,13 +153,14 @@ pub struct Audio {
     scanned: Instant,
     mix: VecDeque<i32>, // interleaved stereo sums, starting at frame `base`
     base: i64,          // next frame to encode, counted from the start
+    opus: &'static Opus,
     enc: *mut c_void,
     pre_skip: u16,
 }
 
 impl Drop for Audio {
     fn drop(&mut self) {
-        unsafe { opus_encoder_destroy(self.enc) };
+        unsafe { (self.opus.encoder_destroy)(self.enc) };
     }
 }
 
@@ -146,15 +171,16 @@ impl Audio {
         if output == Output::None && !mic {
             return Ok(None);
         }
+        let opus = opus()?;
         let mut err = 0;
-        let enc = unsafe { opus_encoder_create(RATE as i32, 2, OPUS_APPLICATION_AUDIO, &mut err) };
+        let enc = unsafe { (opus.encoder_create)(RATE as i32, 2, OPUS_APPLICATION_AUDIO, &mut err) };
         if enc.is_null() {
             return Err(format!("opus_encoder_create: error {err}").into());
         }
         let mut lookahead = 0i32;
         unsafe {
-            opus_encoder_ctl(enc, OPUS_SET_BITRATE, 128_000i32);
-            opus_encoder_ctl(enc, OPUS_GET_LOOKAHEAD, &mut lookahead as *mut i32);
+            (opus.encoder_ctl)(enc, OPUS_SET_BITRATE, 128_000i32);
+            (opus.encoder_ctl)(enc, OPUS_GET_LOOKAHEAD, &mut lookahead as *mut i32);
         }
         let mut a = Audio {
             sources: vec![],
@@ -162,6 +188,7 @@ impl Audio {
             scanned: Instant::now(),
             mix: VecDeque::new(),
             base: 0,
+            opus,
             enc,
             pre_skip: lookahead as u16,
         };
@@ -234,7 +261,7 @@ impl Audio {
             for v in pcm.iter_mut() {
                 *v = self.mix.pop_front().unwrap_or(0).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
             }
-            let n = unsafe { opus_encode(self.enc, pcm.as_ptr(), FRAME as i32, out.as_mut_ptr(), out.len() as i32) };
+            let n = unsafe { (self.opus.encode)(self.enc, pcm.as_ptr(), FRAME as i32, out.as_mut_ptr(), out.len() as i32) };
             if n < 0 {
                 return Err(format!("opus_encode: error {n}").into());
             }
@@ -255,5 +282,21 @@ mod tests {
         mix_in(&mut mix, 100, 102, &[1, 2, 3, 4]); // two frames at 102..104
         mix_in(&mut mix, 100, 98, &[10, 10, 20, 20, 30, 30, 40, 40, 50, 50]); // 98..103: first two too late
         assert_eq!(Vec::from(mix), [30, 30, 40, 40, 51, 52, 3, 4]);
+    }
+
+    #[test]
+    fn opus_loads_at_run_time() {
+        let Ok(opus) = opus() else { return }; // not installed: sound is optional
+        let mut err = 0;
+        let enc = unsafe { (opus.encoder_create)(RATE as i32, 2, OPUS_APPLICATION_AUDIO, &mut err) };
+        assert!(!enc.is_null(), "error {err}");
+        let mut lookahead = 0i32;
+        let mut out = [0u8; 4000];
+        let n = unsafe {
+            (opus.encoder_ctl)(enc, OPUS_GET_LOOKAHEAD, &mut lookahead as *mut i32);
+            (opus.encode)(enc, [0i16; FRAME * 2].as_ptr(), FRAME as i32, out.as_mut_ptr(), out.len() as i32)
+        };
+        unsafe { (opus.encoder_destroy)(enc) };
+        assert!(lookahead > 0 && n > 0, "lookahead {lookahead}, packet {n}");
     }
 }
