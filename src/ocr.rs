@@ -433,11 +433,16 @@ mod tests {
         assert!((t[6 * 2] - (20.0 / 255.0 - 0.5) / 0.5).abs() < 1e-6, "second plane is the G channel");
     }
 
-    /// This process's CPU time so far (all threads), in ms.
+    /// This process's CPU time so far (all threads), in ms; 0 where there's no getrusage (Windows).
     fn cpu_ms() -> u64 {
-        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
-        unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
-        (ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) as u64 * 1000 + (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) as u64 / 1000
+        #[cfg(unix)]
+        {
+            let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+            unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+            (ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) as u64 * 1000 + (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) as u64 / 1000
+        }
+        #[cfg(not(unix))]
+        0
     }
 
     /// A PNG as BGRX.
