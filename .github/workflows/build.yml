@@ -39,16 +39,22 @@ jobs:
           ${{ matrix.wrap }} target/${{ matrix.target }}/release/screenrec shot shot.png
           test -s shot.png
         if: ${{ matrix.shot }}
-      # OCR: the runtime and the models download on first use into
-      # screenrec's cache folder; keep them between runs.
+      # OCR: `screenrec install` downloads ONNX Runtime and the models into
+      # desktop::data_dir()/ocr (checksummed, skipped when already there); keep
+      # them between runs, keyed on the pins.
       - uses: actions/cache@v4
         if: ${{ matrix.ocr }}
         with:
           path: |
-            ~/.cache/screenrec
-            ~/Library/Caches/screenrec
-            ~/AppData/Local/screenrec
-          key: ocr-${{ matrix.target }}-${{ hashFiles('src/**/*ocr*') }}
+            ~/.local/share/screenrec/ocr
+            ~/Library/Application Support/screenrec/ocr
+            ~/AppData/Local/screenrec/ocr
+          key: ocr-${{ matrix.target }}-${{ hashFiles('src/ocr_files.rs') }}
+      # Without GNOME the shortcut part only warns; the files must install (or exit 1).
+      - run: target/${{ matrix.target }}/release/screenrec install
+        if: ${{ matrix.ocr && !matrix.rosetta }}
+      - run: if arch -x86_64 /usr/bin/true; then target/${{ matrix.target }}/release/screenrec install; fi
+        if: ${{ matrix.ocr && matrix.rosetta }}
       # Known text in, the same text out: the runtime loads and the models read it, no screen needed.
       - run: cargo test --target ${{ matrix.target }} -- --ignored --test-threads 1 ocr
         if: ${{ matrix.ocr && !matrix.rosetta }}

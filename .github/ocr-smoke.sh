@@ -51,7 +51,9 @@ MINGW* | MSYS* | CYGWIN*)
     clip_text() { pwsh_run 'Get-Clipboard -Raw'; }
     clip_image() { [ "$(pwsh_run 'Add-Type -AssemblyName System.Windows.Forms; [Windows.Forms.Clipboard]::ContainsImage()')" = True ]; }
     show() {
-        JA_FONT=1 # Yu Gothic / Meiryo ship with Windows
+        # Japanese only where the font is there (a Windows Server runner may lack it)
+        JA_FONT=$(pwsh_run "Add-Type -AssemblyName System.Drawing; [Drawing.FontFamily]::Families.Name -contains 'Yu Gothic UI'")
+        [ "$JA_FONT" = True ] || JA_FONT=
         pwsh_run "Add-Type -AssemblyName System.Windows.Forms
             \$f = New-Object Windows.Forms.Form -Property @{ TopMost = \$true; WindowState = 'Maximized'; BackColor = 'White'; FormBorderStyle = 'None' }
             \$l = New-Object Windows.Forms.Label -Property @{ Text = \"$LATIN\`n$JA\"; AutoSize = \$true; ForeColor = 'Black'; Location = '40,80' }
