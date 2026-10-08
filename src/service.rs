@@ -2,7 +2,6 @@
 //! every target: to start detached from whoever starts it, a per-user
 //! endpoint that one process at a time serves (a Unix socket, a named pipe on
 //! Windows), and files downloaded into the cache.
-#![allow(dead_code)] // until the OCR service uses it
 
 use crate::Res;
 #[cfg(windows)]

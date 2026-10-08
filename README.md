@@ -39,12 +39,14 @@ This builds and installs `screenrec` to `~/.cargo/bin` and binds the launcher to
 
 ```sh
 screenrec                                  # launcher: screenshot or recording
-screenrec shot [file.png|.jpg]             # full-screen screenshot
-screenrec rec [file.mkv|.mp4] [-r FPS] [--window ID] [--cpu]
-screenrec install                          # set up the GNOME shortcut
+screenrec shot [file.png|.jpg] [--ocr] [--clip]   # full-screen screenshot
+screenrec rec [file.mkv|.mp4] [-r FPS] [--window ID] [--cpu] [--ocr] [--ocr-every S]
+screenrec install                          # set up the GNOME shortcut and the text recognition files
 ```
 
 `rec` records until Ctrl+C or SIGTERM. Max FPS is 60 on the GPU and 30 on the CPU; `--cpu` forces CPU encoding. Files go to your Pictures and Videos folders by default.
+
+Text recognition (`--ocr`, or the switch under Area in the launcher) reads English, Spanish and Japanese on this machine with PaddleOCR's PP-OCRv6 models on ONNX Runtime; `screenrec install` downloads them (about 60 MB) into your data folder, and nothing is downloaded at any other time. A screenshot's text goes to `<file>.txt`, or with `--clip` to the clipboard instead of the image; a recording's goes to `<video>.txt`, one line per text seen, with the video time and the clock (`00:01:02.500 (14:03:22) - the text`), read every `S` seconds (0.5 to 5, default 2). A background service does the reading after the capture, so neither the shutter nor the recording waits for it.
 
 In the launcher, pick Area, Screen or Window, then screenshot or recording. Enter or Space captures and Esc closes. Tab and the arrow keys move a focus ring over the controls; with the ring showing, Enter or Space activates the focused one. While you drag an area, its size is shown below it; in Window mode it shows the window's name and size.
 

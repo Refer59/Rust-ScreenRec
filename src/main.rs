@@ -17,6 +17,11 @@ mod mkv;
 mod nvenc;
 #[allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code, unused_imports, clippy::all)]
 mod nvenc_sys;
+mod ocr;
+mod ocr_files;
+mod ocrd;
+#[allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code, unused_imports, clippy::all)]
+mod ort_sys;
 #[cfg(target_os = "linux")]
 mod select;
 mod service;
@@ -55,25 +60,34 @@ fn usage() -> String {
     tr!(
         "usage:
   screenrec                             launcher: screenshot or recording (selection, screen or window)
-  screenrec shot [file.png|.jpg]        full-screen screenshot
-  screenrec rec [file.mkv|.mp4] [-r FPS] [--window ID] [--cpu]
+  screenrec shot [file.png|.jpg] [--ocr] [--clip]
+                                        full-screen screenshot; --ocr: its text to <file>.txt, or with --clip to the
+                                        clipboard; --clip alone: the image to the clipboard
+  screenrec rec [file.mkv|.mp4] [-r FPS] [--window ID] [--cpu] [--ocr] [--ocr-every S]
                                         record the screen (or a window) until Ctrl+C / SIGTERM
-                                        (max FPS: 60 on the GPU, 30 without it; --cpu: no GPU even if there is one)
-  screenrec install                     keyboard shortcut for the launcher ('-' if it has none yet)",
+                                        (max FPS: 60 on the GPU, 30 without it; --cpu: no GPU even if there is one;
+                                        --ocr: the text seen, with its times, to <file>.txt, read every S seconds: 0.5-5, 2 by default)
+  screenrec install                     keyboard shortcut for the launcher ('-' if it has none yet) and the text recognition files",
         "uso:
   screenrec                             interfaz: captura o grabación (selección, pantalla o ventana)
-  screenrec shot [archivo.png|.jpg]     captura de pantalla completa
-  screenrec rec [archivo.mkv|.mp4] [-r FPS] [--window ID] [--cpu]
+  screenrec shot [archivo.png|.jpg] [--ocr] [--clip]
+                                        captura de pantalla completa; --ocr: su texto a <archivo>.txt, o con --clip al
+                                        portapapeles; --clip solo: la imagen al portapapeles
+  screenrec rec [archivo.mkv|.mp4] [-r FPS] [--window ID] [--cpu] [--ocr] [--ocr-every S]
                                         graba la pantalla (o una ventana) hasta Ctrl+C / SIGTERM
-                                        (máx. FPS: 60 con GPU, 30 sin ella; --cpu: sin GPU aunque haya)
-  screenrec install                     atajo de teclado para la interfaz ('-' si aún no tiene)",
+                                        (máx. FPS: 60 con GPU, 30 sin ella; --cpu: sin GPU aunque haya;
+                                        --ocr: el texto visto, con sus tiempos, a <archivo>.txt, leído cada S segundos: 0.5-5, 2 por defecto)
+  screenrec install                     atajo de teclado para la interfaz ('-' si aún no tiene) y los archivos del reconocimiento de texto",
         "使い方:
   screenrec                             ランチャー: スクリーンショットまたは録画 (選択範囲、画面、ウィンドウ)
-  screenrec shot [ファイル.png|.jpg]    画面全体のスクリーンショット
-  screenrec rec [ファイル.mkv|.mp4] [-r FPS] [--window ID] [--cpu]
+  screenrec shot [ファイル.png|.jpg] [--ocr] [--clip]
+                                        画面全体のスクリーンショット。--ocr: そのテキストを <ファイル>.txt に、--clip も付ければ
+                                        クリップボードに。--clip のみ: 画像をクリップボードに
+  screenrec rec [ファイル.mkv|.mp4] [-r FPS] [--window ID] [--cpu] [--ocr] [--ocr-every S]
                                         Ctrl+C / SIGTERM まで画面 (またはウィンドウ) を録画
-                                        (最大 FPS: GPU で 60、なしで 30。--cpu: GPU があっても使わない)
-  screenrec install                     ランチャーのキーボードショートカット (未設定なら '-')"
+                                        (最大 FPS: GPU で 60、なしで 30。--cpu: GPU があっても使わない。
+                                        --ocr: 映ったテキストを時刻付きで <ファイル>.txt に、S 秒ごとに読み取る: 0.5-5、既定 2)
+  screenrec install                     ランチャーのキーボードショートカット (未設定なら '-') とテキスト認識のファイル"
     )
 }
 
@@ -93,9 +107,10 @@ fn main() {
     }
     let res = match args.first().map(String::as_str) {
         None => gui(),
-        Some("shot") => shot(args.get(1)),
+        Some("shot") => shot(&args[1..]),
         Some("rec") => rec(&args[1..]),
         Some("install") => install(),
+        Some("ocrd") => ocrd::serve(), // the text recognition service, started by its first client
         #[cfg(target_os = "linux")]
         Some(desktop::CLIP_OWNER) => desktop::own_clipboard(args.get(1)),
         _ => {
@@ -112,31 +127,59 @@ fn main() {
     }
 }
 
-/// Point our GNOME shortcut at this executable; '-' unless one was already picked.
+/// Point our GNOME shortcut at this executable ('-' unless one was already picked), and
+/// install the text recognition files. Without GNOME (a server, CI) the shortcut is skipped.
 #[cfg(target_os = "linux")]
 fn install() -> Res<()> {
     let accel = shortcut::get().unwrap_or_else(|| "minus".into());
-    shortcut::set(&accel)?;
-    println!("{}", tr!("launcher shortcut: {}", "atajo de la interfaz: {}", "ランチャーのショートカット: {}", shortcut::pretty(&accel)));
-    Ok(())
+    match shortcut::set(&accel) {
+        Ok(()) => println!("{}", tr!("launcher shortcut: {}", "atajo de la interfaz: {}", "ランチャーのショートカット: {}", shortcut::pretty(&accel))),
+        Err(e) => println!("{}", tr!("launcher shortcut: not set, this isn't GNOME ({})", "atajo de la interfaz: sin configurar, esto no es GNOME ({})", "ランチャーのショートカット: 未設定、GNOME ではありません ({})", e)),
+    }
+    ocr_files::install(&mut std::io::stdout())
 }
 
-fn shot(out: Option<&String>) -> Res<()> {
+fn shot(args: &[String]) -> Res<()> {
+    let (mut out, mut ocr, mut clip) = (None, false, false);
+    for a in args {
+        match a.as_str() {
+            "--ocr" => ocr = true,
+            "--clip" => clip = true,
+            p if !p.starts_with("--") => out = Some(PathBuf::from(p)),
+            p => return Err(tr!("unknown option {}", "opción desconocida {}", "不明なオプション {}", p).into()),
+        }
+    }
+    if ocr {
+        ocr_files::files()?; // a clear error before anything is captured
+    }
     let mut cap = Capture::new()?;
     freeze(&mut cap)?;
-    let path = out.map(PathBuf::from).unwrap_or_else(|| default_path("PICTURES", &shot_prefix(), "png"));
-    save_image(cap.frame(), cap.sw, (0, 0, cap.sw as i32, cap.sh as i32), None, &path)?;
+    let path = out.unwrap_or_else(|| default_path("PICTURES", &shot_prefix(), "png"));
+    let (w, h) = (cap.sw, cap.sh);
+    let img = save_image(cap.frame(), w, (0, 0, w as i32, h as i32), None, &path)?;
     println!("{}", path.display());
+    // The text (or the image) is wanted after the file: the same bytes go on, no re-read.
+    if ocr {
+        ocrd::shot(&img, w, h, w * 4, &path, clip, false)?;
+    } else if clip {
+        desktop::copy_image(&img, w, h, w * 4)?;
+    }
     Ok(())
 }
 
 fn rec(args: &[String]) -> Res<()> {
-    let (mut opts, mut path, mut window) = (RecOpts { fps: None, gpu: true, sound: None }, None, None);
+    let (mut opts, mut path, mut window) = (RecOpts { fps: None, gpu: true, sound: None, ocr: None }, None, None);
+    let (mut ocr, mut every) = (false, ocrd::EVERY_DEFAULT);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "-r" => opts.fps = Some(it.next().and_then(|v| v.parse().ok()).filter(|f| (1..=240).contains(f)).ok_or(tr!("-r expects 1..240", "-r espera 1..240", "-r には 1..240 を指定してください"))?),
             "--cpu" => opts.gpu = false,
+            "--ocr" => ocr = true,
+            "--ocr-every" => {
+                let secs: f32 = it.next().and_then(|v| v.parse().ok()).ok_or(tr!("--ocr-every expects seconds (0.5 to 5)", "--ocr-every espera segundos (0.5 a 5)", "--ocr-every には秒数を指定してください (0.5〜5)"))?;
+                (ocr, every) = (true, ocrd::every_clamp(secs));
+            }
             "--window" => {
                 let id = it.next().ok_or(tr!("--window expects the window id", "--window espera el id de la ventana", "--window にはウィンドウ ID を指定してください"))?;
                 let id = id.strip_prefix("0x").map_or_else(|| id.parse().ok(), |h| u32::from_str_radix(h, 16).ok());
@@ -152,6 +195,10 @@ fn rec(args: &[String]) -> Res<()> {
         _ => return Err(tr!("recordings are .mkv or .mp4", "se graba en .mkv o .mp4", "録画は .mkv または .mp4 のみです").into()),
     };
     let rec_path = if mp4 { path.with_extension("rec.mkv") } else { path.clone() }; // MP4 comes out of the MKV at the end
+    if ocr {
+        ocr_files::files()?; // a clear error before anything is recorded
+        opts.ocr = Some((path.with_extension("txt"), every));
+    }
     let mut cap = Capture::new()?;
     let target = match window {
         Some(w) => Target::Window(w, cap.window_area(w)?),
@@ -165,12 +212,14 @@ fn rec(args: &[String]) -> Res<()> {
 }
 
 /// How to record: frame rate cap (default: 60 on the GPU, 30 on the CPU,
-/// where encoding is what costs), GPU or not, and the sound (output,
-/// microphone, the pid whose sound "Window" means).
+/// where encoding is what costs), GPU or not, the sound (output, microphone,
+/// the pid whose sound "Window" means), and text recognition (the .txt to
+/// write, how often to read the screen in seconds).
 struct RecOpts {
     fps: Option<u32>,
     gpu: bool,
     sound: Option<(Output, bool, Option<u32>)>,
+    ocr: Option<(PathBuf, f32)>,
 }
 
 /// What a recording captures: part of the screen, or one window (client id,
@@ -840,13 +889,15 @@ fn shutter(mut cap: Capture, ov: &mut select::Overlay, (windows, fade): (&[&ui::
         let (w, h) = ((r.2 - r.0) as usize, (r.3 - r.1) as usize);
         return std::thread::scope(|s| {
             // Errors cross the thread as Strings; the copy's own failure doesn't undo the saved file.
-            let saved = s.spawn(|| -> Result<Option<String>, String> {
+            let saved = s.spawn(|| -> Result<(Option<String>, Option<String>), String> {
                 let img = save_image(frame, sw, r, last.pointer.then_some(cursor), &path).map_err(|e| e.to_string())?;
-                // With the text recognized, the clipboard gets the text instead.
-                Ok(if last.clip && !text { desktop::copy_image(&img, w, h, w * 4).err().map(|e| e.to_string()) } else { None })
+                // With the text recognized, the clipboard gets the text instead: the same bytes
+                // go to the service, which answers with its own notification when it has read them.
+                let read_failed = text.then(|| ocrd::shot(&img, w, h, w * 4, &path, last.clip, true).err().map(|e| e.to_string())).flatten();
+                Ok((if last.clip && !text { desktop::copy_image(&img, w, h, w * 4).err().map(|e| e.to_string()) } else { None }, read_failed))
             });
             fade_out(&cap.conn, fade, &ours)?;
-            let copy_failed = saved.join().map_err(|_| "the screenshot could not be saved")??;
+            let (copy_failed, read_failed) = saved.join().map_err(|_| "the screenshot could not be saved")??;
             let title = match last.clip && !text && copy_failed.is_none() {
                 true => tr!("Screenshot saved and copied", "Captura guardada y copiada", "スクリーンショットを保存してコピーしました"),
                 false => tr!("Screenshot saved", "Captura guardada", "スクリーンショットを保存しました"),
@@ -855,25 +906,67 @@ fn shutter(mut cap: Capture, ov: &mut select::Overlay, (windows, fade): (&[&ui::
             if let Some(e) = copy_failed {
                 notify(&tr!("Couldn't copy the screenshot", "No se pudo copiar la captura", "スクリーンショットをコピーできませんでした"), &e, None);
             }
+            if let Some(e) = read_failed {
+                notify(&tr!("Couldn't read the text", "No se pudo leer el texto", "テキストを読み取れませんでした"), &e, None);
+            }
             Ok(())
         });
     }
-    // A recording waits until the launcher is gone: none of it may end up in the video.
-    fade.hurry();
-    fade_out(&cap.conn, fade, &ours)?;
-    if STOP.load(Relaxed) {
-        return Ok(()); // the shortcut again while it faded: that's a cancel
-    }
-    ov.release(&cap.conn)?;
-    for w in windows {
-        cap.conn.unmap_window(w.id)?;
-    }
-    let pill = ui::Pill::new(&cap, fonts, scale)?;
-    cap.overlay = Some(pill.win.sprite());
-    cap.draw_pointer = last.pointer;
     let path = default_path("VIDEOS", &rec_prefix(), "mkv");
-    let opts = RecOpts { fps: None, gpu: last.gpu, sound: Some((last.output, last.mic, app)) };
-    record(&mut cap, &path, &opts, Some(pill), Some(windows[0].sprite()), target)?;
+    let opts = RecOpts { fps: None, gpu: last.gpu, sound: Some((last.output, last.mic, app)), ocr: text.then(|| (path.with_extension("txt"), last.ocr_every)) };
+    cap.draw_pointer = last.pointer;
+    if let Target::Window(..) = target {
+        // A window is recorded from its own pixmap, where the launcher never shows: the
+        // recording starts at once, and the launcher fades out meanwhile on a thread with
+        // its own connection (this one is the recording's).
+        cap.conn.ungrab_keyboard(CURRENT_TIME)?;
+        fade.go(0.0);
+        let pill = ui::Pill::new(&cap, fonts, scale)?;
+        let res = std::thread::scope(|s| {
+            let fading = s.spawn(|| -> Result<(), String> {
+                let mut fade_out = || -> Res<()> {
+                    let (conn, _) = x11rb::connect(None)?;
+                    loop {
+                        let done = !fade.busy();
+                        fade.apply(&conn, &ours)?;
+                        conn.flush()?;
+                        if done {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(8));
+                    }
+                    for &w in &ours {
+                        conn.unmap_window(w)?;
+                    }
+                    Ok(conn.flush()?)
+                };
+                fade_out().map_err(|e| e.to_string()) // a String crosses threads, the error type doesn't
+            });
+            let rec = record(&mut cap, &path, &opts, Some(pill), None, target);
+            let _ = fading.join(); // done long ago
+            rec
+        });
+        ov.release(&cap.conn)?;
+        res?;
+    } else {
+        // An area is cut from the screen, so it waits until the launcher is gone: none of
+        // it may end up in the video.
+        fade.hurry();
+        fade_out(&cap.conn, fade, &ours)?;
+        if STOP.load(Relaxed) {
+            return Ok(()); // the shortcut again while it faded: that's a cancel
+        }
+        ov.release(&cap.conn)?;
+        for w in windows {
+            cap.conn.unmap_window(w.id)?;
+        }
+        let pill = ui::Pill::new(&cap, fonts, scale)?;
+        cap.overlay = Some(pill.win.sprite());
+        record(&mut cap, &path, &opts, Some(pill), Some(windows[0].sprite()), target)?;
+    }
+    if !path.exists() {
+        return Ok(()); // stopped before the first frame
+    }
     let path = match last.mp4 {
         true => to_mp4(&path, &path.with_extension("mp4")).unwrap_or_else(|e| {
             notify(&tr!("Saved as MKV instead", "Se guardó como MKV", "MKV のまま保存しました"), &e.to_string(), None);
@@ -985,9 +1078,11 @@ fn gui() -> Res<()> {
     Err(msg.into())
 }
 
+/// The text recognition files; the launcher (and its shortcut) is Linux-only for now.
 #[cfg(not(target_os = "linux"))]
 fn install() -> Res<()> {
-    Err(tr!("the launcher shortcut is GNOME-only for now", "por ahora el atajo de la interfaz es solo para GNOME", "ランチャーのショートカットは今のところ GNOME 専用です").into())
+    println!("{}", tr!("the launcher shortcut is GNOME-only for now", "por ahora el atajo de la interfaz es solo para GNOME", "ランチャーのショートカットは今のところ GNOME 専用です"));
+    ocr_files::install(&mut std::io::stdout())
 }
 
 /// The H.264 encoder: NVENC on the GPU, another GPU encoder through ffmpeg
@@ -1137,6 +1232,10 @@ fn record(cap: &mut Capture, path: &Path, opts: &RecOpts, mut pill: Option<Pill>
             None
         })
     });
+    // Text recognition reads frames at the end of the pipeline: the service connects on its
+    // own thread, gets a frame every `every` seconds at most, one at a time, and never holds
+    // up a frame; if it goes away, the recording goes on without it.
+    let mut text = opts.ocr.as_ref().map(|(txt, every)| ocrd::Video::start(txt.clone(), *every, pill.is_some()));
     let mut mkv: Option<mkv::Mkv> = None;
     let (mut frames, mut last_ts, mut last_key) = (0u64, 0u64, 0u64);
     // Write a frame; the first one (with SPS/PPS) creates the file.
@@ -1213,6 +1312,15 @@ fn record(cap: &mut Capture, path: &Path, opts: &RecOpts, mut pill: Option<Pill>
                 put(&mut mkv, &mut last_key, unit)?;
             }
             (frames, last_ts) = (frames + 1, ts);
+            if let Some(t) = text.as_mut()
+                && let Err(e) = t.offer(cap.frame(), (w, h, cap.view.w * 4), ts)
+            {
+                eprintln!("{e}");
+                if pill.is_some() {
+                    notify(&tr!("Recording without text recognition", "Grabando sin reconocimiento de texto", "テキスト認識なしで録画しています"), &e.to_string(), None);
+                }
+                text = None;
+            }
         }
         Ok(())
     })();

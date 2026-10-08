@@ -49,6 +49,12 @@ pub fn cache_dir() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into())).join("Library/Caches/screenrec")
 }
 
+/// Where we keep files installed for good (the text recognizer's runtime and
+/// models, put there by `screenrec install`): ~/Library/Application Support/screenrec.
+pub fn data_dir() -> PathBuf {
+    PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into())).join("Library/Application Support/screenrec")
+}
+
 /// Unix time `secs` as local (year, month, day, hour, minute, second).
 pub fn local_time(secs: u64) -> (i32, i32, i32, i32, i32, i32) {
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };

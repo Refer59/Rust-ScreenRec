@@ -46,6 +46,14 @@ pub fn cache_dir() -> PathBuf {
     xdg.unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into())).join(".cache")).join("screenrec")
 }
 
+/// Where we keep files installed for good (the text recognizer's runtime and
+/// models, put there by `screenrec install`): $XDG_DATA_HOME/screenrec, else
+/// ~/.local/share/screenrec.
+pub fn data_dir() -> PathBuf {
+    let xdg = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).filter(|d| d.is_absolute());
+    xdg.unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into())).join(".local/share")).join("screenrec")
+}
+
 /// Unix time `secs` as local (year, month, day, hour, minute, second).
 pub fn local_time(secs: u64) -> (i32, i32, i32, i32, i32, i32) {
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
@@ -66,7 +74,6 @@ pub fn copy_image(bgrx: &[u8], w: usize, h: usize, stride: usize) -> Res<()> {
 
 /// Put `text` on the clipboard. It stays there after we exit, until something
 /// else is copied.
-#[allow(dead_code)] // until the OCR copies what it read
 pub fn copy_text(text: &str) -> Res<()> {
     clip(TEXT, text.as_bytes())
 }

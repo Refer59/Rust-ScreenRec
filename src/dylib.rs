@@ -13,7 +13,6 @@ pub fn open(name: &CStr) -> Option<*mut c_void> {
 
 /// The library at `path`, a file of ours (say, in the cache): never a
 /// system copy of the same name, and fine with any characters in the path.
-#[allow(dead_code)] // until the OCR loads its runtime
 pub fn open_path(path: &Path) -> Option<*mut c_void> {
     Some(unsafe { load_path(path) }).filter(|h| !h.is_null())
 }
