@@ -1002,6 +1002,7 @@ fn shutter(mut cap: Capture, ov: &mut select::Overlay, (windows, fade): (&[&ui::
                 fade_out().map_err(|e| e.to_string()) // a String crosses threads, the error type doesn't
             });
             let rec = record(&mut cap, &path, &opts, Some(pill), None, target);
+            RECORDING.store(true, Relaxed); // failed before its first frame (no encoder): the launcher goes now, not in 3 s
             let _ = fading.join(); // done long ago
             rec
         });
