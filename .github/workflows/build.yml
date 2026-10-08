@@ -65,6 +65,12 @@ jobs:
         if: ${{ matrix.ocr && matrix.shot && runner.os == 'Linux' }}
       - run: ${{ matrix.wrap }} bash .github/ocr-smoke.sh target/${{ matrix.target }}/release/screenrec ocr-smoke
         if: ${{ matrix.ocr && matrix.shot }}
+      # What a failed check saw: the screenshots, the .txt files, the recording.
+      - uses: actions/upload-artifact@v4
+        if: ${{ failure() && matrix.ocr && matrix.shot }}
+        with:
+          name: ocr-smoke-${{ matrix.target }}
+          path: ocr-smoke
       # Informational: the runner may not grant screen recording to the job.
       - run: bash .github/ocr-smoke.sh target/${{ matrix.target }}/release/screenrec ocr-smoke
         if: ${{ matrix.ocr && runner.os == 'macOS' && !matrix.rosetta }}
