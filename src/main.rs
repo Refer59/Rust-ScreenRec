@@ -997,7 +997,10 @@ fn shutter(mut cap: Capture, ov: &mut select::Overlay, (windows, fade): (&[&ui::
                     for &w in &ours {
                         conn.unmap_window(w)?;
                     }
-                    Ok(conn.flush()?)
+                    // A round trip before this connection closes: a server busy with the recording's
+                    // grabs sees the hang-up first and drops what it hasn't read, the launcher stays up.
+                    conn.get_input_focus()?.reply()?;
+                    Ok(())
                 };
                 fade_out().map_err(|e| e.to_string()) // a String crosses threads, the error type doesn't
             });
