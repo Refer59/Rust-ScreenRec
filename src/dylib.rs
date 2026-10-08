@@ -64,10 +64,15 @@ unsafe extern "system" {
 mod tests {
     #[test]
     fn open_path_loads_a_system_library_by_its_full_path() {
-        #[cfg(target_os = "linux")]
-        let lib = std::path::Path::new(if cfg!(target_arch = "aarch64") { "/lib/aarch64-linux-gnu/libc.so.6" } else { "/lib/x86_64-linux-gnu/libc.so.6" });
-        #[cfg(target_os = "macos")]
-        let lib = std::path::Path::new("/usr/lib/libSystem.B.dylib");
+        // The C library this process already uses, by the full path it was loaded from
+        // (distributions and cross sysroots keep it in different folders).
+        #[cfg(unix)]
+        let lib = &{
+            use std::os::unix::ffi::OsStrExt;
+            let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+            assert!(unsafe { libc::dladdr(libc::malloc as *const std::ffi::c_void, &mut info) } != 0);
+            std::path::PathBuf::from(std::ffi::OsStr::from_bytes(unsafe { std::ffi::CStr::from_ptr(info.dli_fname) }.to_bytes()))
+        };
         #[cfg(windows)]
         let lib = &std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32").join("kernel32.dll");
         assert!(super::open_path(lib).is_some(), "{}", lib.display());
