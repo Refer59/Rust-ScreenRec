@@ -1,7 +1,7 @@
 //! What a background helper (the OCR service) needs from the OS, the same on
 //! every target: to start detached from whoever starts it, a per-user
-//! endpoint that one process at a time serves (a Unix socket, a named pipe on
-//! Windows), and files downloaded into the cache.
+//! endpoint that one process at a time serves (a Unix socket, a named pipe per
+//! logon session on Windows), and files downloaded into the cache.
 
 use crate::Res;
 #[cfg(windows)]
@@ -157,13 +157,17 @@ pub struct Listener {
     next: std::os::windows::io::OwnedHandle, // the pipe instance the next client gets
 }
 
-/// The pipe for `name`, NUL-terminated UTF-16. Pipe names are machine-wide: one per user.
+/// The pipe for `name`, NUL-terminated UTF-16. Pipe names are machine-wide: one per user and
+/// logon session, since a service reaches the clipboard of its own session only.
 /// ponytail: another local user could create it first and get our clients;
 /// a random per-user name kept in data_dir() fixes that if it matters.
 #[cfg(windows)]
 fn pipe(name: &str) -> Vec<u16> {
+    use windows_sys::Win32::System::{RemoteDesktop::ProcessIdToSessionId, Threading::GetCurrentProcessId};
     let user = std::env::var("USERNAME").unwrap_or_default();
-    format!(r"\\.\pipe\screenrec-{name}-{user}").encode_utf16().chain([0]).collect()
+    let mut session = 0;
+    unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) };
+    format!(r"\\.\pipe\screenrec-{name}-{user}-{session}").encode_utf16().chain([0]).collect()
 }
 
 /// A new instance of the pipe `name`; `first` fails if the pipe already exists.

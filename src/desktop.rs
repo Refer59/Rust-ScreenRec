@@ -3,10 +3,12 @@
 //! macos/desktop.rs have the same functions.
 
 use crate::Res;
+use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use x11rb::connection::{Connection, RequestConnection as _};
 use x11rb::protocol::Event;
@@ -23,7 +25,54 @@ pub const GET_FFMPEG: &str = "sudo apt install ffmpeg";
 
 pub fn notify(title: &str, body: &str, icon: Option<&Path>) {
     let icon = icon.map_or("media-record".into(), |p| p.display().to_string());
-    let _ = std::process::Command::new("notify-send").args(["-a", "screenrec", "-i", &icon, title, body]).spawn();
+    let _ = helper("notify-send").args(["-a", "screenrec", "-i", &icon, title, body]).spawn();
+}
+
+/// The desktop session our helpers (notify-send, wl-copy, the clipboard's owner) start in:
+/// ours, but for what `act_in` set.
+static ACT_IN: Mutex<Vec<(String, Option<String>)>> = Mutex::new(Vec::new());
+
+/// What places us in our desktop session, for a service that acts for us (the OCR service, for
+/// its clipboard copy and notification): the display and its authorization, D-Bus, the runtime
+/// folder, and the PATH the helpers are found in; None for what isn't set. A value that isn't
+/// UTF-8 stays out (the service keeps its own).
+pub fn session_env() -> Vec<(String, Option<String>)> {
+    let vars = ["DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "PATH"];
+    vars.into_iter()
+        .filter_map(|k| match std::env::var(k) {
+            Ok(v) => Some((k.to_owned(), Some(v))),
+            Err(std::env::VarError::NotPresent) => Some((k.to_owned(), None)),
+            Err(std::env::VarError::NotUnicode(_)) => None,
+        })
+        .collect()
+}
+
+/// From now on, start our helpers in the desktop session `env` (a client's `session_env`)
+/// instead of ours. The OCR service does it for each job: it serves every display of the user,
+/// and outlives the session it was started from (an X server restarted on the same display
+/// has a new XAUTHORITY, and the old one no longer opens it).
+pub fn act_in(env: Vec<(String, Option<String>)>) {
+    *ACT_IN.lock().unwrap() = env;
+}
+
+/// The program `name`, to start in the session we act in.
+fn helper(name: impl AsRef<OsStr>) -> Command {
+    let mut cmd = Command::new(name);
+    for (k, v) in ACT_IN.lock().unwrap().iter() {
+        match v {
+            Some(v) => cmd.env(k, v),
+            None => cmd.env_remove(k),
+        };
+    }
+    cmd
+}
+
+/// Whether the session we act in is a Wayland one.
+fn wayland() -> bool {
+    match ACT_IN.lock().unwrap().iter().find(|(k, _)| k == "WAYLAND_DISPLAY") {
+        Some((_, v)) => v.is_some(),
+        None => std::env::var_os("WAYLAND_DISPLAY").is_some(),
+    }
 }
 
 /// The user's folder for `xdg_dir` (PICTURES, VIDEOS), else their home.
@@ -93,8 +142,8 @@ fn copy_failed() -> String {
 /// clipboard manager to hand it to (GNOME 42 on X11 runs none: nobody owns
 /// CLIPBOARD_MANAGER). On Wayland, wl-copy does the same job.
 fn clip(mime: &str, data: &[u8]) -> Res<()> {
-    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-        let mut wl = Command::new("wl-copy").args(["--type", mime]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|_| {
+    if wayland() {
+        let mut wl = helper("wl-copy").args(["--type", mime]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|_| {
             tr!(
                 "copying to the clipboard on Wayland needs wl-copy (sudo apt install wl-clipboard)",
                 "copiar al portapapeles en Wayland necesita wl-copy (sudo apt install wl-clipboard)",
@@ -105,7 +154,7 @@ fn clip(mime: &str, data: &[u8]) -> Res<()> {
         return if wl.wait()?.success() { Ok(()) } else { Err(copy_failed().into()) };
     }
     // Its own process group: a Ctrl+C or a `timeout` meant for us must leave the clipboard alone.
-    let mut owner = Command::new(std::env::current_exe()?);
+    let mut owner = helper(std::env::current_exe()?);
     owner.args([CLIP_OWNER, mime]).current_dir("/").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).process_group(0);
     let mut owner = owner.spawn()?;
     let _ = owner.stdin.take().unwrap().write_all(data);
@@ -260,5 +309,25 @@ impl Owner {
         conn.send_event(false, e.requestor, EventMask::NO_EVENT, note)?;
         conn.flush()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn helpers_start_in_the_session_we_act_in() {
+        // The client's variables, those it has and those it hasn't, over ours (PATH is surely set here).
+        act_in(vec![("DISPLAY".into(), Some(":77".into())), ("PATH".into(), None), ("WAYLAND_DISPLAY".into(), Some("wayland-9".into()))]);
+        let out = helper("/usr/bin/env").output(); // not a shell: it would make up a PATH
+        let on_wayland = wayland();
+        act_in(Vec::new());
+        let out = String::from_utf8(out.unwrap().stdout).unwrap();
+        let mut got: Vec<_> = out.lines().filter(|l| ["DISPLAY=", "PATH=", "WAYLAND_DISPLAY="].iter().any(|v| l.starts_with(v))).collect();
+        got.sort();
+        assert_eq!(got, ["DISPLAY=:77", "WAYLAND_DISPLAY=wayland-9"]);
+        assert!(on_wayland);
+        assert_eq!(wayland(), std::env::var_os("WAYLAND_DISPLAY").is_some(), "ours again");
     }
 }

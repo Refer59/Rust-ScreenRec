@@ -4,7 +4,12 @@
 //! asked: a .txt next to the image or video, or the text on the clipboard, with a notification
 //! for the launcher's users. Nothing of this runs, or is even loaded, unless text recognition
 //! is on.
+//!
+//! Each request carries its client's language and desktop session, and the copy and the
+//! notification happen there: the service serves every display of the user, and outlives the
+//! session it was started from (an X server restarted on the same display, a re-login).
 
+use crate::i18n::{self, LANGS, Lang};
 use crate::service::{self, Conn};
 use crate::{Res, desktop, ocr, ocr_files};
 use std::collections::{HashSet, VecDeque};
@@ -21,47 +26,73 @@ pub fn every_clamp(v: f32) -> f32 {
     if v.is_finite() { v.clamp(0.5, 5.0) } else { EVERY_DEFAULT }
 }
 
-const MAGIC: &[u8; 4] = b"OCR1";
+const MAGIC: &[u8; 4] = b"OCR2";
+/// The service's endpoint: one per user (per logon session on Windows) for all displays, since
+/// each request says where its copy and notification go. A new name with each new MAGIC: a
+/// service of an older screenrec, still running, is never asked.
+const ENDPOINT: &str = "ocr2";
 const IDLE_EXIT: Duration = Duration::from_secs(300);
 const MAX_PIXELS: u64 = 64 << 20; // 8K is 33 M
 
 // ---------------------------------------------------------------------------------------------
 // Protocol: a header, then one image (a screenshot) or images until the client hangs up (a
 // recording, each image answered with one byte once it is done). Little-endian.
-//   header: MAGIC, video u8, notify u8, clipboard u8, 0, path len u32, path (UTF-8)
+//   header: MAGIC, video u8, notify u8, clipboard u8, language u8 (index in LANGS),
+//           path len u32, path (UTF-8), env len u32, env (UTF-8: "NAME=value\0", "NAME\0" if unset)
 //   image:  w u32, h u32, video ms u64, wall-clock s u64, w*h*4 bytes of BGRX
-// `path` is the .txt to write (or, for the clipboard, the image it came from, for messages).
+// `path` is the .txt to write (or, for the clipboard, the image it came from, for messages);
+// `env` is the client's desktop session (desktop::session_env).
 
 struct Header {
     video: bool,
     notify: bool,
     clipboard: bool,
+    lang: Lang,
     path: PathBuf,
+    env: Vec<(String, Option<String>)>,
 }
 
 impl Header {
+    /// A request of ours: in our language, for our desktop session.
+    fn ours(video: bool, notify: bool, clipboard: bool, path: PathBuf) -> Header {
+        Header { video, notify, clipboard, lang: i18n::lang(), path, env: desktop::session_env() }
+    }
+
     fn write(&self, w: &mut impl Write) -> std::io::Result<()> {
-        let path = self.path.to_string_lossy();
-        w.write_all(MAGIC)?;
-        w.write_all(&[self.video as u8, self.notify as u8, self.clipboard as u8, 0])?;
-        w.write_all(&(path.len() as u32).to_le_bytes())?;
-        w.write_all(path.as_bytes())
+        let lang = LANGS.iter().position(|&l| l == self.lang).unwrap() as u8;
+        let env: String = self.env.iter().map(|(k, v)| v.as_ref().map_or(format!("{k}\0"), |v| format!("{k}={v}\0"))).collect();
+        let mut head = Vec::new();
+        head.extend_from_slice(MAGIC);
+        head.extend_from_slice(&[self.video as u8, self.notify as u8, self.clipboard as u8, lang]);
+        for s in [&*self.path.to_string_lossy(), &env] {
+            head.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            head.extend_from_slice(s.as_bytes());
+        }
+        w.write_all(&head)
     }
 
     fn read(r: &mut impl Read) -> Res<Header> {
-        let mut head = [0u8; 12];
+        let mut head = [0u8; 8];
         r.read_exact(&mut head)?;
-        if &head[..4] != MAGIC || head[7] != 0 {
-            return Err("not a screenrec OCR request".into());
-        }
-        let len = u32::from_le_bytes(head[8..12].try_into().unwrap()) as usize;
-        if len > 4096 {
-            return Err("path too long".into());
-        }
-        let mut path = vec![0u8; len];
-        r.read_exact(&mut path)?;
-        Ok(Header { video: head[4] != 0, notify: head[5] != 0, clipboard: head[6] != 0, path: PathBuf::from(String::from_utf8(path)?) })
+        let lang = LANGS.get(head[7] as usize).copied().filter(|_| &head[..4] == MAGIC).ok_or("not a screenrec OCR request")?;
+        let path = PathBuf::from(read_str(r, 4096)?);
+        let env = read_str(r, 1 << 20)?;
+        let env = env.split_terminator('\0').map(|e| e.split_once('=').map_or((e.to_owned(), None), |(k, v)| (k.to_owned(), Some(v.to_owned())))).collect();
+        Ok(Header { video: head[4] != 0, notify: head[5] != 0, clipboard: head[6] != 0, lang, path, env })
     }
+}
+
+/// A string sent as its length (u32) and UTF-8 bytes, `max` bytes at most.
+fn read_str(r: &mut impl Read, max: usize) -> Res<String> {
+    let mut len = [0u8; 4];
+    r.read_exact(&mut len)?;
+    let len = u32::from_le_bytes(len) as usize;
+    if len > max {
+        return Err("request too long".into());
+    }
+    let mut s = vec![0u8; len];
+    r.read_exact(&mut s)?;
+    Ok(String::from_utf8(s)?)
 }
 
 struct Image {
@@ -112,15 +143,6 @@ fn read_image(r: &mut impl Read) -> Res<Option<Image>> {
     Ok(Some(Image { w, h, ms: u64_at(8), wall: u64_at(16), bgrx }))
 }
 
-/// The service's endpoint: one per X display, since the service keeps its first client's
-/// environment and that is where its clipboard copies and notifications go.
-fn endpoint() -> String {
-    match std::env::var("DISPLAY") {
-        Ok(d) if !d.is_empty() => format!("ocr-{}", d.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect::<String>()),
-        _ => "ocr".to_owned(),
-    }
-}
-
 // ---------------------------------------------------------------------------------------------
 // Clients.
 
@@ -128,14 +150,13 @@ fn endpoint() -> String {
 /// installed: nothing is started for nothing.
 fn connect() -> Res<Conn> {
     ocr_files::files()?;
-    let endpoint = endpoint();
-    if let Ok(c) = service::connect(&endpoint) {
+    if let Ok(c) = service::connect(ENDPOINT) {
         return Ok(c);
     }
     service::spawn_detached(&["ocrd"])?;
     let give_up = Instant::now() + Duration::from_secs(5);
     loop {
-        match service::connect(&endpoint) {
+        match service::connect(ENDPOINT) {
             Ok(c) => return Ok(c),
             Err(e) if Instant::now() > give_up => return Err(tr!("the text recognition service didn't start: {}", "el servicio de reconocimiento de texto no arrancó: {}", "テキスト認識サービスが起動しませんでした: {}", e).into()),
             Err(_) => std::thread::sleep(Duration::from_millis(20)),
@@ -147,7 +168,7 @@ fn connect() -> Res<Conn> {
 /// `<image without extension>.txt`, or to the clipboard; `notify` for a notification when done.
 /// Returns as soon as the service has the pixels.
 pub fn shot(bgrx: &[u8], w: usize, h: usize, stride: usize, image: &Path, clipboard: bool, notify: bool) -> Res<()> {
-    let header = Header { video: false, notify, clipboard, path: if clipboard { image.to_owned() } else { image.with_extension("txt") } };
+    let header = Header::ours(false, notify, clipboard, if clipboard { image.to_owned() } else { image.with_extension("txt") });
     let send = || -> Res<()> {
         let mut c = connect()?;
         header.write(&mut c)?;
@@ -174,7 +195,7 @@ impl Video {
     pub fn start(txt: PathBuf, every: f32, notify: bool) -> Video {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let header = Header { video: true, notify, clipboard: false, path: txt };
+            let header = Header::ours(true, notify, false, txt);
             let _ = tx.send(connect().and_then(|mut c| header.write(&mut c).map(|()| c).map_err(Into::into)).map_err(|e| e.to_string()));
         });
         Video { pending: Some(rx), sender: None, idle: Arc::new(AtomicBool::new(true)), dead: Arc::new(AtomicBool::new(false)), every: Duration::from_secs_f32(every_clamp(every)), last: None }
@@ -233,10 +254,9 @@ impl Video {
 // ---------------------------------------------------------------------------------------------
 // The service.
 
-/// A recording being followed: its file, what was already written, and the way back to it.
+/// A recording being followed: its request (the .txt), what was already written, and the way back to it.
 struct Session {
-    txt: PathBuf,
-    notify: bool,
+    head: Header,
     seen: Mutex<HashSet<String>>,
     ack: Mutex<Conn>,
 }
@@ -283,7 +303,7 @@ impl Queue {
 
 /// Serve until idle for five minutes; returns at once if another process already serves.
 pub fn serve() -> Res<()> {
-    let Some(mut listener) = service::listen(&endpoint())? else { return Ok(()) };
+    let Some(mut listener) = service::listen(ENDPOINT)? else { return Ok(()) };
     desktop::lower_priority();
     let q = Arc::new(Queue::default());
     let worker = q.clone();
@@ -309,7 +329,7 @@ fn client(mut conn: Conn, q: &Queue) -> Res<()> {
         q.push(Work::Shot(header, image));
         return Ok(());
     }
-    let session = Arc::new(Session { txt: header.path, notify: header.notify, seen: Mutex::default(), ack: Mutex::new(conn.try_clone()?) });
+    let session = Arc::new(Session { head: header, seen: Mutex::default(), ack: Mutex::new(conn.try_clone()?) });
     let res = (|| -> Res<()> {
         while let Some(image) = read_image(&mut conn)? {
             q.push(Work::Frame(session.clone(), image));
@@ -324,6 +344,13 @@ fn worker_loop(q: &Queue) {
     let mut engine: Option<ocr::Engine> = None;
     loop {
         let work = q.next();
+        // The client's language for what we say, its desktop session for what we copy and show.
+        let h = match &work {
+            Work::Shot(h, _) => h,
+            Work::Frame(s, _) | Work::End(s) => &s.head,
+        };
+        i18n::set(h.lang);
+        desktop::act_in(h.env.clone());
         let engine = match &mut engine {
             Some(e) => e,
             slot => match ocr_files::files().and_then(|f| ocr::Engine::load(&f)) {
@@ -380,7 +407,7 @@ fn run(engine: &ocr::Engine, work: Work) -> Res<()> {
                     }
                 }
                 if !out.is_empty() {
-                    std::fs::OpenOptions::new().append(true).create(true).open(&s.txt)?.write_all(out.as_bytes())?;
+                    std::fs::OpenOptions::new().append(true).create(true).open(&s.head.path)?.write_all(out.as_bytes())?;
                 }
                 Ok(())
             });
@@ -388,13 +415,14 @@ fn run(engine: &ocr::Engine, work: Work) -> Res<()> {
             res
         }
         Work::End(s) => {
-            let had_text = s.txt.is_file();
+            let (txt, notify) = (&s.head.path, s.head.notify);
+            let had_text = txt.is_file();
             if !had_text {
-                std::fs::write(&s.txt, "")?; // "nothing was read" is an answer too
+                std::fs::write(txt, "")?; // "nothing was read" is an answer too
             }
             match had_text {
-                true => note(s.notify, &tr!("Text saved", "Texto guardado", "テキストを保存しました"), &s.txt.display().to_string()),
-                false => note(s.notify, &tr!("No text found", "No se encontró texto", "テキストが見つかりませんでした"), &s.txt.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
+                true => note(notify, &tr!("Text saved", "Texto guardado", "テキストを保存しました"), &txt.display().to_string()),
+                false => note(notify, &tr!("No text found", "No se encontró texto", "テキストが見つかりませんでした"), &txt.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
             }
             Ok(())
         }
@@ -418,14 +446,16 @@ mod tests {
 
     #[test]
     fn header_and_image_round_trip() {
-        let h = Header { video: true, notify: false, clipboard: true, path: PathBuf::from("/tmp/ñ 日本/clip.txt") };
+        // The client's session: what it has (values with '=' too) and what it hasn't.
+        let env = vec![("DBUS_SESSION_BUS_ADDRESS".into(), Some("unix:path=/run/user/1000/bus".into())), ("XAUTHORITY".into(), None), ("DISPLAY".into(), Some(":1".into()))];
+        let h = Header { video: true, notify: false, clipboard: true, lang: Lang::Ja, path: PathBuf::from("/tmp/ñ 日本/clip.txt"), env };
         let mut bytes = Vec::new();
         h.write(&mut bytes).unwrap();
         let bgrx: Vec<u8> = (0..3 * 2 * 4 * 2).map(|i| i as u8).collect(); // 3x2, stride 24 of which 12 used
         write_image(&mut bytes, &bgrx, (3, 2, 24), 61_001).unwrap();
         let mut r = bytes.as_slice();
         let back = Header::read(&mut r).unwrap();
-        assert!((back.video, back.notify, back.clipboard) == (true, false, true) && back.path == h.path);
+        assert!((back.video, back.notify, back.clipboard, back.lang) == (true, false, true, Lang::Ja) && back.path == h.path && back.env == h.env);
         let img = read_image(&mut r).unwrap().unwrap();
         assert_eq!((img.w, img.h, img.ms), (3, 2, 61_001));
         assert_eq!(img.bgrx, [&bgrx[..12], &bgrx[24..36]].concat());

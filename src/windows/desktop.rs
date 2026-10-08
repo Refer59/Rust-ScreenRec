@@ -24,6 +24,16 @@ pub fn notify(title: &str, body: &str, _icon: Option<&Path>) {
     eprintln!("{title}: {body}");
 }
 
+/// What places us in our desktop session, for a service that acts for us: nothing here. A
+/// service we start runs in our logon session (its pipe is per session, see service.rs) and
+/// reaches the clipboard in-process.
+pub fn session_env() -> Vec<(String, Option<String>)> {
+    Vec::new()
+}
+
+/// Act in the desktop session `env` (a client's `session_env`): ours already.
+pub fn act_in(_env: Vec<(String, Option<String>)>) {}
+
 /// The user's Pictures or Videos folder (wherever it was moved, e.g. to
 /// OneDrive), else their profile folder.
 pub fn user_dir(xdg_dir: &str) -> PathBuf {

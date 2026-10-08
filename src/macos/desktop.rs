@@ -35,6 +35,16 @@ pub fn notify(title: &str, body: &str, _icon: Option<&Path>) {
     let _ = cmd.args([title, body]).spawn();
 }
 
+/// What places us in our desktop session, for a service that acts for us: nothing here. A user
+/// has one GUI session, and the service reaches the pasteboard and Notification Center from it
+/// like we do.
+pub fn session_env() -> Vec<(String, Option<String>)> {
+    Vec::new()
+}
+
+/// Act in the desktop session `env` (a client's `session_env`): ours already.
+pub fn act_in(_env: Vec<(String, Option<String>)>) {}
+
 /// The user's Pictures or Movies folder, else their home.
 pub fn user_dir(xdg_dir: &str) -> PathBuf {
     let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into()));
