@@ -88,7 +88,21 @@ fn load_error() -> String {
             return unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned();
         }
     }
-    std::io::Error::last_os_error().to_string()
+    let e = std::io::Error::last_os_error();
+    // "Module not found" although the DLL is there: a DLL it needs is missing, which for
+    // ONNX Runtime is the Visual C++ runtime (MSVCP140.dll, VCRUNTIME140.dll).
+    #[cfg(windows)]
+    {
+        if e.raw_os_error() == Some(126) {
+            let hint = tr!(
+                "a library it needs is missing: install the Microsoft Visual C++ Redistributable, https://aka.ms/vs/17/release/vc_redist.x64.exe",
+                "falta una biblioteca que necesita: instala el Microsoft Visual C++ Redistributable, https://aka.ms/vs/17/release/vc_redist.x64.exe",
+                "必要なライブラリがありません: Microsoft Visual C++ 再頒布可能パッケージをインストールしてください (https://aka.ms/vs/17/release/vc_redist.x64.exe)"
+            );
+            return format!("{e}; {hint}");
+        }
+    }
+    e.to_string()
 }
 
 fn reinstall() -> String {
@@ -98,7 +112,10 @@ fn reinstall() -> String {
 impl Engine {
     /// Load the runtime and both models from `files` (ocr_files::files()): ~0.3 s and ~90 MB.
     pub fn load(files: &Files) -> Res<Engine> {
-        let lib = dylib::open_path(&files.runtime).ok_or_else(|| tr!("couldn't load {}: {}", "no se pudo cargar {}: {}", "{} を読み込めませんでした: {}", files.runtime.display(), load_error()))?;
+        let lib = dylib::open_path(&files.runtime).ok_or_else(|| {
+            let why = load_error(); // first: on Windows, tr!'s own calls would overwrite the error
+            tr!("couldn't load {}: {}", "no se pudo cargar {}: {}", "{} を読み込めませんでした: {}", files.runtime.display(), why)
+        })?;
         let base: unsafe extern "C" fn() -> *const OrtApiBase = unsafe { dylib::sym(lib, c"OrtGetApiBase") }.ok_or_else(|| tr!("{} is not ONNX Runtime", "{} no es ONNX Runtime", "{} は ONNX Runtime ではありません", files.runtime.display()))?;
         let base = unsafe { &*base() };
         let version = unsafe { CStr::from_ptr(base.GetVersionString.unwrap()()) }.to_string_lossy().into_owned();
