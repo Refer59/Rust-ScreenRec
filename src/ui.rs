@@ -571,15 +571,18 @@ fn card(c: &mut Canvas, w: f32, h: f32, r: f32) {
 }
 
 /// Área's text switch, the settings' switch at half size around (0, 0): grey when
-/// off, the accent yellow when on; `h` is how hovered it is.
-fn mini_switch(c: &mut Canvas, v: f32, h: f32) {
-    c.paint(mix(mix(THUMB, TEXT2, 0.3 * h), YELLOW, v), rrect(-11.0, -6.0, 11.0, 6.0, 6.0));
-    c.paint(mix(mix(TEXT2, TEXT, h), BLACK, v), circle(-5.0 + 10.0 * v, 0.0, 4.5));
+/// off, the accent yellow when on; `h` is how hovered it is, `off` how disabled
+/// (the settings switch's look: a dim track, the knob where it was).
+fn mini_switch(c: &mut Canvas, v: f32, h: f32, off: f32) {
+    let h = h * (1.0 - off);
+    c.paint(mix(mix(mix(THUMB, TEXT2, 0.3 * h), YELLOW, v), WELL, off), rrect(-11.0, -6.0, 11.0, 6.0, 6.0));
+    c.paint(mix(mix(mix(TEXT2, TEXT, h), BLACK, v), mix(DISABLED, THUMB, v), off), circle(-5.0 + 10.0 * v, 0.0, 4.5));
 }
 
 /// What recognizing text will do now, for the switch's tooltip: off, or where the text goes.
-pub fn ocr_tip(on: bool, record: bool, clip: bool) -> String {
+pub fn ocr_tip(on: bool, record: bool, clip: bool, with_ui: bool) -> String {
     match (on, record, clip) {
+        _ if with_ui => tr!("Text recognition is off while including the UI", "Sin reconocimiento de texto al incluir la UI", "UI を含める間は文字を読み取りません"),
         (false, ..) => tr!("Text recognition is off", "Reconocimiento de texto apagado", "文字の読み取りはオフです"),
         (true, true, _) => tr!("The text will be saved to a .txt with timestamps", "El texto se guardará en un .txt con marcas de tiempo", "文字をタイムスタンプ付きで .txt に保存します"),
         (true, false, true) => tr!("The text will be copied to the clipboard", "El texto se copiará al portapapeles", "文字をクリップボードにコピーします"),
@@ -587,10 +590,11 @@ pub fn ocr_tip(on: bool, record: bool, clip: bool) -> String {
     }
 }
 
-/// A tooltip: one line in a dark capsule, the badge's look a little larger.
-pub fn tooltip(text: &str, font: Option<&FontVec>, scale: f32) -> Canvas {
+/// A tooltip: one line in a dark capsule, the badge's look a little larger; `a` fades it.
+pub fn tooltip(text: &str, font: Option<&FontVec>, scale: f32, a: f32) -> Canvas {
     let w = (font.map_or(120.0, |f| Canvas::width(f, text, 13.0)) + 24.0).ceil();
     let mut c = Canvas::new(w as usize, 28, scale);
+    c.alpha = a;
     c.paint(fade(BLACK, 0.92), rrect(0.0, 0.0, w, 28.0, 14.0));
     c.paint(HAIRLINE, stroke(rrect(0.5, 0.5, w - 0.5, 27.5, 13.5), 1.0));
     if let Some(f) = font {
@@ -605,6 +609,21 @@ pub fn tooltip_pos(sw: i32, sh: i32, scale: f32, (tw, th): (i32, i32)) -> (i32, 
     let x = px + ((M + cell_mid(0.0)) * scale).round() as i32 - tw / 2;
     let y = py + ((M - 8.0) * scale).round() as i32 - th;
     (x.clamp(0, (sw - tw).max(0)), y.max(0))
+}
+
+/// The caption under the panel while the capture includes the UI: the tooltip's capsule, at opacity `a`.
+pub fn ui_caption(font: Option<&FontVec>, scale: f32, a: f32) -> Canvas {
+    tooltip(&tr!("Capture including UI", "Capturar incluyendo UI", "UI を含めてキャプチャ"), font, scale, a)
+}
+
+/// The caption's gap under the panel's body, and its height (logical px).
+const CAPTION_GAP: f32 = 10.0;
+const CAPTION_H: f32 = 28.0;
+
+/// Where the `c`-sized caption goes: centred on the panel's body, `CAPTION_GAP` under it.
+pub fn caption_pos(sw: i32, sh: i32, scale: f32, (cw, _): (i32, i32)) -> (i32, i32) {
+    let (px, py) = place(sw, sh, scale).0;
+    (px + ((M + BODY.0 / 2.0) * scale).round() as i32 - cw / 2, py + ((M + BODY.1 + CAPTION_GAP) * scale).round() as i32)
 }
 
 /// A round close button: `h` is how hovered it is.
@@ -662,7 +681,7 @@ const BODY_R: f32 = 16.0;
 const PAD: f32 = 12.0;
 const PW: usize = 368;
 const PH: usize = 187;
-const SBODY: (f32, f32) = (BODY.0, SEG_LANG.1 + 20.0); // as wide as the panel: the two cards stack flush
+const SBODY: (f32, f32) = (BODY.0, SEG_LANG.1 + 18.0); // as wide as the panel: the two cards stack flush
 const SBODY_R: f32 = 14.0;
 pub const SW: usize = 368; // the settings popover, logical px
 pub const SH: usize = SBODY.1 as usize + 2 * M as usize;
@@ -743,6 +762,8 @@ pub struct PanelState<'a> {
     pub focus: Option<Hit>,
     /// Recognize text in an area (Área's switch).
     pub ocr: bool,
+    /// The capture is the whole screen with the launcher in it (`Last.with_ui`): Área's text switch is off.
+    pub with_ui: bool,
     pub scale: f32,
     tw: PanelTw,
 }
@@ -751,14 +772,15 @@ struct PanelTw {
     mode: Tween, // fractional index of the chosen mode
     record: Tween,
     ocr: Tween,
+    ui: Tween, // `with_ui`: the caption's opacity, and how disabled Área's switch looks
     hover: Hov<Hit>,
 }
 
 impl<'a> PanelState<'a> {
     pub fn new(mode: Mode, record: bool, (font, bold): (Option<&'a FontVec>, Option<&'a FontVec>), scale: f32) -> Self {
         let ix = MODES.iter().position(|&m| m == mode).unwrap() as f32;
-        let tw = PanelTw { mode: Tween::io(ix), record: Tween::io(record as u8 as f32), ocr: Tween::io(0.0), hover: Hov::new() };
-        PanelState { mode, record, hover: None, settings_open: false, font, bold, focus: None, ocr: false, scale, tw }
+        let tw = PanelTw { mode: Tween::io(ix), record: Tween::io(record as u8 as f32), ocr: Tween::io(0.0), ui: Tween::new(0.0), hover: Hov::new() };
+        PanelState { mode, record, hover: None, settings_open: false, font, bold, focus: None, ocr: false, with_ui: false, scale, tw }
     }
 
     /// Aim the tweens at the current state; call before every render.
@@ -767,12 +789,18 @@ impl<'a> PanelState<'a> {
         self.tw.mode.go(ix, 200.0);
         self.tw.record.go(self.record as u8 as f32, 180.0);
         self.tw.ocr.go(self.ocr as u8 as f32, 160.0);
+        self.tw.ui.go(self.with_ui as u8 as f32, 160.0);
         self.tw.hover.set(self.hover);
     }
 
     pub fn busy(&self) -> bool {
         let t = &self.tw;
-        t.mode.busy() || t.record.busy() || t.ocr.busy() || t.hover.t.busy()
+        t.mode.busy() || t.record.busy() || t.ocr.busy() || t.ui.busy() || t.hover.t.busy()
+    }
+
+    /// How much of the caption shows (0 to 1): its opacity.
+    pub fn ui_shown(&self) -> f32 {
+        self.tw.ui.get()
     }
 
     /// Jump every tween to the state (previews).
@@ -780,7 +808,7 @@ impl<'a> PanelState<'a> {
     pub fn settle(&mut self) {
         self.sync();
         let t = &mut self.tw;
-        for w in [&mut t.mode, &mut t.record, &mut t.ocr] {
+        for w in [&mut t.mode, &mut t.record, &mut t.ocr, &mut t.ui] {
             w.settle();
         }
         t.hover.settle(self.hover);
@@ -824,7 +852,7 @@ pub fn panel(s: &PanelState) -> Canvas {
     c.alpha = 1.0 - area;
     c.paint(YELLOW, circle(cell_mid(idx), DOT, 2.5));
     c.alpha = area;
-    c.scaled((cell_mid(0.0), DOT), 0.4 + 0.6 * area, |c| mini_switch(c, t.ocr.get(), hv(Hit::Ocr)));
+    c.scaled((cell_mid(0.0), DOT), 0.4 + 0.6 * area, |c| mini_switch(c, t.ocr.get(), hv(Hit::Ocr), t.ui.get()));
     c.alpha = 1.0;
 
     // photo | video
@@ -863,6 +891,8 @@ pub enum SetHit {
     ImageFormat(usize),
     Clip,
     Pointer,
+    /// Capture the whole screen with the launcher in it.
+    WithUi,
     Shortcut,
     Lang(usize),
     /// The OCR interval's counter: 0 −, 1 the field, 2 +.
@@ -870,7 +900,7 @@ pub enum SetHit {
 }
 
 /// Keyboard focus order.
-pub const SETTINGS_ORDER: [SetHit; 19] = [
+pub const SETTINGS_ORDER: [SetHit; 20] = [
     SetHit::Output(0),
     SetHit::Output(1),
     SetHit::Output(2),
@@ -885,6 +915,7 @@ pub const SETTINGS_ORDER: [SetHit; 19] = [
     SetHit::ImageFormat(1),
     SetHit::Clip,
     SetHit::Pointer,
+    SetHit::WithUi,
     SetHit::Shortcut,
     SetHit::Lang(0),
     SetHit::Lang(1),
@@ -905,9 +936,10 @@ const ROW_EVERY: f32 = 250.0;
 const ROW_SHOT: f32 = 294.0;
 const ROW_CLIP: f32 = 330.0;
 const ROW_POINTER: f32 = 366.0;
-const ROW_KEY: f32 = 410.0;
-const SEG_LANG: (f32, f32) = (464.0, 496.0);
-const DIVIDERS: [f32; 4] = [ROW_MIC + 22.0, ROW_EVERY + 22.0, ROW_POINTER + 22.0, ROW_KEY + 22.0];
+const ROW_UI: f32 = ROW_POINTER + 36.0;
+const ROW_KEY: f32 = ROW_UI + 44.0;
+const SEG_LANG: (f32, f32) = (ROW_KEY + 22.0, ROW_KEY + 54.0); // clear of the shortcut field's focus ring
+const DIVIDERS: [f32; 3] = [ROW_MIC + 22.0, ROW_EVERY + 22.0, ROW_UI + 22.0];
 
 /// Cell `i` of `n` across x0..x1 and y0..y1; `inset` 3 gives the thumb, its corners concentric with the well's.
 fn cell(x0: f32, x1: f32, (y0, y1): (f32, f32), n: usize, i: usize, inset: f32) -> Geo {
@@ -945,6 +977,7 @@ fn set_shape(h: SetHit) -> Geo {
         SetHit::Mic => switch_geo(ROW_MIC),
         SetHit::Gpu => switch_geo(ROW_GPU),
         SetHit::Pointer => switch_geo(ROW_POINTER),
+        SetHit::WithUi => switch_geo(ROW_UI),
         SetHit::Clip => switch_geo(ROW_CLIP),
         SetHit::Shortcut => Geo::Rect(PICK, ROW_KEY - 16.0, SX.1, ROW_KEY + 16.0, 8.0),
         SetHit::Every(i) => every_cell(i, 3.0),
@@ -962,6 +995,7 @@ fn set_hit(h: SetHit) -> Geo {
         SetHit::Mic => row_rect(ROW_MIC),
         SetHit::Gpu => row_rect(ROW_GPU),
         SetHit::Pointer => row_rect(ROW_POINTER),
+        SetHit::WithUi => row_rect(ROW_UI),
         SetHit::Clip => row_rect(ROW_CLIP),
         SetHit::Shortcut => set_shape(h),
         SetHit::Every(i) => every_cell(i, 0.0),
@@ -1056,6 +1090,8 @@ pub struct SettingsState<'a> {
     pub gpu_found: bool,
     pub jpg: bool,
     pub pointer: bool,
+    /// The capture is the whole screen with the launcher in it (`Last.with_ui`).
+    pub with_ui: bool,
     /// Copy photos to the clipboard; off limits while the panel is on video (`record`).
     pub clip: bool,
     pub record: bool,
@@ -1088,18 +1124,19 @@ struct SetTw {
     gpu: Tween,
     image: Tween,
     pointer: Tween,
+    ui: Tween,
     lang: Tween,
     clip: Tween,
     hover: Hov<SetHit>,
 }
 
 impl SetTw {
-    fn all(&mut self) -> [&mut Tween; 9] {
-        [&mut self.appear, &mut self.out, &mut self.mic, &mut self.video, &mut self.gpu, &mut self.image, &mut self.pointer, &mut self.lang, &mut self.clip]
+    fn all(&mut self) -> [&mut Tween; 10] {
+        [&mut self.appear, &mut self.out, &mut self.mic, &mut self.video, &mut self.gpu, &mut self.image, &mut self.pointer, &mut self.ui, &mut self.lang, &mut self.clip]
     }
 
     fn busy(&self) -> bool {
-        [&self.appear, &self.out, &self.mic, &self.video, &self.gpu, &self.image, &self.pointer, &self.lang, &self.clip].iter().any(|t| t.busy()) || self.hover.t.busy()
+        [&self.appear, &self.out, &self.mic, &self.video, &self.gpu, &self.image, &self.pointer, &self.ui, &self.lang, &self.clip].iter().any(|t| t.busy()) || self.hover.t.busy()
     }
 }
 
@@ -1118,11 +1155,12 @@ impl<'a> SettingsState<'a> {
             gpu: Tween::io(0.0),
             image: Tween::io(0.0),
             pointer: Tween::io(0.0),
+            ui: Tween::io(0.0),
             lang: Tween::io(lang_ix()),
             clip: Tween::io(0.0),
             hover: Hov::new(),
         };
-        SettingsState { output: 0, mic: false, mp4: false, gpu: false, gpu_found: false, jpg: false, pointer: false, clip: false, record: false, text: false, area: false, ocr_every: EVERY_DEFAULT, typing: None, shortcut: String::new(), capturing: false, hover: None, focus: None, font, bold, cjk, scale, tw }
+        SettingsState { output: 0, mic: false, mp4: false, gpu: false, gpu_found: false, jpg: false, pointer: false, with_ui: false, clip: false, record: false, text: false, area: false, ocr_every: EVERY_DEFAULT, typing: None, shortcut: String::new(), capturing: false, hover: None, focus: None, font, bold, cjk, scale, tw }
     }
 
     pub fn sync(&mut self) {
@@ -1135,6 +1173,7 @@ impl<'a> SettingsState<'a> {
         t.mic.go(f(self.mic), 160.0);
         t.gpu.go(f(self.gpu && self.gpu_found), 160.0);
         t.pointer.go(f(self.pointer), 160.0);
+        t.ui.go(f(self.with_ui), 160.0);
         t.clip.go(f(self.clip), 160.0);
         t.hover.set(self.hover);
     }
@@ -1285,7 +1324,7 @@ pub fn settings(s: &SettingsState) -> Canvas {
     segmented(&mut c, SX, SEG_OUT, &labels, t.out.get(), &|i| hv(SetHit::Output(i)));
 
     // rows: whole switch rows react to the pointer
-    for (h, cy) in [(SetHit::Mic, ROW_MIC), (SetHit::Gpu, ROW_GPU), (SetHit::Clip, ROW_CLIP), (SetHit::Pointer, ROW_POINTER)] {
+    for (h, cy) in [(SetHit::Mic, ROW_MIC), (SetHit::Gpu, ROW_GPU), (SetHit::Clip, ROW_CLIP), (SetHit::Pointer, ROW_POINTER), (SetHit::WithUi, ROW_UI)] {
         if (h != SetHit::Gpu || s.gpu_found) && (h != SetHit::Clip || !s.record) {
             let Geo::Rect(x0, y0, x1, y1, r) = row_rect(cy) else { unreachable!() };
             c.paint(fade(WHITE, 0.05 * hv(h)), rrect(x0, y0, x1, y1, r));
@@ -1314,6 +1353,7 @@ pub fn settings(s: &SettingsState) -> Canvas {
     lbl(&mut c, &tr!("Read text every", "Leer texto cada", "文字の読み取り間隔"), 15.0, 20.0, ROW_EVERY - 4.0, if on { TEXT } else { TEXT2 });
     let why = match (s.record, s.area, s.text) {
         (false, ..) => tr!("video only", "solo video", "動画のみ"),
+        _ if s.with_ui => tr!("off with the UI", "apagado con la UI", "UI を含めるとオフ"),
         (_, false, _) => tr!("Area only", "solo en Área", "範囲のみ"),
         (_, _, false) => tr!("text recognition off", "reconocimiento apagado", "文字の読み取りがオフ"),
         _ => tr!("while recording", "al grabar", "録画時"),
@@ -1340,6 +1380,14 @@ pub fn settings(s: &SettingsState) -> Canvas {
     lbl(&mut c, &tr!("Show pointer", "Mostrar cursor", "ポインターを表示"), 15.0, 20.0, ROW_POINTER + 5.0, TEXT);
     switch(&mut c, ROW_POINTER, t.pointer.get(), true);
 
+    // the whole screen with the launcher in it
+    let include = tr!("Include the UI", "Incluir la UI", "UI を含める");
+    lbl(&mut c, &include, 15.0, 20.0, ROW_UI + 5.0, TEXT);
+    if let Some(f) = f {
+        c.text(f, &tr!("whole screen", "toda la pantalla", "画面全体"), 12.0, 20.0 + Canvas::width(f, &include, 15.0) + 8.0, ROW_UI + 5.0, 0.0, TEXT2);
+    }
+    switch(&mut c, ROW_UI, t.ui.get(), true);
+
     // shortcut: shows the current one; click, then press the new keys
     lbl(&mut c, &tr!("Shortcut", "Atajo", "ショートカット"), 15.0, 20.0, ROW_KEY - 4.0, TEXT);
     let caption = if s.capturing { tr!("Esc to cancel", "Esc para cancelar", "Esc でキャンセル") } else { tr!("Opens screenrec", "Abre screenrec", "screenrec を開く") };
@@ -1352,7 +1400,6 @@ pub fn settings(s: &SettingsState) -> Canvas {
     }
 
     // language: each in its own name, so a wrong pick can be undone
-    section(&mut c, &tr!("Language", "Idioma", "言語"), SEG_LANG.0 - 10.0);
     let ja = if s.cjk.is_some() || crate::i18n::lang() == crate::i18n::Lang::Ja { "日本語".to_owned() } else { tr!("Japanese", "Japonés", "日本語") };
     let langs = [("English", f), ("Español", f), (ja.as_str(), s.cjk.or(f))];
     segmented(&mut c, SX, SEG_LANG, &langs, t.lang.get(), &|i| hv(SetHit::Lang(i)));
@@ -1592,10 +1639,11 @@ pub fn badge_pos(sel: Rect, (bw, bh): (i32, i32), (sw, sh): (i32, i32), gap: i32
     if sel.3 + gap + bh <= sh && !hidden { (x, y) } else { fit((sel.0 + gap, sel.1 + gap)) }
 }
 
-/// The panel's body on a `sw`×`sh` screen, in device px.
-pub fn panel_rect(sw: i32, sh: i32, scale: f32) -> Rect {
+/// The panel's body on a `sw`×`sh` screen, in device px; with `with_ui`, down to the caption's bottom.
+pub fn panel_rect(sw: i32, sh: i32, scale: f32, with_ui: bool) -> Rect {
     let ((x, y), m) = (place(sw, sh, scale).0, (M * scale).round() as i32);
-    (x + m, y + m, x + m + (BODY.0 * scale).round() as i32, y + m + (BODY.1 * scale).round() as i32)
+    let caption = if with_ui { ((CAPTION_GAP + CAPTION_H) * scale).ceil() as i32 } else { 0 };
+    (x + m, y + m, x + m + (BODY.0 * scale).round() as i32, y + m + (BODY.1 * scale).round() as i32 + caption)
 }
 
 const EDGE: i32 = 20; // where the pill rests, from the screen edge (logical px)
@@ -1921,7 +1969,7 @@ mod preview {
             let gap = (14.0 * SCALE).round() as i32;
             let with_badge = |full: &mut Vec<u32>, r: Rect, name: Option<&str>| {
                 let bc = badge(r.2 - r.0, r.3 - r.1, name, font, SCALE);
-                let (bx, by) = badge_pos(r, (bc.w as i32, bc.h as i32), (sw as i32, sh as i32), gap, panel_rect(sw as i32, sh as i32, SCALE));
+                let (bx, by) = badge_pos(r, (bc.w as i32, bc.h as i32), (sw as i32, sh as i32), gap, panel_rect(sw as i32, sh as i32, SCALE, false));
                 over(full, sw, &bc, bx as usize, by as usize);
             };
             let sel = (420, 260, 1240, 720);
@@ -1940,7 +1988,7 @@ mod preview {
                 s.ocr = on;
                 s.settle();
                 over(&mut full, sw, &panel(&s), px as usize, py as usize);
-                let t = tooltip(&ocr_tip(on, record, clip), font, SCALE);
+                let t = tooltip(&ocr_tip(on, record, clip, false), font, SCALE, 1.0);
                 let (tx, ty) = tooltip_pos(sw as i32, sh as i32, SCALE, (t.w as i32, t.h as i32));
                 over(&mut full, sw, &t, tx as usize, ty as usize);
                 let (x0, y0, cw) = (560, 740, 800);
@@ -1967,6 +2015,78 @@ mod preview {
             let sel = (0, 0, 900, 500);
             let full = overlay(&frozen, (sw, sh), sel, true);
             save(&dir, &format!("overlay-corner-{tag}"), 1000, 600, &full.chunks_exact(sw).take(600).flat_map(|r| r[..1000].to_vec()).collect::<Vec<_>>(), bg);
+            // Include the UI: its settings row, and the reason it gives the text interval.
+            for (name, on, focus) in [("off", false, None), ("on", true, None), ("focus", true, Some(SetHit::WithUi)), ("focus-key", true, Some(SetHit::Shortcut))] {
+                let mut s = set_state(fonts, cjk, SCALE);
+                (s.with_ui, s.focus) = (on, focus);
+                s.settle();
+                let c = settings(&s);
+                save(&dir, &format!("settings-ui-{name}-{tag}"), c.w, c.h, &c.px, bg);
+            }
+            let mut s = set_state(fonts, cjk, SCALE);
+            (s.record, s.area, s.text, s.with_ui) = (true, true, false, true); // gui() passes text false with the UI in
+            s.settle();
+            let c = settings(&s);
+            save(&dir, &format!("settings-every-na-ui-{tag}"), c.w, c.h, &c.px, bg);
+            // The caption, whole and halfway through its fade.
+            for (name, a) in [("", 1.0), ("-half", 0.5)] {
+                let c = ui_caption(font, SCALE, a);
+                save(&dir, &format!("caption{name}-{tag}"), c.w, c.h, &c.px, bg);
+            }
+            // Área's switch with the UI in: disabled (on and off), and halfway there.
+            let ui_panel = |mode, record, on, hover, open| {
+                let mut s = panel_state(mode, record, hover, open, None);
+                (s.ocr, s.with_ui) = (on, true);
+                s.settle();
+                s
+            };
+            let mut half = ocr(panel_state(Mode::Selection, false, None, false, None));
+            half.with_ui = true;
+            half.tw.ui = Tween::new(0.5);
+            for (name, s) in [("ocr-on", ui_panel(Mode::Selection, false, true, None, false)), ("ocr-off", ui_panel(Mode::Selection, false, false, None, false)), ("mid", half)] {
+                let c = panel(&s);
+                save(&dir, &format!("panel-ui-{name}-{tag}"), c.w, c.h, &c.px, bg);
+            }
+            // The launcher with the UI in: panel, caption under it, the badge kept off the caption.
+            let (swi, shi) = (sw as i32, sh as i32);
+            let caption = ui_caption(font, SCALE, 1.0);
+            let (cx, cy) = caption_pos(swi, shi, SCALE, (caption.w as i32, caption.h as i32));
+            let ui_launcher = |area: Rect, handles: bool, name: Option<&str>, s: &PanelState, settings_on: bool| {
+                let mut full = overlay(&frozen, (sw, sh), area, handles);
+                let bc = badge(area.2 - area.0, area.3 - area.1, name, font, SCALE);
+                let (bx, by) = badge_pos(area, (bc.w as i32, bc.h as i32), (swi, shi), gap, panel_rect(swi, shi, SCALE, true));
+                over(&mut full, sw, &bc, bx as usize, by as usize);
+                over(&mut full, sw, &panel(s), px as usize, py as usize);
+                over(&mut full, sw, &caption, cx as usize, cy as usize);
+                if settings_on {
+                    let mut ss = set_state(fonts, cjk, SCALE);
+                    (ss.with_ui, ss.record, ss.area) = (true, s.record, true);
+                    ss.settle();
+                    over(&mut full, sw, &settings(&ss), mx as usize, my as usize);
+                }
+                full
+            };
+            let sel = (420, 260, 1240, 720);
+            let full = ui_launcher(sel, true, None, &ui_panel(Mode::Selection, false, true, None, false), false);
+            save(&dir, &format!("launcher-ui-{tag}"), sw, sh, &full, bg);
+            let full = ui_launcher(sel, true, None, &ui_panel(Mode::Selection, true, true, None, false), false);
+            save(&dir, &format!("launcher-ui-photo-video-{tag}"), sw, sh, &full, bg);
+            let full = ui_launcher(sel, true, None, &ui_panel(Mode::Selection, true, true, None, true), true);
+            save(&dir, &format!("launcher-ui-settings-{tag}"), sw, sh, &full, bg);
+            let win = (820, 300, 1700, 900);
+            let full = ui_launcher(win, false, Some("Firefox Web Browser"), &ui_panel(Mode::Window, true, false, None, false), false);
+            save(&dir, &format!("launcher-ui-window-{tag}"), sw, sh, &full, bg);
+            let mut full = ui_launcher(sel, true, None, &ui_panel(Mode::Selection, false, true, Some(Hit::Ocr), false), false);
+            let t = tooltip(&ocr_tip(true, false, false, true), font, SCALE, 1.0);
+            let (tx, ty) = tooltip_pos(swi, shi, SCALE, (t.w as i32, t.h as i32));
+            over(&mut full, sw, &t, tx as usize, ty as usize);
+            let (x0, y0, cw) = (560, 740, 800);
+            let crop: Vec<u32> = full.chunks_exact(sw).skip(y0).flat_map(|r| r[x0..x0 + cw].to_vec()).collect();
+            save(&dir, &format!("launcher-ui-tip-{tag}"), cw, sh - y0, &crop, bg);
+            // A selection ending just above the panel's bottom: its badge would sit on the caption, so it moves inside.
+            let low = (900, 500, 1500, 1010);
+            let full = ui_launcher(low, true, None, &ui_panel(Mode::Selection, false, false, None, false), false);
+            save(&dir, &format!("launcher-ui-badge-low-{tag}"), sw, sh, &full, bg);
             // The pill over light and dark backgrounds.
             for (name, paused, secs) in [("recording", false, 42), ("paused", true, 725), ("hour", false, 3723)] {
                 let c = pill(paused, secs, fonts, SCALE);
@@ -2177,6 +2297,8 @@ mod preview {
         assert_eq!(step(&PANEL_ORDER, Hit::Mode(Mode::Window), false, |_| false), Hit::Ocr); // right after the mode words
         assert_eq!(step(&PANEL_ORDER, Hit::Mode(Mode::Window), false, |h| h == Hit::Ocr), Hit::Shot);
         assert_eq!(step(&SETTINGS_ORDER, SetHit::ImageFormat(1), false, |h| h == SetHit::Clip), SetHit::Pointer);
+        assert_eq!(step(&SETTINGS_ORDER, SetHit::Pointer, false, |_| false), SetHit::WithUi);
+        assert_eq!(step(&SETTINGS_ORDER, SetHit::WithUi, false, |_| false), SetHit::Shortcut);
     }
 
     #[test]
@@ -2211,9 +2333,37 @@ mod preview {
         assert_eq!(badge_pos((1900, 100, 1919, 200), b, scr, 8, none), (1830, 208)); // clamped right
         assert_eq!(badge_pos((-30, 100, 200, 200), b, scr, 8, none), (0, 208)); // and left
         assert_eq!(badge_pos((0, 0, 1920, 1080), (200, 24), (300, 100), 8, none), (8, 8)); // flipped, on a small screen
-        let panel = panel_rect(1920, 1080, 1.25);
+        let panel = panel_rect(1920, 1080, 1.25, false);
         assert_eq!(badge_pos((820, 300, 1700, 900), b, scr, 8, panel), (828, 308)); // not behind the panel
         assert_eq!(badge_pos((1300, 300, 1700, 900), b, scr, 8, panel), (1300, 908)); // beside it is fine
+        // With the UI in, the caption hangs under the panel: a badge that would land on it goes inside.
+        let low = (820, 300, 1700, 1040);
+        let (no_caption, caption) = (panel_rect(1920, 1080, 1.25, false), panel_rect(1920, 1080, 1.25, true));
+        assert_eq!(badge_pos(low, b, scr, 8, no_caption), (820, 1048));
+        assert_eq!(badge_pos(low, b, scr, 8, caption), (828, 308));
+    }
+
+    #[test]
+    fn caption_sits_under_the_panel() {
+        let ja = load_font(true);
+        let latin = load_font(false);
+        // The caption in each language, as `ui_caption` words it (the language is global: not switched here).
+        let words = [("Capture including UI", latin.as_ref()), ("Capturar incluyendo UI", latin.as_ref()), ("UI を含めてキャプチャ", ja.as_ref())];
+        for (sw, sh, scale) in [(1280, 720, 1.0), (1366, 768, 1.0), (1920, 1080, 1.25), (1920, 1080, 1.5)] {
+            let body = panel_rect(sw, sh, scale, false);
+            let full = panel_rect(sw, sh, scale, true);
+            for (text, font) in words {
+                let c = tooltip(text, font, scale, 1.0);
+                let (x, y) = caption_pos(sw, sh, scale, (c.w as i32, c.h as i32));
+                let (cx, bx) = (x + c.w as i32 / 2, (body.0 + body.2) / 2);
+                assert!((cx - bx).abs() <= 1, "{sw}x{sh}@{scale} {text}: centre {cx} vs {bx}");
+                assert!(x >= 0 && y >= body.3 + 9 && x + c.w as i32 <= sw && y + c.h as i32 <= sh, "{sw}x{sh}@{scale} {text}: {x},{y} {}x{}", c.w, c.h);
+                assert!(y + c.h as i32 <= full.3, "the badge's avoid rect covers the caption");
+                // The tooltip (28 tall, like the caption) is above the panel, so the two never meet.
+                let (tx, ty) = tooltip_pos(sw, sh, scale, (c.w as i32, c.h as i32));
+                assert!(ty + c.h as i32 <= body.1 && body.1 < y, "{sw}x{sh}@{scale}: tooltip {tx},{ty}");
+            }
+        }
     }
 
     #[test]

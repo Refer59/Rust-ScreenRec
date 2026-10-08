@@ -526,16 +526,16 @@ fn gui() -> Res<()> {
         _ => ja.get_or_init(|| ui::load_font(true)).as_ref(), // loaded when the settings first open
     };
     let mut st = ui::PanelState::new(last.mode, last.record, fonts(), scale);
-    st.ocr = last.ocr;
+    (st.ocr, st.with_ui) = (last.ocr, last.with_ui);
     let mut window = name_of(&cap, hovered); // the name of the window Window mode would take, for the badge
     let ((px, py), (mx, my)) = ui::place(sw, sh, scale);
     let mask = EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION | EventMask::LEAVE_WINDOW;
     // The size badge sits under the panel in the stack (made first): the selection's size,
     // or the window's name and size; Screen mode has none.
     let gap = (14.0 * scale).round() as i32; // clear of the corner brackets
-    let badge_for = |(r, name): &(Rect, Option<String>)| {
+    let badge_for = |(r, name): &(Rect, Option<String>), with_ui: bool| {
         let c = ui::badge(r.2 - r.0, r.3 - r.1, name.as_deref(), font(), scale);
-        (ui::badge_pos(*r, (c.w as i32, c.h as i32), (sw, sh), gap, ui::panel_rect(sw, sh, scale)), c)
+        (ui::badge_pos(*r, (c.w as i32, c.h as i32), (sw, sh), gap, ui::panel_rect(sw, sh, scale, with_ui)), c)
     };
     let badge_want = |last: &Last, w: Option<(Rect, u32)>, name: &Option<String>| match last.mode {
         Mode::Selection => Some((last.sel, None)),
@@ -543,7 +543,7 @@ fn gui() -> Res<()> {
         Mode::Screen => None,
     };
     let mut badge_at = badge_want(&last, hovered, &window); // what it shows, if mapped
-    let ((bx, by), bc) = badge_for(&badge_at.clone().unwrap_or((last.sel, None)));
+    let ((bx, by), bc) = badge_for(&badge_at.clone().unwrap_or((last.sel, None)), last.with_ui);
     let mut badge = ui::Win::new(&cap, bx, by, bc, EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION)?;
     let mut panel = ui::Win::new(&cap, px, py, ui::panel(&st), mask)?;
     let shortcut_now = || shortcut::get().map_or(tr!("none", "ninguno", "なし"), |a| shortcut::pretty(&a));
@@ -552,12 +552,16 @@ fn gui() -> Res<()> {
     // render wait for the gear: none of them is needed to show the panel.
     (set.output, set.mic, set.pointer) = (audio::OUTPUTS.iter().position(|&o| o == last.output).unwrap_or(0), last.mic, last.pointer);
     (set.mp4, set.jpg, set.gpu, set.clip, set.ocr_every) = (last.mp4, last.jpg, last.gpu, last.clip, last.ocr_every);
+    set.with_ui = last.with_ui;
     let mut modal = ui::Win::new(&cap, mx, my, ui::Canvas::new(ui::SW, ui::SH, scale), mask)?; // drawn and mapped by the gear
     // The tooltip of Área's switch, shown while it's hovered or focused.
     let mut tip = ui::Win::new(&cap, 0, 0, ui::Canvas::new(1, 1, scale), EventMask::NO_EVENT)?;
     let mut tip_text: Option<String> = None;
+    // The caption under the panel while the capture includes the UI: click-through like the badge.
+    let mut caption = ui::Win::new(&cap, 0, 0, ui::Canvas::new(1, 1, scale), EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION)?;
+    let mut caption_a = 0.0f32; // the opacity it was drawn at (-1: redraw it)
     // Everything fades in together: the dimmed screen, the badge, the panel.
-    let ours = [ov.win, badge.id, panel.id, modal.id, tip.id];
+    let ours = [ov.win, badge.id, panel.id, modal.id, tip.id, caption.id];
     let mut fade = ui::Fade::new(&cap)?;
     fade.apply(&cap.conn, &ours)?; // transparent before it's mapped
     ui::set_reduced_motion(reduced.join().unwrap_or(false));
@@ -573,7 +577,7 @@ fn gui() -> Res<()> {
     let mut grip: Option<(select::Grip, Rect)> = None; // dragging, and the selection before it
     let (mut moving, mut moving_set) = (true, false); // animating: the next frame is due
     let (mut pfocus, mut sfocus, mut ring) = (Hit::Shutter, ui::SETTINGS_ORDER[0], false); // keyboard focus; the ring shows once a key moves it
-    let (pid, mid, bid) = (panel.id, modal.id, badge.id);
+    let (pid, mid, bid, cid) = (panel.id, modal.id, badge.id, caption.id);
     let mut thru = false; // a press began in a transparent margin: the drag belongs to the overlay
     loop {
         cap.wait((moving || moving_set || fade.busy()).then_some(Duration::from_millis(8)))?; // the next animation frame, else sleep until an event
@@ -592,7 +596,7 @@ fn gui() -> Res<()> {
         for mut ev in cap.take_events()? {
             // The panels' transparent margins and the badge are click-through: the overlay gets those
             // events, or the panel where the settings' margin overhangs it (its close button).
-            let body = |id: u32, x: i16, y: i16| id != bid && (id != pid || ui::panel_body_has(scale, x, y)) && (id != mid || ui::settings_body_has(scale, x, y));
+            let body = |id: u32, x: i16, y: i16| id != bid && id != cid && (id != pid || ui::panel_body_has(scale, x, y)) && (id != mid || ui::settings_body_has(scale, x, y));
             let under = |id: u32, rx: i16, ry: i16| {
                 let (x, y) = ((rx as i32 - px) as i16, (ry as i32 - py) as i16);
                 if id == mid && ui::panel_body_has(scale, x, y) { (pid, x, y) } else { (ov.win, rx, ry) }
@@ -731,7 +735,7 @@ fn gui() -> Res<()> {
                         if ring && st.settings_open {
                             sfocus = ui::step(&ui::SETTINGS_ORDER, sfocus, back, |h| set.off(h));
                         } else if ring {
-                            pfocus = ui::step(&ui::PANEL_ORDER, pfocus, back, |h| h == Hit::Ocr && st.mode != Mode::Selection);
+                            pfocus = ui::step(&ui::PANEL_ORDER, pfocus, back, |h| h == Hit::Ocr && (st.mode != Mode::Selection || st.with_ui));
                         }
                         ring = true; // the first press only shows where the focus is
                         if st.settings_open && sfocus == SetHit::Every(1) {
@@ -770,6 +774,7 @@ fn gui() -> Res<()> {
                             cap.conn.map_window(mid)?;
                         }
                         Hit::Shutter => shoot = true,
+                        Hit::Ocr if st.with_ui => {} // off while the UI is in the capture
                         Hit::Ocr => {
                             (st.ocr, last.ocr) = (!st.ocr, !st.ocr);
                             last.save();
@@ -788,6 +793,10 @@ fn gui() -> Res<()> {
                         SetHit::Output(i) => set.output = i,
                         SetHit::Mic => set.mic = !set.mic,
                         SetHit::Pointer => set.pointer = !set.pointer,
+                        SetHit::WithUi => {
+                            set.with_ui = !set.with_ui;
+                            (st.with_ui, redraw, badge_at, reshape) = (set.with_ui, true, None, true); // the badge keeps clear of the caption, or not
+                        }
                         SetHit::Clip if !set.record => set.clip = !set.clip,
                         SetHit::Clip => {} // photos only: off limits on video
                         SetHit::VideoFormat(i) => set.mp4 = i == 1,
@@ -800,12 +809,12 @@ fn gui() -> Res<()> {
                         SetHit::Lang(i) => {
                             i18n::set(i18n::LANGS[i]);
                             ((st.font, st.bold), (set.font, set.bold)) = (fonts(), fonts());
-                            (set.cjk, set.shortcut, redraw, reshape, badge_at) = (cjk(), shortcut_now(), true, true, None); // the badge, in the new font
+                            (set.cjk, set.shortcut, redraw, reshape, badge_at, caption_a) = (cjk(), shortcut_now(), true, true, None, -1.0); // the badge and the caption, in the new font
                         }
                     }
                     // Settings stick at once, also when the launcher is then closed.
                     (last.pointer, last.output, last.mic) = (set.pointer, audio::OUTPUTS[set.output], set.mic);
-                    (last.mp4, last.jpg, last.gpu, last.clip, last.ocr_every) = (set.mp4, set.jpg, set.gpu, set.clip, set.ocr_every);
+                    (last.mp4, last.jpg, last.gpu, last.clip, last.ocr_every, last.with_ui) = (set.mp4, set.jpg, set.gpu, set.clip, set.ocr_every, set.with_ui);
                     last.save();
                 }
                 None => {}
@@ -825,7 +834,7 @@ fn gui() -> Res<()> {
                     None => None,
                 };
                 let app = app.and_then(|id| ewmh.pid(&cap, id));
-                return shutter(cap, &mut ov, (&[&panel, &modal, &badge, &tip], &mut fade), target, &last, &cursor, app, (fonts(), scale));
+                return shutter(cap, &mut ov, (&[&panel, &modal, &badge, &tip, &caption], &mut fade), target, &last, &cursor, app, (fonts(), scale));
             }
         }
         if reshape {
@@ -838,7 +847,7 @@ fn gui() -> Res<()> {
             if want != badge_at {
                 match &want {
                     Some(b) => {
-                        let ((x, y), c) = badge_for(b);
+                        let ((x, y), c) = badge_for(b, st.with_ui);
                         badge.reset(&cap.conn, x, y, c)?;
                         cap.conn.map_window(bid)?;
                     }
@@ -849,10 +858,10 @@ fn gui() -> Res<()> {
                 badge_at = want;
             }
         }
-        if pfocus == Hit::Ocr && st.mode != Mode::Selection {
-            pfocus = Hit::Mode(st.mode); // the switch went with Área
+        if pfocus == Hit::Ocr && (st.mode != Mode::Selection || st.with_ui) {
+            pfocus = Hit::Mode(st.mode); // the switch went with Área, or is off with the UI in
         }
-        let (rec, text, area) = (st.record, st.ocr && st.mode == Mode::Selection, st.mode == Mode::Selection);
+        let (rec, text, area) = (st.record, st.ocr && st.mode == Mode::Selection && !st.with_ui, st.mode == Mode::Selection);
         (restyle, set.record, set.text, set.area) = (restyle || (rec, text, area) != (set.record, set.text, set.area), rec, text, area);
         if set.off(sfocus) {
             sfocus = ui::step(&ui::SETTINGS_ORDER, sfocus, true, |h| set.off(h)); // its control went off limits (the clipboard on video, ...)
@@ -866,15 +875,30 @@ fn gui() -> Res<()> {
         let f = ring.then_some(sfocus);
         (restyle, set.focus) = (restyle || f != set.focus, f);
         st.sync();
+        // The caption fades with the panel's `ui` tween: drawn while it runs, gone at 0.
+        let a = st.ui_shown();
+        if a != caption_a {
+            if a > 0.0 {
+                let c = ui::ui_caption(font(), scale, a);
+                let (x, y) = ui::caption_pos(sw, sh, scale, (c.w as i32, c.h as i32));
+                caption.reset(&cap.conn, x, y, c)?;
+                if caption_a <= 0.0 {
+                    caption.show(&cap.conn)?;
+                }
+            } else {
+                cap.conn.unmap_window(cid)?;
+            }
+            caption_a = a;
+        }
         if redraw || moving || st.busy() {
             panel.redraw(&cap.conn, ui::panel(&st))?;
         }
         moving = st.busy();
         // Área's switch explains itself while it's hovered or focused.
-        let want = (st.mode == Mode::Selection && (st.hover == Some(Hit::Ocr) || st.focus == Some(Hit::Ocr))).then(|| ui::ocr_tip(st.ocr, st.record, set.clip));
+        let want = (st.mode == Mode::Selection && (st.hover == Some(Hit::Ocr) || st.focus == Some(Hit::Ocr))).then(|| ui::ocr_tip(st.ocr, st.record, set.clip, st.with_ui));
         if want != tip_text {
             if let Some(text) = &want {
-                let c = ui::tooltip(text, font(), scale);
+                let c = ui::tooltip(text, font(), scale, 1.0);
                 let (x, y) = ui::tooltip_pos(sw, sh, scale, (c.w as i32, c.h as i32));
                 tip.reset(&cap.conn, x, y, c)?;
                 tip.show(&cap.conn)?;
