@@ -258,6 +258,8 @@ struct Last {
     clip: bool,
     /// Recognize text; only an area's (Área mode), see `text`.
     ocr: bool,
+    /// Seconds between the frames a recording reads text from: at most one per interval.
+    ocr_every: f32,
 }
 
 fn last_path() -> PathBuf {
@@ -285,16 +287,18 @@ impl Last {
         let flag = |i: usize| f.get(i) == Some(&"true");
         let gpu = f.get(11) != Some(&"false"); // the GPU when there is one, unless told otherwise
         let mode = mode.unwrap_or(Mode::Selection);
-        Last { mode, record: flag(1), pointer: flag(2), sel, output, mic: flag(8), mp4: flag(9), jpg: flag(10), gpu, clip: flag(13), ocr: flag(14) } // older files end at 12: both off
+        let ocr_every = f.get(15).and_then(|v| v.parse::<f32>().ok()).filter(|v| v.is_finite()).map_or(ui::EVERY_DEFAULT, ui::every_clamp);
+        // Older files end at 12 (clip and ocr off) or at 14 (the default interval).
+        Last { mode, record: flag(1), pointer: flag(2), sel, output, mic: flag(8), mp4: flag(9), jpg: flag(10), gpu, clip: flag(13), ocr: flag(14), ocr_every }
     }
 
     fn save(&self) {
         let path = last_path();
         let (m, (x0, y0, x1, y1), o) = (self.mode, self.sel, self.output);
         let _ = std::fs::create_dir_all(path.parent().unwrap());
-        let (rec, ptr, mic, mp4, jpg, gpu, clip, ocr) = (self.record, self.pointer, self.mic, self.mp4, self.jpg, self.gpu, self.clip, self.ocr);
+        let (rec, ptr, mic, mp4, jpg, gpu, clip, ocr, every) = (self.record, self.pointer, self.mic, self.mp4, self.jpg, self.gpu, self.clip, self.ocr, self.ocr_every);
         let lang = i18n::chosen().map_or("-".into(), |l| format!("{l:?}")); // "-": the locale's
-        let _ = std::fs::write(path, format!("{m:?} {rec} {ptr} {x0} {y0} {x1} {y1} {o:?} {mic} {mp4} {jpg} {gpu} {lang} {clip} {ocr}\n"));
+        let _ = std::fs::write(path, format!("{m:?} {rec} {ptr} {x0} {y0} {x1} {y1} {o:?} {mic} {mp4} {jpg} {gpu} {lang} {clip} {ocr} {every}\n"));
     }
 
     /// Whether the capture's text gets recognized: the switch is on and the mode is Área.
@@ -308,9 +312,13 @@ impl Last {
 fn last_reads_older_files() {
     let old = Last::parse("Selection true false 1 2 300 400 System true false true false Es\n", 1920, 1080);
     assert!((old.record, old.mic, old.jpg, old.gpu, old.clip, old.ocr) == (true, true, true, false, false, false));
-    let new = Last::parse("Selection false false 1 2 300 400 None false false false true - true true\n", 1920, 1080);
-    assert!((new.clip, new.ocr, new.text()) == (true, true, true));
-    assert!(!Last { mode: Mode::Screen, ..new }.text(), "text is read from an area only");
+    let v6 = Last::parse("Selection false false 1 2 300 400 None false false false true - true true\n", 1920, 1080);
+    assert!((v6.clip, v6.ocr, v6.text(), v6.ocr_every) == (true, true, true, 2.0));
+    assert!(!Last { mode: Mode::Screen, ..v6 }.text(), "text is read from an area only");
+    assert_eq!(old.ocr_every, 2.0);
+    // The interval, clamped to 0.5..5 s; what isn't a number is the default.
+    let every = |v: &str| Last::parse(&format!("Selection false false 1 2 300 400 None false false false true - true true {v}\n"), 1920, 1080).ocr_every;
+    assert_eq!(["2.5", "0.5", "5", "0.1", "9", "-3", "1.25", "nan", "inf", "x", ""].map(every), [2.5, 0.5, 5.0, 0.5, 5.0, 0.5, 1.3, 2.0, 2.0, 2.0, 2.0]);
 }
 
 /// One launcher at a time: launching again (the shortcut pressed twice)
@@ -350,6 +358,20 @@ impl Keymap {
     fn sym(&self, code: u8) -> u32 {
         self.syms.get((code.saturating_sub(self.min)) as usize * self.per).copied().unwrap_or(0)
     }
+
+    /// What the key types into a number: a digit, '.' or ','. The keypad's digits are
+    /// its second column with NumLock (Mod2) on; Shift takes the main keys' (AZERTY digits).
+    fn typed(&self, code: u8, state: u16) -> Option<char> {
+        let col = |i: usize| if i < self.per { self.syms.get(code.saturating_sub(self.min) as usize * self.per + i).copied().unwrap_or(0) } else { 0 };
+        let keypad = |s: u32| (0xffac..=0xffb9).contains(&s);
+        let sym = if state & 0x10 != 0 && keypad(col(1)) || state & 1 != 0 && !keypad(col(1)) { col(1) } else { col(0) };
+        match sym {
+            0x30..=0x39 | 0x2c | 0x2e => char::from_u32(sym),
+            0xffb0..=0xffb9 => char::from_u32(sym - 0xffb0 + 0x30), // KP_0..KP_9
+            0xffac | 0xffae => Some('.'),                          // KP_Separator, KP_Decimal
+            _ => None,
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -362,6 +384,8 @@ const KEYS_PREV: [u32; 5] = [0xfe20, 0xff51, 0xff52, 0xff96, 0xff97]; // ISO_Lef
 const KEYS_NEXT: [u32; 4] = [0xff53, 0xff54, 0xff98, 0xff99]; // Right, Down, KP_Right, KP_Down
 #[cfg(target_os = "linux")]
 const KEY_ENTERS: [u32; 3] = [0xff0d, 0xff8d, 0x20]; // Return, KP_Enter, space
+#[cfg(target_os = "linux")]
+const KEY_BACKSPACE: u32 = 0xff08;
 
 /// A control being activated: a click and Enter on the focus ring do the same.
 #[cfg(target_os = "linux")]
@@ -457,7 +481,7 @@ fn gui() -> Res<()> {
     // The shortcut (two gsettings runs), the NVIDIA probe (a driver dlopen) and the
     // render wait for the gear: none of them is needed to show the panel.
     (set.output, set.mic, set.pointer) = (audio::OUTPUTS.iter().position(|&o| o == last.output).unwrap_or(0), last.mic, last.pointer);
-    (set.mp4, set.jpg, set.gpu, set.clip) = (last.mp4, last.jpg, last.gpu, last.clip);
+    (set.mp4, set.jpg, set.gpu, set.clip, set.ocr_every) = (last.mp4, last.jpg, last.gpu, last.clip, last.ocr_every);
     let mut modal = ui::Win::new(&cap, mx, my, ui::Canvas::new(ui::SW, ui::SH, scale), mask)?; // drawn and mapped by the gear
     // The tooltip of Área's switch, shown while it's hovered or focused.
     let mut tip = ui::Win::new(&cap, 0, 0, ui::Canvas::new(1, 1, scale), EventMask::NO_EVENT)?;
@@ -490,6 +514,7 @@ fn gui() -> Res<()> {
         let (mut redraw, mut reshape, mut restyle) = (false, false, false); // panel, overlay, settings
         macro_rules! close_settings {
             () => {
+                set.commit();
                 (st.settings_open, set.capturing, redraw, pfocus) = (false, false, true, Hit::Settings);
                 cap.conn.unmap_window(mid)?;
             };
@@ -505,6 +530,7 @@ fn gui() -> Res<()> {
             match &mut ev {
                 Event::ButtonPress(e) => {
                     ring = false;
+                    set.commit(); // a click anywhere leaves the interval's field (on it, it starts again)
                     if !body(e.event, e.event_x, e.event_y) {
                         let to = under(e.event, e.root_x, e.root_y);
                         (thru, e.event, e.event_x, e.event_y) = (to.0 == ov.win, to.0, to.1, to.2);
@@ -593,7 +619,8 @@ fn gui() -> Res<()> {
                     false
                 }
                 Event::KeyPress(e) => {
-                    let sym = keys.sym(e.detail);
+                    let (sym, typed) = (keys.sym(e.detail), keys.typed(e.detail, e.state.into()));
+                    let nav = sym == KEY_TAB || KEYS_PREV.contains(&sym) || KEYS_NEXT.contains(&sym);
                     if set.capturing {
                         if sym == KEY_ESCAPE {
                             (set.capturing, restyle) = (false, true);
@@ -604,19 +631,42 @@ fn gui() -> Res<()> {
                             (set.shortcut, set.capturing, restyle) = (shortcut_now(), false, true);
                         }
                         false
+                    } else if let Some(t) = set.typing.as_mut().filter(|_| typed.is_some() || !nav) {
+                        // The interval's field takes the keys, none reach the launcher; Tab and the arrows leave it.
+                        match typed {
+                            Some(ch) => t.key(ch),
+                            None if sym == KEY_BACKSPACE => t.back(),
+                            None if sym == KEY_ESCAPE => set.typing = None, // back to the value it had
+                            None if KEY_ENTERS[..2].contains(&sym) => set.commit(),
+                            None => {}
+                        }
+                        restyle = true;
+                        false
+                    } else if let Some(ch) = typed.filter(|_| st.settings_open && ring && sfocus == SetHit::Every(1) && !set.off(sfocus)) {
+                        let mut t = ui::Typing::new(set.ocr_every); // a digit on the focused field types over it
+                        t.key(ch);
+                        (set.typing, restyle) = (Some(t), true);
+                        false
                     } else if sym == KEY_ESCAPE && st.settings_open {
                         close_settings!();
                         false
                     } else if sym == KEY_ESCAPE {
                         return fade_out(&cap.conn, &mut fade, &ours);
-                    } else if sym == KEY_TAB || KEYS_PREV.contains(&sym) || KEYS_NEXT.contains(&sym) {
+                    } else if nav {
                         let back = if sym == KEY_TAB { u16::from(e.state) & 1 != 0 } else { KEYS_PREV.contains(&sym) }; // Shift is bit 1
+                        if set.typing.is_some() {
+                            (ring, restyle) = (true, true); // leaving the field keeps what was typed, and moves on
+                            set.commit();
+                        }
                         if ring && st.settings_open {
-                            sfocus = ui::step(&ui::SETTINGS_ORDER, sfocus, back, |h| (h == SetHit::Gpu && !set.gpu_found) || (h == SetHit::Clip && set.record));
+                            sfocus = ui::step(&ui::SETTINGS_ORDER, sfocus, back, |h| set.off(h));
                         } else if ring {
                             pfocus = ui::step(&ui::PANEL_ORDER, pfocus, back, |h| h == Hit::Ocr && st.mode != Mode::Selection);
                         }
                         ring = true; // the first press only shows where the focus is
+                        if st.settings_open && sfocus == SetHit::Every(1) {
+                            set.typing = Some(ui::Typing::new(set.ocr_every)); // arriving at the field: ready to type over its value
+                        }
                         false
                     } else if !KEY_ENTERS.contains(&sym) {
                         false
@@ -674,6 +724,9 @@ fn gui() -> Res<()> {
                         SetHit::Gpu => set.gpu = !set.gpu,
                         SetHit::ImageFormat(i) => set.jpg = i == 1,
                         SetHit::Shortcut => set.capturing = true,
+                        SetHit::Every(_) if set.off(h) => {} // no text read from a video: it doesn't matter
+                        SetHit::Every(1) => (set.typing, sfocus) = (Some(ui::Typing::new(set.ocr_every)), h),
+                        SetHit::Every(i) => set.ocr_every = ui::every_step(set.ocr_every, i == 2),
                         SetHit::Lang(i) => {
                             i18n::set(i18n::LANGS[i]);
                             ((st.font, st.bold), (set.font, set.bold)) = (fonts(), fonts());
@@ -682,13 +735,13 @@ fn gui() -> Res<()> {
                     }
                     // Settings stick at once, also when the launcher is then closed.
                     (last.pointer, last.output, last.mic) = (set.pointer, audio::OUTPUTS[set.output], set.mic);
-                    (last.mp4, last.jpg, last.gpu, last.clip) = (set.mp4, set.jpg, set.gpu, set.clip);
+                    (last.mp4, last.jpg, last.gpu, last.clip, last.ocr_every) = (set.mp4, set.jpg, set.gpu, set.clip, set.ocr_every);
                     last.save();
                 }
                 None => {}
             }
             if shoot {
-                (last.mode, last.record) = (st.mode, st.record);
+                (last.mode, last.record, last.ocr_every) = (st.mode, st.record, set.ocr_every);
                 let target = match (last.mode, picked.or(hovered)) {
                     (Mode::Window, Some((r, id))) => Some(Target::Window(id, r)),
                     (Mode::Window, None) => None, // no window picked
@@ -728,8 +781,14 @@ fn gui() -> Res<()> {
         if pfocus == Hit::Ocr && st.mode != Mode::Selection {
             pfocus = Hit::Mode(st.mode); // the switch went with Área
         }
-        if sfocus == SetHit::Clip && st.record {
-            sfocus = SetHit::ImageFormat(1); // the clipboard is off limits on video
+        let (rec, text, area) = (st.record, st.ocr && st.mode == Mode::Selection, st.mode == Mode::Selection);
+        (restyle, set.record, set.text, set.area) = (restyle || (rec, text, area) != (set.record, set.text, set.area), rec, text, area);
+        if set.off(sfocus) {
+            sfocus = ui::step(&ui::SETTINGS_ORDER, sfocus, true, |h| set.off(h)); // its control went off limits (the clipboard on video, ...)
+        }
+        if last.ocr_every != set.ocr_every {
+            last.ocr_every = set.ocr_every;
+            last.save();
         }
         let f = (ring && !st.settings_open).then_some(pfocus);
         (redraw, st.focus) = (redraw || f != st.focus, f);
@@ -753,8 +812,6 @@ fn gui() -> Res<()> {
             }
             tip_text = want;
         }
-        let (rec, text) = (st.record, st.ocr && st.mode == Mode::Selection);
-        (restyle, set.record, set.text) = (restyle || (rec, text) != (set.record, set.text), rec, text);
         if st.settings_open {
             set.sync();
             if restyle || moving_set || set.busy() {

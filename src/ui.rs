@@ -726,7 +726,8 @@ pub fn place(sw: i32, sh: i32, scale: f32) -> ((i32, i32), (i32, i32)) {
     let px = (sw as f32 - s(BODY.0)) / 2.0 - s(M);
     let body_top = sh as f32 - s(48.0) - s(BODY.1);
     let mx = (sw as f32 - s(SBODY.0)) / 2.0 - s(M);
-    let my = body_top - s(18.0) - s(SBODY.1) - s(M);
+    // On a short screen (720 logical px) it moves closer to the panel rather than off the top.
+    let my = (body_top - s(18.0) - s(SBODY.1)).max(s(8.0)) - s(M);
     ((px.round() as i32, (body_top - s(M)).round() as i32), (mx.round() as i32, my.round() as i32))
 }
 
@@ -864,10 +865,12 @@ pub enum SetHit {
     Pointer,
     Shortcut,
     Lang(usize),
+    /// The OCR interval's counter: 0 −, 1 the field, 2 +.
+    Every(usize),
 }
 
 /// Keyboard focus order.
-pub const SETTINGS_ORDER: [SetHit; 16] = [
+pub const SETTINGS_ORDER: [SetHit; 19] = [
     SetHit::Output(0),
     SetHit::Output(1),
     SetHit::Output(2),
@@ -875,6 +878,9 @@ pub const SETTINGS_ORDER: [SetHit; 16] = [
     SetHit::VideoFormat(0),
     SetHit::VideoFormat(1),
     SetHit::Gpu,
+    SetHit::Every(0),
+    SetHit::Every(1),
+    SetHit::Every(2),
     SetHit::ImageFormat(0),
     SetHit::ImageFormat(1),
     SetHit::Clip,
@@ -889,16 +895,19 @@ pub const SETTINGS_ORDER: [SetHit; 16] = [
 // Settings content runs between SX.0 and SX.1; the pickers and the shortcut field fill a right-hand column from PICK.
 const SX: (f32, f32) = (20.0, SBODY.0 - 20.0);
 const PICK: f32 = SX.1 - 124.0;
-// Settings rows (centres) in the body.
-const SEG_OUT: (f32, f32) = (84.0, 116.0);
-const ROW_MIC: f32 = 140.0;
-const ROW_VIDEO: f32 = 190.0;
-const ROW_GPU: f32 = 230.0;
-const ROW_SHOT: f32 = 278.0;
-const ROW_CLIP: f32 = 318.0;
-const ROW_POINTER: f32 = 358.0;
-const ROW_KEY: f32 = 406.0;
-const SEG_LANG: (f32, f32) = (466.0, 498.0);
+// Settings rows (centres) in the body: 36 apart in a group (40 before a two-line one), 22 each
+// side of a divider. Tight enough for a 720 px tall screen.
+const SEG_OUT: (f32, f32) = (76.0, 108.0);
+const ROW_MIC: f32 = 130.0;
+const ROW_VIDEO: f32 = 174.0;
+const ROW_GPU: f32 = 210.0;
+const ROW_EVERY: f32 = 250.0;
+const ROW_SHOT: f32 = 294.0;
+const ROW_CLIP: f32 = 330.0;
+const ROW_POINTER: f32 = 366.0;
+const ROW_KEY: f32 = 410.0;
+const SEG_LANG: (f32, f32) = (464.0, 496.0);
+const DIVIDERS: [f32; 4] = [ROW_MIC + 22.0, ROW_EVERY + 22.0, ROW_POINTER + 22.0, ROW_KEY + 22.0];
 
 /// Cell `i` of `n` across x0..x1 and y0..y1; `inset` 3 gives the thumb, its corners concentric with the well's.
 fn cell(x0: f32, x1: f32, (y0, y1): (f32, f32), n: usize, i: usize, inset: f32) -> Geo {
@@ -919,6 +928,12 @@ fn switch_geo(cy: f32) -> Geo {
     Geo::Rect(SX.1 - 44.0, cy - 12.0, SX.1, cy + 12.0, 12.0)
 }
 
+/// The interval counter's cells across the pickers' column, `inset` like `cell`'s: − (0), the field (1), + (2).
+fn every_cell(i: usize, inset: f32) -> Geo {
+    let ((y0, y1), x) = (pick_y(ROW_EVERY), [PICK, PICK + 32.0, SX.1 - 32.0, SX.1]);
+    Geo::Rect(x[i] + inset, y0 + inset, x[i + 1] - inset, y1 - inset, 8.0 - inset)
+}
+
 /// What a settings control looks like (and where its focus ring goes).
 fn set_shape(h: SetHit) -> Geo {
     match h {
@@ -932,6 +947,7 @@ fn set_shape(h: SetHit) -> Geo {
         SetHit::Pointer => switch_geo(ROW_POINTER),
         SetHit::Clip => switch_geo(ROW_CLIP),
         SetHit::Shortcut => Geo::Rect(PICK, ROW_KEY - 16.0, SX.1, ROW_KEY + 16.0, 8.0),
+        SetHit::Every(i) => every_cell(i, 3.0),
     }
 }
 
@@ -948,6 +964,7 @@ fn set_hit(h: SetHit) -> Geo {
         SetHit::Pointer => row_rect(ROW_POINTER),
         SetHit::Clip => row_rect(ROW_CLIP),
         SetHit::Shortcut => set_shape(h),
+        SetHit::Every(i) => every_cell(i, 0.0),
     }
 }
 
@@ -960,6 +977,75 @@ pub fn settings_hit(scale: f32, x: i16, y: i16) -> Option<SetHit> {
 pub fn settings_body_has(scale: f32, x: i16, y: i16) -> bool {
     let (x, y) = (x as f32 / scale - M, y as f32 / scale - M);
     sd_rrect(x, y, (0.0, 0.0, SBODY.0, SBODY.1), SBODY_R) <= 0.0 || SETTINGS_ORDER.into_iter().any(|h| set_hit(h).has(x, y))
+}
+
+/// How often a recording reads text, in seconds (at most one frame per interval): the range, the default.
+pub const EVERY: (f32, f32) = (0.5, 5.0);
+pub const EVERY_DEFAULT: f32 = 2.0;
+/// What the counter's − and + move it by.
+const EVERY_STEP: f32 = 0.5;
+
+/// `v` within the range, to a tenth of a second.
+pub fn every_clamp(v: f32) -> f32 {
+    ((v * 10.0).round() / 10.0).clamp(EVERY.0, EVERY.1)
+}
+
+/// The counter's − (`up` false) or +: the next multiple of the step that way, within the range.
+pub fn every_step(v: f32, up: bool) -> f32 {
+    let k = v / EVERY_STEP;
+    let n = if up { (k + 1e-3).floor() + 1.0 } else { (k - 1e-3).ceil() - 1.0 };
+    (n * EVERY_STEP).clamp(EVERY.0, EVERY.1)
+}
+
+/// The decimal separator as the language writes it.
+fn decimal_sep() -> char {
+    if crate::i18n::lang() == crate::i18n::Lang::Es { ',' } else { '.' }
+}
+
+/// `v` written with `sep`: "2", "0.5"; the tenths only when there are some.
+fn secs(v: f32, sep: char) -> String {
+    let t = (v * 10.0).round() as i32;
+    if t % 10 == 0 { (t / 10).to_string() } else { format!("{}{sep}{}", t / 10, t % 10) }
+}
+
+/// The interval's field while it's typed into: the text, and whether it's all selected (the next key replaces it).
+pub struct Typing {
+    pub text: String,
+    pub all: bool,
+}
+
+impl Typing {
+    /// Typing over `v`: its digits, all selected.
+    pub fn new(v: f32) -> Self {
+        Typing { text: secs(v, decimal_sep()), all: true }
+    }
+
+    /// A key typed: digits, and one '.' or ',' (shown as the language writes it); four characters at most.
+    pub fn key(&mut self, ch: char) {
+        let sep = ch == '.' || ch == ',';
+        if !(ch.is_ascii_digit() || sep) {
+            return;
+        }
+        if self.all {
+            (self.text, self.all) = (String::new(), false);
+        }
+        if self.text.len() < 4 && !(sep && self.text.contains(['.', ','])) {
+            self.text.push(if sep { decimal_sep() } else { ch });
+        }
+    }
+
+    pub fn back(&mut self) {
+        if self.all {
+            self.text.clear();
+        }
+        self.text.pop();
+        self.all = false;
+    }
+
+    /// What it says, within the range; `old` when it isn't a number.
+    pub fn value(&self, old: f32) -> f32 {
+        self.text.replace(',', ".").parse::<f32>().map_or(old, every_clamp)
+    }
 }
 
 pub struct SettingsState<'a> {
@@ -975,6 +1061,12 @@ pub struct SettingsState<'a> {
     pub record: bool,
     /// Text will be recognized (Área mode, its switch on): then the text is what gets copied.
     pub text: bool,
+    /// Área mode: the only one whose text is read.
+    pub area: bool,
+    /// Seconds between the frames a recording reads text from (`Last.ocr_every`).
+    pub ocr_every: f32,
+    /// Its field, while it's typed into.
+    pub typing: Option<Typing>,
     pub shortcut: String,
     pub capturing: bool, // waiting for the new shortcut
     pub hover: Option<SetHit>,
@@ -1030,7 +1122,7 @@ impl<'a> SettingsState<'a> {
             clip: Tween::io(0.0),
             hover: Hov::new(),
         };
-        SettingsState { output: 0, mic: false, mp4: false, gpu: false, gpu_found: false, jpg: false, pointer: false, clip: false, record: false, text: false, shortcut: String::new(), capturing: false, hover: None, focus: None, font, bold, cjk, scale, tw }
+        SettingsState { output: 0, mic: false, mp4: false, gpu: false, gpu_found: false, jpg: false, pointer: false, clip: false, record: false, text: false, area: false, ocr_every: EVERY_DEFAULT, typing: None, shortcut: String::new(), capturing: false, hover: None, focus: None, font, bold, cjk, scale, tw }
     }
 
     pub fn sync(&mut self) {
@@ -1055,6 +1147,29 @@ impl<'a> SettingsState<'a> {
         self.tw.appear = appear(160.0);
     }
 
+    /// Whether the OCR interval matters: a recording whose text is read.
+    pub fn every_on(&self) -> bool {
+        self.record && self.text
+    }
+
+    /// Whether `h` is off limits now, so the focus passes over it: the GPU switch with no
+    /// GPU, the clipboard on video, the interval when it doesn't matter.
+    pub fn off(&self, h: SetHit) -> bool {
+        match h {
+            SetHit::Gpu => !self.gpu_found,
+            SetHit::Clip => self.record,
+            SetHit::Every(_) => !self.every_on(),
+            _ => false,
+        }
+    }
+
+    /// Leave the interval's field: what was typed is kept if it's a number (within the range), else the value it had.
+    pub fn commit(&mut self) {
+        if let Some(t) = self.typing.take() {
+            self.ocr_every = t.value(self.ocr_every);
+        }
+    }
+
     pub fn settle(&mut self) {
         self.sync();
         self.tw.all().into_iter().for_each(Tween::settle);
@@ -1067,6 +1182,52 @@ fn switch(c: &mut Canvas, cy: f32, v: f32, enabled: bool) {
     let Geo::Rect(x0, y0, x1, y1, r) = switch_geo(cy) else { unreachable!() };
     c.paint(if enabled { mix(THUMB, TEXT, v) } else { WELL }, rrect(x0, y0, x1, y1, r));
     c.paint(if enabled { mix(TEXT, BLACK, v) } else { mix(DISABLED, THUMB, v) }, circle(x0 + 12.0 + 20.0 * v, cy, 9.0));
+}
+
+/// The OCR interval: − [2 s] + in a well like the pickers'. Typed into, the field turns
+/// white, as the shortcut's does while it listens; a button at its end of the range, or
+/// the whole counter when the interval doesn't matter, is dim.
+fn counter(c: &mut Canvas, s: &SettingsState, hover: &dyn Fn(SetHit) -> f32) {
+    let (on, v, cy) = (s.every_on(), s.ocr_every, ROW_EVERY);
+    let Geo::Rect(l, t, _, b, rad) = every_cell(0, 0.0) else { unreachable!() };
+    c.paint(WELL, rrect(l, t, SX.1, b, rad));
+    let typed = s.typing.as_ref().map_or(v, |t| t.value(v)); // a click commits it first, then steps
+    for (i, up) in [(0, false), (2, true)] {
+        let live = on && every_step(typed, up) != typed;
+        let h = if live { hover(SetHit::Every(i)) } else { 0.0 };
+        let Geo::Rect(x0, y0, x1, y1, r) = every_cell(i, 3.0) else { unreachable!() };
+        c.paint(fade(WHITE, 0.08 * h), rrect(x0, y0, x1, y1, r));
+        let (x, col) = ((x0 + x1) / 2.0, if live { TEXT } else { DISABLED });
+        c.paint(col, line(x - 5.5, cy, x + 5.5, cy, 0.85));
+        if up {
+            c.paint(col, line(x, cy - 5.5, x, cy + 5.5, 0.85));
+        }
+    }
+    let Geo::Rect(x0, y0, x1, y1, r) = every_cell(1, 3.0) else { unreachable!() };
+    let unit = format!(" {}", tr!("s", "s", "秒"));
+    let typing = s.typing.as_ref();
+    let field = match typing {
+        Some(_) => TEXT,
+        None => mix(BLACK, WELL_HI, 0.6 * if on { hover(SetHit::Every(1)) } else { 0.0 }),
+    };
+    c.paint(field, rrect(x0, y0, x1, y1, r));
+    let Some(f) = s.font else { return };
+    let num = typing.map_or_else(|| secs(v, decimal_sep()), |t| t.text.clone());
+    let (nw, uw) = (Canvas::width(f, &num, 14.0), Canvas::width(f, &unit, 14.0));
+    let gap = if typing.is_some() { 1.5 } else { 0.0 }; // room for the caret before the unit
+    let x = (x0 + x1 - nw - gap - uw) / 2.0;
+    let (ink, dim) = match typing {
+        Some(_) => (BLACK, mix(BLACK, TEXT, 0.4)), // 5:1 on white
+        None if on => (TEXT, TEXT2),
+        None => (TEXT2, TEXT2),
+    };
+    match typing {
+        Some(t) if t.all => c.paint(mix(TEXT, BLACK, 0.2), rrect(x - 2.0, cy - 9.0, x + nw + 2.0, cy + 9.0, 3.0)), // selected
+        Some(_) => c.paint(BLACK, line(x + nw + 0.75, cy - 8.0, x + nw + 0.75, cy + 8.0, 0.6)), // the caret, steady: blinking would wake us twice a second
+        None => {}
+    }
+    c.text(f, &num, 14.0, x, cy + 5.0, 0.0, ink);
+    c.text(f, &unit, 14.0, x + nw + gap, cy + 5.0, 0.0, dim);
 }
 
 /// Segmented control in the rect x0..x1 × `ys`: `labels` in a capsule, the thumb at the fractional index `on`.
@@ -1118,7 +1279,7 @@ pub fn settings(s: &SettingsState) -> Canvas {
     close_button(&mut c, set_shape(SetHit::Close), hv(SetHit::Close));
 
     // sound
-    section(&mut c, &tr!("Sound", "Sonido", "サウンド"), 74.0);
+    section(&mut c, &tr!("Sound", "Sonido", "サウンド"), SEG_OUT.0 - 10.0);
     let sound = [tr!("None", "Sin sonido", "なし"), tr!("System", "Sistema", "システム"), tr!("App", "Aplicación", "アプリ")];
     let labels: Vec<(&str, Option<&FontVec>)> = sound.iter().map(|l| (l.as_str(), f)).collect();
     segmented(&mut c, SX, SEG_OUT, &labels, t.out.get(), &|i| hv(SetHit::Output(i)));
@@ -1132,7 +1293,7 @@ pub fn settings(s: &SettingsState) -> Canvas {
     }
     lbl(&mut c, &tr!("Microphone", "Micrófono", "マイク"), 15.0, 20.0, ROW_MIC + 5.0, TEXT);
     switch(&mut c, ROW_MIC, t.mic.get(), true);
-    for y in [166.0, 254.0, ROW_POINTER + 24.0, ROW_KEY + 26.0] {
+    for y in DIVIDERS {
         c.paint(DIVIDER, line(SX.0, y, SX.1, y, 0.5));
     }
 
@@ -1146,6 +1307,19 @@ pub fn settings(s: &SettingsState) -> Canvas {
         c.text(f, &note, 12.0, 20.0 + Canvas::width(f, &use_gpu, 15.0) + 8.0, ROW_GPU + 5.0, 0.0, TEXT2);
     }
     switch(&mut c, ROW_GPU, t.gpu.get(), s.gpu_found);
+
+    // how often a recording reads text: "Read text every 2 s, while recording"; when it doesn't
+    // matter, dim, with the one thing that would make it (like the clipboard's "photos only")
+    let on = s.every_on();
+    lbl(&mut c, &tr!("Read text every", "Leer texto cada", "文字の読み取り間隔"), 15.0, 20.0, ROW_EVERY - 4.0, if on { TEXT } else { TEXT2 });
+    let why = match (s.record, s.area, s.text) {
+        (false, ..) => tr!("video only", "solo video", "動画のみ"),
+        (_, false, _) => tr!("Area only", "solo en Área", "範囲のみ"),
+        (_, _, false) => tr!("text recognition off", "reconocimiento apagado", "文字の読み取りがオフ"),
+        _ => tr!("while recording", "al grabar", "録画時"),
+    };
+    lbl(&mut c, &why, 12.0, 20.0, ROW_EVERY + 12.0, TEXT2);
+    counter(&mut c, s, &hv);
 
     lbl(&mut c, &tr!("Image format", "Formato de imagen", "画像の形式"), 15.0, 20.0, ROW_SHOT + 5.0, TEXT);
     segmented(&mut c, (PICK, SX.1), pick_y(ROW_SHOT), &[("PNG", f), ("JPG", f)], t.image.get(), &|i| hv(SetHit::ImageFormat(i)));
@@ -1712,6 +1886,36 @@ mod preview {
                 save(&dir, &format!("settings-clip-{name}-{tag}"), c.w, c.h, &c.px, bg);
             }
 
+            // The OCR interval: at rest, typed into (just arrived by Tab: all selected; then typing), at
+            // its ends (the focus stays on a dim button), and where it doesn't matter.
+            let every = |name: &str, f: &dyn Fn(&mut SettingsState)| {
+                let mut s = set_state(fonts, cjk, SCALE);
+                (s.record, s.text, s.area) = (true, true, true);
+                f(&mut s);
+                s.settle();
+                let c = settings(&s);
+                save(&dir, &format!("settings-every-{name}-{tag}"), c.w, c.h, &c.px, bg);
+            };
+            every("normal", &|_| {});
+            every("hover-plus", &|s| s.hover = Some(SetHit::Every(2)));
+            every("focus-minus", &|s| s.focus = Some(SetHit::Every(0)));
+            every("focus-field", &|s| (s.focus, s.typing) = (Some(SetHit::Every(1)), Some(Typing::new(2.0))));
+            every("typing", &|s| {
+                let mut t = Typing::new(2.0);
+                "2,5".chars().for_each(|ch| t.key(ch));
+                (s.focus, s.typing) = (Some(SetHit::Every(1)), Some(t));
+            });
+            every("typing-mouse", &|s| {
+                let mut t = Typing::new(EVERY.1);
+                t.key('1'); // at 5 s, typing 1: + is live again
+                (s.ocr_every, s.typing) = (EVERY.1, Some(t));
+            });
+            every("min", &|s| (s.ocr_every, s.focus) = (EVERY.0, Some(SetHit::Every(0))));
+            every("max", &|s| (s.ocr_every, s.focus) = (EVERY.1, Some(SetHit::Every(2))));
+            every("na-photo", &|s| s.record = false);
+            every("na-screen", &|s| (s.area, s.text) = (false, false));
+            every("na-ocr-off", &|s| s.text = false);
+
             // The whole launcher over the frozen desktop, as the user sees it.
             let ((px, py), (mx, my)) = place(sw as i32, sh as i32, SCALE);
             let gap = (14.0 * SCALE).round() as i32;
@@ -1773,6 +1977,29 @@ mod preview {
             for (w, h, name) in [(1280, 720, None), (64, 64, None), (1920, 1080, None), (880, 600, Some("Firefox Web Browser"))] {
                 let c = badge(w, h, name, font, SCALE);
                 save(&dir, &format!("badge-{w}x{h}-{tag}"), c.w, c.h, &c.px, bg);
+            }
+        }
+        // A 720 px tall screen (logical): 1280×720 at 1x, 1920×1080 at 1.5x; the settings open over the panel.
+        for (lang, tag) in [(Lang::En, "en"), (Lang::Es, "es"), (Lang::Ja, "ja")] {
+            i18n::set(lang);
+            let fonts = if lang == Lang::Ja { (ja.as_ref(), ja.as_ref()) } else { (latin.as_ref(), bold.as_ref()) };
+            for (w, h, scale) in [(1280, 720, 1.0), (1920, 1080, 1.5)] {
+                let mut full = vec![255 << 24 | 0x3a2f4a; w * h];
+                let ((px, py), (mx, my)) = place(w as i32, h as i32, scale);
+                let mut p = PanelState::new(Mode::Selection, true, fonts, scale);
+                (p.ocr, p.settings_open) = (true, true);
+                p.settle();
+                let mut s = set_state(fonts, if lang == Lang::Ja { None } else { ja.as_ref() }, scale);
+                (s.record, s.text, s.area) = (true, true, true);
+                s.settle();
+                let (pc, sc) = (panel(&p), settings(&s));
+                assert!(my + (M * scale) as i32 >= 0, "the settings' body is on screen");
+                over(&mut full, w, &pc, px as usize, py as usize);
+                // The canvas' top margin may be off screen: only its rows on screen.
+                let skip = (-my).max(0) as usize;
+                let on: Vec<u32> = sc.px[skip * sc.w..].to_vec();
+                over(&mut full, w, &Canvas { w: sc.w, h: sc.h - skip, px: on, scale, alpha: 1.0, origin: (0.0, 0.0) }, mx as usize, (my.max(0)) as usize);
+                save(&dir, &format!("launcher-settings-{w}x{h}-{tag}"), w, h, &full, bg);
             }
         }
         // At 1x too: the panel at rest and with the focus by the close button, and the settings.
@@ -1843,6 +2070,56 @@ mod preview {
     }
 
     #[test]
+    fn every_steps_clamps_and_parses() {
+        // − and + go by half seconds and stop at the ends; off the grid, to the next mark that way.
+        assert_eq!([2.0, 0.5, 5.0, 1.3, 4.8, 0.7].map(|v| every_step(v, true)), [2.5, 1.0, 5.0, 1.5, 5.0, 1.0]);
+        assert_eq!([2.0, 0.5, 5.0, 1.3, 4.8, 0.7].map(|v| every_step(v, false)), [1.5, 0.5, 4.5, 1.0, 4.5, 0.5]);
+        assert_eq!([0.0, 0.49, 5.01, 1.25, 3.04, 100.0].map(every_clamp), [0.5, 0.5, 5.0, 1.3, 3.0, 5.0]);
+        assert_eq!([secs(2.0, '.'), secs(2.5, ','), secs(0.5, '.'), secs(5.0, ','), secs(1.3, '.')], ["2", "2,5", "0.5", "5", "1.3"]);
+        // Typing: digits and one separator, '.' or ',' alike, four at most; a number commits within the range, the rest reverts.
+        let typed = |keys: &str| {
+            let mut t = Typing { text: "2".into(), all: true };
+            for ch in keys.chars() {
+                if ch == '<' { t.back() } else { t.key(ch) }
+            }
+            (t.text.replace(',', "."), t.value(2.0))
+        };
+        assert_eq!(typed("3"), ("3".into(), 3.0)); // the first key replaces the selection
+        assert_eq!(typed("1,5"), ("1.5".into(), 1.5));
+        assert_eq!(typed("1.5"), ("1.5".into(), 1.5));
+        assert_eq!(typed("1.2.5"), ("1.25".into(), 1.3)); // the second separator is ignored
+        assert_eq!(typed("4a s"), ("4".into(), 4.0)); // and so is what isn't a digit
+        assert_eq!(typed("12345"), ("1234".into(), 5.0));
+        assert_eq!(typed("0"), ("0".into(), 0.5));
+        assert_eq!(typed(",5"), (".5".into(), 0.5));
+        assert_eq!(typed("."), (".".into(), 2.0)); // not a number: the old value
+        assert_eq!(typed("<"), ("".into(), 2.0));
+        assert_eq!(typed("3<4"), ("4".into(), 4.0));
+        assert_eq!(typed(""), ("2".into(), 2.0)); // untouched
+    }
+
+    #[test]
+    fn every_commits_and_goes_off_limits() {
+        let mut s = SettingsState::new((None, None), None, 1.0);
+        (s.record, s.text, s.area) = (true, true, true);
+        assert!(!SETTINGS_ORDER.iter().any(|&h| matches!(h, SetHit::Every(_)) && s.off(h)));
+        s.typing = Some(Typing { text: "9".into(), all: false });
+        s.commit();
+        assert!(s.ocr_every == 5.0 && s.typing.is_none());
+        s.typing = Some(Typing { text: "".into(), all: false });
+        s.commit();
+        assert_eq!(s.ocr_every, 5.0);
+        for (record, text) in [(false, true), (true, false), (false, false)] {
+            (s.record, s.text) = (record, text);
+            assert!(s.off(SetHit::Every(0)) && s.off(SetHit::Every(1)) && s.off(SetHit::Every(2)));
+        }
+        // The focus passes over it then, both ways.
+        let off = |h| s.off(h);
+        assert_eq!(step(&SETTINGS_ORDER, SetHit::Gpu, false, off), SetHit::ImageFormat(0));
+        assert_eq!(step(&SETTINGS_ORDER, SetHit::ImageFormat(0), true, off), SetHit::VideoFormat(1)); // no GPU found either
+    }
+
+    #[test]
     fn fit_ellipsises() {
         let Some(f) = load_font(false) else { return };
         let t = Canvas::fit(&f, "Firefox Web Browser", 12.0, 96.0);
@@ -1891,8 +2168,9 @@ mod preview {
         assert_eq!([step(&o, 1, false, |_| false), step(&o, 4, false, |_| false), step(&o, 1, true, |_| false), step(&o, 3, true, |_| false)], [2, 1, 4, 2]);
         assert_eq!([step(&o, 1, false, |h| h == 2), step(&o, 3, true, |h| h == 2), step(&o, 4, false, |h| h == 1)], [3, 1, 2]);
         let no_gpu = |h| h == SetHit::Gpu;
-        assert_eq!(step(&SETTINGS_ORDER, SetHit::VideoFormat(1), false, no_gpu), SetHit::ImageFormat(0));
-        assert_eq!(step(&SETTINGS_ORDER, SetHit::ImageFormat(0), true, no_gpu), SetHit::VideoFormat(1));
+        assert_eq!(step(&SETTINGS_ORDER, SetHit::VideoFormat(1), false, no_gpu), SetHit::Every(0));
+        assert_eq!(step(&SETTINGS_ORDER, SetHit::Every(0), true, no_gpu), SetHit::VideoFormat(1));
+        assert_eq!(step(&SETTINGS_ORDER, SetHit::Every(2), false, no_gpu), SetHit::ImageFormat(0)); // −, the field, + in a row
         assert_eq!(step(&SETTINGS_ORDER, SetHit::Close, false, no_gpu), SetHit::Output(0));
         assert_eq!(step(&PANEL_ORDER, Hit::Close, false, |_| false), Hit::Mode(Mode::Selection));
         assert_eq!(step(&PANEL_ORDER, Hit::Mode(Mode::Selection), true, |_| false), Hit::Close);
@@ -1911,6 +2189,18 @@ mod preview {
             assert!(!settings_body_has(s, 1, 1) && !settings_body_has(s, d(M + SBODY.0 + 20.0), d(M + SBODY.1 + 20.0)));
             assert!(settings_body_has(s, d(M + 170.0), d(M + 240.0)) && settings_body_has(s, d(M + 30.0), d(M + 30.0)));
         }
+    }
+
+    #[test]
+    fn settings_fit_a_720_px_screen() {
+        for (sw, sh, scale) in [(1280, 720, 1.0), (1920, 1080, 1.5), (1366, 768, 1.0), (1920, 1080, 1.25)] {
+            let ((_, py), (_, my)) = place(sw, sh, scale);
+            let (top, bottom) = (my as f32 / scale + M, my as f32 / scale + M + SBODY.1);
+            assert!(top >= 7.0 && bottom + 8.0 <= py as f32 / scale + M + 1.0, "{sw}x{sh}@{scale}: body {top}..{bottom}, panel at {}", py as f32 / scale + M);
+        }
+        // With room, 18 px above the panel as before.
+        let ((_, py), (_, my)) = place(1920, 1080, 1.25);
+        assert_eq!(((py - my) as f32 / 1.25 - SBODY.1).round(), 18.0);
     }
 
     #[test]
