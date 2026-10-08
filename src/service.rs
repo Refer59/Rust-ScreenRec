@@ -28,11 +28,73 @@ pub fn spawn_detached(args: &[&str]) -> Res<()> {
     Ok(())
 }
 
-/// A client's connection to an endpoint: bytes both ways.
+/// A connection to an endpoint: bytes both ways, and `try_clone` for a second
+/// thread. One thread may wait in a read while another writes.
 #[cfg(unix)]
 pub type Conn = std::os::unix::net::UnixStream;
+
+/// On Windows, a named pipe opened for overlapped I/O, each read and write
+/// waited for on its own. A synchronous pipe handle (a plain File, clones
+/// included) queues every operation behind the one under way, so a write
+/// would wait for a read that waits for the other end.
 #[cfg(windows)]
-pub type Conn = std::fs::File;
+pub struct Conn(std::os::windows::io::OwnedHandle);
+
+#[cfg(windows)]
+impl Conn {
+    /// Another handle to the same connection, for another thread.
+    pub fn try_clone(&self) -> io::Result<Conn> {
+        Ok(Conn(self.0.try_clone()?))
+    }
+
+    fn io(&self, read: bool, buf: *mut u8, len: usize) -> io::Result<usize> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+        let (h, len) = (self.0.as_raw_handle(), len.min(u32::MAX as usize) as u32);
+        let n = overlapped(h, |ov| unsafe { if read { ReadFile(h, buf, len, std::ptr::null_mut(), ov) } else { WriteFile(h, buf, len, std::ptr::null_mut(), ov) } });
+        match n {
+            Err(e) if read && e.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE as i32) => Ok(0), // the other end hung up
+            n => n.map(|n| n as usize),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl io::Read for Conn {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.io(true, buf.as_mut_ptr(), buf.len())
+    }
+}
+
+#[cfg(windows)]
+impl io::Write for Conn {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.io(false, buf.as_ptr().cast_mut(), buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Start one overlapped operation on `h` (`start` gets its OVERLAPPED) and wait for it: the
+/// bytes it moved. Each has its own event, so operations on other threads don't wake it.
+#[cfg(windows)]
+fn overlapped(h: windows_sys::Win32::Foundation::HANDLE, start: impl FnOnce(*mut windows_sys::Win32::System::IO::OVERLAPPED) -> i32) -> io::Result<u32> {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_IO_PENDING, GetLastError};
+    use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+    use windows_sys::Win32::System::Threading::CreateEventW;
+    let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
+    ov.hEvent = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+    if ov.hEvent.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let mut n = 0;
+    let done = (start(&mut ov) != 0 || unsafe { GetLastError() } == ERROR_IO_PENDING) && unsafe { GetOverlappedResult(h, &ov, &mut n, 1) } != 0;
+    let res = if done { Ok(n) } else { Err(io::Error::last_os_error()) };
+    unsafe { CloseHandle(ov.hEvent) };
+    res
+}
 
 /// The endpoint `name` (say, "ocr"), served by this process.
 #[cfg(unix)]
@@ -93,34 +155,35 @@ pub fn connect(name: &str) -> Res<Conn> {
 #[cfg(windows)]
 pub struct Listener {
     name: Vec<u16>,
-    next: windows_sys::Win32::Foundation::HANDLE, // the pipe instance the next client gets
+    next: std::os::windows::io::OwnedHandle, // the pipe instance the next client gets
 }
 
-/// The pipe for `name`. Pipe names are machine-wide: one per user.
+/// The pipe for `name`, NUL-terminated UTF-16. Pipe names are machine-wide: one per user.
 /// ponytail: another local user could create it first and get our clients;
-/// a random per-user name kept in cache_dir() fixes that if it matters.
+/// a random per-user name kept in data_dir() fixes that if it matters.
 #[cfg(windows)]
-fn pipe(name: &str) -> String {
-    format!(r"\\.\pipe\screenrec-{name}-{}", std::env::var("USERNAME").unwrap_or_default())
+fn pipe(name: &str) -> Vec<u16> {
+    let user = std::env::var("USERNAME").unwrap_or_default();
+    format!(r"\\.\pipe\screenrec-{name}-{user}").encode_utf16().chain([0]).collect()
 }
 
-/// A new instance of the pipe `name` (NUL-terminated UTF-16); `first` fails
-/// if the pipe already exists.
+/// A new instance of the pipe `name`; `first` fails if the pipe already exists.
 #[cfg(windows)]
-fn instance(name: &[u16], first: bool) -> io::Result<windows_sys::Win32::Foundation::HANDLE> {
+fn instance(name: &[u16], first: bool) -> io::Result<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::io::FromRawHandle;
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX};
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX};
     use windows_sys::Win32::System::Pipes::{CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT};
-    let open = PIPE_ACCESS_DUPLEX | if first { FILE_FLAG_FIRST_PIPE_INSTANCE } else { 0 };
+    let open = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | if first { FILE_FLAG_FIRST_PIPE_INSTANCE } else { 0 };
     let mode = PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS;
     let h = unsafe { CreateNamedPipeW(name.as_ptr(), open, mode, PIPE_UNLIMITED_INSTANCES, 1 << 16, 1 << 16, 0, std::ptr::null()) };
-    if h == INVALID_HANDLE_VALUE { Err(io::Error::last_os_error()) } else { Ok(h) }
+    if h == INVALID_HANDLE_VALUE { Err(io::Error::last_os_error()) } else { Ok(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(h) }) }
 }
 
 /// Serve the endpoint `name`; None if another process already does.
 #[cfg(windows)]
 pub fn listen(name: &str) -> Res<Option<Listener>> {
-    let name: Vec<u16> = pipe(name).encode_utf16().chain([0]).collect();
+    let name = pipe(name);
     match instance(&name, true) {
         Ok(next) => Ok(Some(Listener { name, next })),
         Err(e) if e.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32) => Ok(None),
@@ -132,32 +195,35 @@ pub fn listen(name: &str) -> Res<Option<Listener>> {
 impl Listener {
     /// The next client to connect.
     pub fn accept(&mut self) -> Res<Conn> {
-        use std::os::windows::io::FromRawHandle;
-        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_PIPE_CONNECTED};
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::ERROR_PIPE_CONNECTED;
         use windows_sys::Win32::System::Pipes::ConnectNamedPipe;
         loop {
-            // A client may have connected already (since the instance was made): that's fine too.
-            let ok = unsafe { ConnectNamedPipe(self.next, std::ptr::null_mut()) } != 0 || io::Error::last_os_error().raw_os_error() == Some(ERROR_PIPE_CONNECTED as i32);
+            // A client may have connected already, since the instance was made: that's fine too.
+            let h = self.next.as_raw_handle();
+            let ok = match overlapped(h, |ov| unsafe { ConnectNamedPipe(h, ov) }) {
+                Ok(_) => true,
+                Err(e) => e.raw_os_error() == Some(ERROR_PIPE_CONNECTED as i32),
+            };
             let this = std::mem::replace(&mut self.next, instance(&self.name, false)?);
             if ok {
-                return Ok(unsafe { Conn::from_raw_handle(this) });
-            }
-            unsafe { CloseHandle(this) }; // a client that left before we got to it
+                return Ok(Conn(this));
+            } // else it's dropped: a client that left before we got to it
         }
-    }
-}
-
-#[cfg(windows)]
-impl Drop for Listener {
-    fn drop(&mut self) {
-        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.next) };
     }
 }
 
 /// Connect to the process that serves `name`; an error if none does.
 #[cfg(windows)]
 pub fn connect(name: &str) -> Res<Conn> {
-    Ok(std::fs::OpenOptions::new().read(true).write(true).open(pipe(name))?)
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING};
+    let h = unsafe { CreateFileW(pipe(name).as_ptr(), GENERIC_READ | GENERIC_WRITE, 0, std::ptr::null(), OPEN_EXISTING, FILE_FLAG_OVERLAPPED, std::ptr::null_mut()) };
+    if h == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(Conn(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(h) }))
 }
 
 /// Download `url` to `dest` with the system's curl (Windows 10+, macOS, most
@@ -212,6 +278,7 @@ fn tar() -> Command {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+    use std::time::Duration;
 
     #[test]
     fn one_process_serves_and_clients_talk_to_it() {
@@ -231,6 +298,49 @@ mod tests {
         conn.read_exact(&mut got).unwrap();
         conn.write_all(b"pong").unwrap();
         assert_eq!((&got, &client.join().unwrap()), (b"ping", b"pong"));
+        drop(server);
+        #[cfg(unix)]
+        for p in [endpoint(&name).unwrap(), endpoint(&name).unwrap().with_extension("lock")] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn a_waiting_reader_does_not_hold_up_a_write() {
+        // A recording waits for the service's answers on one thread while it sends frames on
+        // another, and the service reads the next frame while it answers the last: both ends.
+        use std::sync::mpsc::channel;
+        let name = format!("duplex-{}", std::process::id());
+        let mut server = listen(&name).unwrap().expect("nobody serves it yet");
+        let (to, (said, heard), t) = (name.clone(), channel(), Duration::from_secs(10));
+        std::thread::spawn(move || {
+            let mut c = connect(&to).unwrap();
+            let mut answers = c.try_clone().unwrap();
+            let waiting = std::thread::spawn(move || {
+                let mut b = [0; 1];
+                answers.read_exact(&mut b).map(|()| b[0])
+            });
+            std::thread::sleep(Duration::from_millis(200)); // it waits for an answer by now
+            c.write_all(b"1").unwrap();
+            said.send(waiting.join().unwrap().unwrap()).unwrap();
+            c.write_all(b"2").unwrap();
+        });
+        let mut conn = server.accept().unwrap();
+        let mut answer = conn.try_clone().unwrap();
+        let (got, frames) = channel();
+        std::thread::spawn(move || {
+            let mut b = [0; 1];
+            while conn.read_exact(&mut b).is_ok() {
+                got.send(b[0]).unwrap();
+            }
+        });
+        assert_eq!(frames.recv_timeout(t).expect("the client's write waited for its reader"), b'1');
+        std::thread::sleep(Duration::from_millis(200)); // the service waits for the next frame by now
+        let (wrote, written) = channel();
+        std::thread::spawn(move || wrote.send(answer.write_all(b"a").is_ok()));
+        assert!(written.recv_timeout(t).expect("the service's write waited for its reader"));
+        assert_eq!(heard.recv_timeout(t).unwrap(), b'a');
+        assert_eq!(frames.recv_timeout(t).unwrap(), b'2');
         drop(server);
         #[cfg(unix)]
         for p in [endpoint(&name).unwrap(), endpoint(&name).unwrap().with_extension("lock")] {
