@@ -433,22 +433,57 @@ mod tests {
         assert!((t[6 * 2] - (20.0 / 255.0 - 0.5) / 0.5).abs() < 1e-6, "second plane is the G channel");
     }
 
+    /// This process's CPU time so far (all threads), in ms.
+    fn cpu_ms() -> u64 {
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+        (ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) as u64 * 1000 + (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) as u64 / 1000
+    }
+
+    /// A PNG as BGRX.
+    fn load_png(path: &std::path::Path) -> (Vec<u8>, usize, usize) {
+        let dec = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(path).unwrap()));
+        let mut r = dec.read_info().unwrap();
+        let mut buf = vec![0; r.output_buffer_size().unwrap()];
+        let info = r.next_frame(&mut buf).unwrap();
+        let (w, h, n) = (info.width as usize, info.height as usize, info.color_type.samples());
+        (buf.chunks(n).flat_map(|p| [p[2], p[1], p[0], 0]).collect(), w, h)
+    }
+
     /// Needs the installed files (see ocr_files): reads the sample next to the sources, with
     /// Spanish accents and Japanese, and checks the text. CI runs it after the install test.
     #[test]
     #[ignore]
     fn ocr_reads_spanish_and_japanese_from_the_sample() {
-        let files = ocr_files::files().unwrap();
-        let engine = Engine::load(&files).unwrap();
-        let dec = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/ocr-sample.png")).unwrap()));
-        let mut r = dec.read_info().unwrap();
-        let mut buf = vec![0; r.output_buffer_size().unwrap()];
-        let info = r.next_frame(&mut buf).unwrap();
-        let (w, h, n) = (info.width as usize, info.height as usize, info.color_type.samples());
-        let bgrx: Vec<u8> = buf.chunks(n).flat_map(|p| [p[2], p[1], p[0], 0]).collect();
+        let engine = Engine::load(&ocr_files::files().unwrap()).unwrap();
+        let (bgrx, w, h) = load_png(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/ocr-sample.png")));
         let lines = engine.recognize(&bgrx, w, h, w * 4).unwrap();
         let text = text_of(&lines);
         assert!(text.contains("Hola señor, ¿qué tal?"), "{text}");
         assert!(text.contains("日本語のテキスト"), "{text}");
+    }
+
+    /// Scores the shipped pipeline on a folder of screenshots: SCREENREC_OCR_TESTSET=<dir>
+    /// reads its *.png and writes <dir>/rust-results.tsv (image, x, y, w, h, confidence, text;
+    /// a `#` line per image with its milliseconds) for a scorer with the ground truth.
+    #[test]
+    #[ignore]
+    fn ocr_dumps_a_testset() {
+        let Some(dir) = std::env::var_os("SCREENREC_OCR_TESTSET").map(std::path::PathBuf::from) else { return };
+        let engine = Engine::load(&ocr_files::files().unwrap()).unwrap();
+        let mut out = String::new();
+        let mut names: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "png")).collect();
+        names.sort();
+        for p in names {
+            let (bgrx, w, h) = load_png(&p);
+            let (t, c0) = (std::time::Instant::now(), cpu_ms());
+            let lines = engine.recognize(&bgrx, w, h, w * 4).unwrap();
+            let name = p.file_name().unwrap().to_string_lossy();
+            out.push_str(&format!("# {name} {} ms {} lines {} cpu_ms {}x{}\n", t.elapsed().as_millis(), lines.len(), cpu_ms() - c0, w, h));
+            for l in lines {
+                out.push_str(&format!("{name}\t{}\t{}\t{}\t{}\t{:.3}\t{}\n", l.x, l.y, l.w, l.h, l.conf, l.text));
+            }
+        }
+        std::fs::write(dir.join("rust-results.tsv"), out).unwrap();
     }
 }

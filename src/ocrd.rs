@@ -11,7 +11,7 @@ use std::collections::{HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -22,7 +22,6 @@ pub fn every_clamp(v: f32) -> f32 {
 }
 
 const MAGIC: &[u8; 4] = b"OCR1";
-const ENDPOINT: &str = "ocr";
 const IDLE_EXIT: Duration = Duration::from_secs(300);
 const MAX_PIXELS: u64 = 64 << 20; // 8K is 33 M
 
@@ -73,15 +72,24 @@ struct Image {
     bgrx: Vec<u8>,
 }
 
-/// Send the image's rows (`stride` bytes apart) straight from the capture buffer: no copy here.
+/// Send the image (rows `stride` bytes apart) in one write: a row at a time would wake the
+/// service's reader a thousand times per frame (~20 ms of CPU for both; one write is ~2 ms).
 fn write_image(w: &mut impl Write, bgrx: &[u8], (iw, ih, stride): (usize, usize, usize), ms: u64) -> std::io::Result<()> {
     let wall = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    w.write_all(&(iw as u32).to_le_bytes())?;
-    w.write_all(&(ih as u32).to_le_bytes())?;
-    w.write_all(&ms.to_le_bytes())?;
-    w.write_all(&wall.to_le_bytes())?;
-    for y in 0..ih {
-        w.write_all(&bgrx[y * stride..][..iw * 4])?;
+    let mut head = Vec::with_capacity(24);
+    head.extend_from_slice(&(iw as u32).to_le_bytes());
+    head.extend_from_slice(&(ih as u32).to_le_bytes());
+    head.extend_from_slice(&ms.to_le_bytes());
+    head.extend_from_slice(&wall.to_le_bytes());
+    w.write_all(&head)?;
+    if stride == iw * 4 {
+        w.write_all(&bgrx[..iw * 4 * ih])?;
+    } else {
+        let mut packed = Vec::with_capacity(iw * 4 * ih);
+        for y in 0..ih {
+            packed.extend_from_slice(&bgrx[y * stride..][..iw * 4]);
+        }
+        w.write_all(&packed)?;
     }
     w.flush()
 }
@@ -104,6 +112,15 @@ fn read_image(r: &mut impl Read) -> Res<Option<Image>> {
     Ok(Some(Image { w, h, ms: u64_at(8), wall: u64_at(16), bgrx }))
 }
 
+/// The service's endpoint: one per X display, since the service keeps its first client's
+/// environment and that is where its clipboard copies and notifications go.
+fn endpoint() -> String {
+    match std::env::var("DISPLAY") {
+        Ok(d) if !d.is_empty() => format!("ocr-{}", d.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect::<String>()),
+        _ => "ocr".to_owned(),
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Clients.
 
@@ -111,13 +128,14 @@ fn read_image(r: &mut impl Read) -> Res<Option<Image>> {
 /// installed: nothing is started for nothing.
 fn connect() -> Res<Conn> {
     ocr_files::files()?;
-    if let Ok(c) = service::connect(ENDPOINT) {
+    let endpoint = endpoint();
+    if let Ok(c) = service::connect(&endpoint) {
         return Ok(c);
     }
     service::spawn_detached(&["ocrd"])?;
     let give_up = Instant::now() + Duration::from_secs(5);
     loop {
-        match service::connect(ENDPOINT) {
+        match service::connect(&endpoint) {
             Ok(c) => return Ok(c),
             Err(e) if Instant::now() > give_up => return Err(tr!("the text recognition service didn't start: {}", "el servicio de reconocimiento de texto no arrancó: {}", "テキスト認識サービスが起動しませんでした: {}", e).into()),
             Err(_) => std::thread::sleep(Duration::from_millis(20)),
@@ -141,10 +159,11 @@ pub fn shot(bgrx: &[u8], w: usize, h: usize, stride: usize, image: &Path, clipbo
 }
 
 /// A recording's side of the service: frames offered every `every` seconds at most, one in
-/// flight, each line of text appended once to `txt` with its time.
+/// flight, each line of text appended once to `txt` with its time. The recording's thread
+/// only copies the frame (~1 ms); a sender thread writes it to the service.
 pub struct Video {
     pending: Option<Receiver<Result<Conn, String>>>, // connecting on a thread: the recording never waits
-    conn: Option<Conn>,
+    sender: Option<SyncSender<Image>>,
     idle: Arc<AtomicBool>, // the service has answered the last frame
     dead: Arc<AtomicBool>, // ... or hung up
     every: Duration,
@@ -158,15 +177,15 @@ impl Video {
             let header = Header { video: true, notify, clipboard: false, path: txt };
             let _ = tx.send(connect().and_then(|mut c| header.write(&mut c).map(|()| c).map_err(Into::into)).map_err(|e| e.to_string()));
         });
-        Video { pending: Some(rx), conn: None, idle: Arc::new(AtomicBool::new(true)), dead: Arc::new(AtomicBool::new(false)), every: Duration::from_secs_f32(every_clamp(every)), last: None }
+        Video { pending: Some(rx), sender: None, idle: Arc::new(AtomicBool::new(true)), dead: Arc::new(AtomicBool::new(false)), every: Duration::from_secs_f32(every_clamp(every)), last: None }
     }
 
     /// A frame just recorded (w×h BGRX, rows `stride` apart, `ms` on the video's clock):
-    /// sent if it is time and the service is free, else skipped; ~2 ms when sent.
+    /// copied for the service if it is time and the service is free, else skipped.
     pub fn offer(&mut self, bgrx: &[u8], (w, h, stride): (usize, usize, usize), ms: u64) -> Res<()> {
         if let Some(rx) = &self.pending {
             match rx.try_recv() {
-                Ok(Ok(conn)) => {
+                Ok(Ok(mut conn)) => {
                     let (mut acks, idle, dead) = (conn.try_clone()?, self.idle.clone(), self.dead.clone());
                     std::thread::spawn(move || {
                         let mut b = [0u8; 1];
@@ -175,7 +194,15 @@ impl Video {
                         }
                         dead.store(true, Relaxed);
                     });
-                    (self.conn, self.pending) = (Some(conn), None);
+                    let (tx, frames) = std::sync::mpsc::sync_channel::<Image>(1); // one frame at a time by design
+                    std::thread::spawn(move || {
+                        for f in frames {
+                            if write_image(&mut conn, &f.bgrx, (f.w, f.h, f.w * 4), f.ms).is_err() {
+                                break; // the ack reader sees the hang-up and says so
+                            }
+                        }
+                    });
+                    (self.sender, self.pending) = (Some(tx), None);
                 }
                 Ok(Err(e)) => return Err(e.into()),
                 Err(TryRecvError::Empty) => return Ok(()),
@@ -189,8 +216,14 @@ impl Video {
         if !due || !self.idle.load(Relaxed) {
             return Ok(());
         }
-        let Some(conn) = self.conn.as_mut() else { return Ok(()) };
-        write_image(conn, bgrx, (w, h, stride), ms)?;
+        let Some(tx) = &self.sender else { return Ok(()) };
+        let mut copy = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            copy.extend_from_slice(&bgrx[y * stride..][..w * 4]);
+        }
+        if tx.try_send(Image { w, h, ms, wall: 0, bgrx: copy }).is_err() {
+            return Ok(()); // still sending the last one (the ack rule makes this rare): skip this frame
+        }
         self.idle.store(false, Relaxed);
         self.last = Some(Instant::now());
         Ok(())
@@ -250,7 +283,7 @@ impl Queue {
 
 /// Serve until idle for five minutes; returns at once if another process already serves.
 pub fn serve() -> Res<()> {
-    let Some(mut listener) = service::listen(ENDPOINT)? else { return Ok(()) };
+    let Some(mut listener) = service::listen(&endpoint())? else { return Ok(()) };
     desktop::lower_priority();
     let q = Arc::new(Queue::default());
     let worker = q.clone();
