@@ -116,6 +116,15 @@ pub fn install(out: &mut impl Write) -> Res<()> {
     Ok(())
 }
 
+/// Error unless the installed runtime is the pinned one. A damaged library would crash the
+/// loader rather than fail (a truncated one maps pages past its end: SIGBUS), so the service
+/// hashes it before loading it, once per start (~0.1 s for 29 MB). A wrong one is removed, so
+/// the next request says to install again.
+pub fn verify_runtime(path: &Path) -> Res<()> {
+    let Some(rt) = RUNTIME else { return Err(no_runtime().into()) };
+    check(path, rt.sha256).map_err(|e| tr!("{}: run `screenrec install`", "{}: ejecuta `screenrec install`", "{}: `screenrec install` を実行してください", e).into())
+}
+
 /// Error unless `path` hashes to `sha256`; a wrong file is removed.
 fn check(path: &Path, sha256: &str) -> Res<()> {
     if sha256_file(path)? == sha256 {

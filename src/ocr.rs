@@ -112,6 +112,7 @@ fn reinstall() -> String {
 impl Engine {
     /// Load the runtime and both models from `files` (ocr_files::files()): ~0.3 s and ~90 MB.
     pub fn load(files: &Files) -> Res<Engine> {
+        ocr_files::verify_runtime(&files.runtime)?;
         let lib = dylib::open_path(&files.runtime).ok_or_else(|| {
             let why = load_error(); // first: on Windows, tr!'s own calls would overwrite the error
             tr!("couldn't load {}: {}", "no se pudo cargar {}: {}", "{} を読み込めませんでした: {}", files.runtime.display(), why)
