@@ -95,6 +95,9 @@ fn usage() -> String {
 const KEYINT_MS: u64 = 5000;
 
 static STOP: AtomicBool = AtomicBool::new(false);
+/// A recording has its encoder and its first frame is next: what the launcher waits
+/// for before it fades out of a recording that includes it.
+static RECORDING: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_signal(_: libc::c_int) {
     STOP.store(true, Relaxed);
@@ -168,7 +171,7 @@ fn shot(args: &[String]) -> Res<()> {
 }
 
 fn rec(args: &[String]) -> Res<()> {
-    let (mut opts, mut path, mut window) = (RecOpts { fps: None, gpu: true, sound: None, ocr: None }, None, None);
+    let (mut opts, mut path, mut window) = (RecOpts { fps: None, gpu: true, sound: None, ocr: None, ui: false }, None, None);
     let (mut ocr, mut every) = (false, ocrd::EVERY_DEFAULT);
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -214,12 +217,14 @@ fn rec(args: &[String]) -> Res<()> {
 /// How to record: frame rate cap (default: 60 on the GPU, 30 on the CPU,
 /// where encoding is what costs), GPU or not, the sound (output, microphone,
 /// the pid whose sound "Window" means), and text recognition (the .txt to
-/// write, how often to read the screen in seconds).
+/// write, how often to read the screen in seconds), and whether our own UI
+/// stays in the video (the pill isn't taken out of the frames).
 struct RecOpts {
     fps: Option<u32>,
     gpu: bool,
     sound: Option<(Output, bool, Option<u32>)>,
     ocr: Option<(PathBuf, f32)>,
+    ui: bool,
 }
 
 /// What a recording captures: part of the screen, or one window (client id,
@@ -309,6 +314,8 @@ struct Last {
     ocr: bool,
     /// Seconds between the frames a recording reads text from: at most one per interval.
     ocr_every: f32,
+    /// Capture the whole screen with the launcher in it, whatever the mode.
+    with_ui: bool,
 }
 
 fn last_path() -> PathBuf {
@@ -337,22 +344,23 @@ impl Last {
         let gpu = f.get(11) != Some(&"false"); // the GPU when there is one, unless told otherwise
         let mode = mode.unwrap_or(Mode::Selection);
         let ocr_every = f.get(15).and_then(|v| v.parse::<f32>().ok()).filter(|v| v.is_finite()).map_or(ui::EVERY_DEFAULT, ui::every_clamp);
-        // Older files end at 12 (clip and ocr off) or at 14 (the default interval).
-        Last { mode, record: flag(1), pointer: flag(2), sel, output, mic: flag(8), mp4: flag(9), jpg: flag(10), gpu, clip: flag(13), ocr: flag(14), ocr_every }
+        // Older files end at 12 (clip and ocr off), at 14 (the default interval) or at 15 (the UI left out).
+        Last { mode, record: flag(1), pointer: flag(2), sel, output, mic: flag(8), mp4: flag(9), jpg: flag(10), gpu, clip: flag(13), ocr: flag(14), ocr_every, with_ui: flag(16) }
     }
 
     fn save(&self) {
         let path = last_path();
         let (m, (x0, y0, x1, y1), o) = (self.mode, self.sel, self.output);
         let _ = std::fs::create_dir_all(path.parent().unwrap());
-        let (rec, ptr, mic, mp4, jpg, gpu, clip, ocr, every) = (self.record, self.pointer, self.mic, self.mp4, self.jpg, self.gpu, self.clip, self.ocr, self.ocr_every);
+        let (rec, ptr, mic, mp4, jpg, gpu, clip, ocr, every, ui) = (self.record, self.pointer, self.mic, self.mp4, self.jpg, self.gpu, self.clip, self.ocr, self.ocr_every, self.with_ui);
         let lang = i18n::chosen().map_or("-".into(), |l| format!("{l:?}")); // "-": the locale's
-        let _ = std::fs::write(path, format!("{m:?} {rec} {ptr} {x0} {y0} {x1} {y1} {o:?} {mic} {mp4} {jpg} {gpu} {lang} {clip} {ocr} {every}\n"));
+        let _ = std::fs::write(path, format!("{m:?} {rec} {ptr} {x0} {y0} {x1} {y1} {o:?} {mic} {mp4} {jpg} {gpu} {lang} {clip} {ocr} {every} {ui}\n"));
     }
 
-    /// Whether the capture's text gets recognized: the switch is on and the mode is Área.
+    /// Whether the capture's text gets recognized: the switch is on and the mode is Área
+    /// (not overruled by the UI, which makes it the whole screen).
     fn text(&self) -> bool {
-        self.ocr && self.mode == Mode::Selection
+        self.ocr && self.mode == Mode::Selection && !self.with_ui
     }
 }
 
@@ -368,6 +376,19 @@ fn last_reads_older_files() {
     // The interval, clamped to 0.5..5 s; what isn't a number is the default.
     let every = |v: &str| Last::parse(&format!("Selection false false 1 2 300 400 None false false false true - true true {v}\n"), 1920, 1080).ocr_every;
     assert_eq!(["2.5", "0.5", "5", "0.1", "9", "-3", "1.25", "nan", "inf", "x", ""].map(every), [2.5, 0.5, 5.0, 0.5, 5.0, 0.5, 1.3, 2.0, 2.0, 2.0, 2.0]);
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn last_with_ui() {
+    // Files without it (v7 and older) leave the UI out.
+    let v7 = Last::parse("Selection false false 1 2 300 400 None false false false true - true true 2.5\n", 1920, 1080);
+    assert!(!v7.with_ui && v7.text());
+    assert!(!Last::parse("Selection true false 1 2 300 400 System true false true false Es\n", 1920, 1080).with_ui);
+    let v8 = Last::parse("Selection false false 1 2 300 400 None false false false true - true true 2.5 true\n", 1920, 1080);
+    assert!(v8.with_ui && v8.ocr && v8.ocr_every == 2.5);
+    assert!(!v8.text(), "no text read with the UI in: it's the whole screen");
+    assert!(!Last::parse("Selection false false 1 2 300 400 None false false false true - true true 2.5 false\n", 1920, 1080).with_ui);
 }
 
 /// One launcher at a time: launching again (the shortcut pressed twice)
@@ -792,6 +813,7 @@ fn gui() -> Res<()> {
             if shoot {
                 (last.mode, last.record, last.ocr_every) = (st.mode, st.record, set.ocr_every);
                 let target = match (last.mode, picked.or(hovered)) {
+                    _ if last.with_ui => Some(Target::Area((0, 0, sw, sh))), // the launcher is on all of it
                     (Mode::Window, Some((r, id))) => Some(Target::Window(id, r)),
                     (Mode::Window, None) => None, // no window picked
                     _ => area(&last, None).map(Target::Area),
@@ -884,6 +906,9 @@ fn shutter(mut cap: Capture, ov: &mut select::Overlay, (windows, fade): (&[&ui::
     let text = last.text(); // recognize the capture's text
     if !last.record {
         // The file never waits for the fade: it's cut from the frozen screen while the launcher fades out.
+        // With the UI in, it's the screen as it is now instead, the launcher on it, taken before the fade.
+        let live = if last.with_ui { Some(freeze(&mut cap)?) } else { None };
+        let cursor = live.as_ref().unwrap_or(cursor);
         let path = default_path("PICTURES", &shot_prefix(), if last.jpg { "jpg" } else { "png" });
         let (frame, sw) = (cap.frame(), cap.sw);
         let (w, h) = ((r.2 - r.0) as usize, (r.3 - r.1) as usize);
@@ -913,19 +938,29 @@ fn shutter(mut cap: Capture, ov: &mut select::Overlay, (windows, fade): (&[&ui::
         });
     }
     let path = default_path("VIDEOS", &rec_prefix(), "mkv");
-    let opts = RecOpts { fps: None, gpu: last.gpu, sound: Some((last.output, last.mic, app)), ocr: text.then(|| (path.with_extension("txt"), last.ocr_every)) };
+    let ui = last.with_ui;
+    let opts = RecOpts { fps: None, gpu: last.gpu, sound: Some((last.output, last.mic, app)), ocr: text.then(|| (path.with_extension("txt"), last.ocr_every)), ui };
     cap.draw_pointer = last.pointer;
-    if let Target::Window(..) = target {
-        // A window is recorded from its own pixmap, where the launcher never shows: the
-        // recording starts at once, and the launcher fades out meanwhile on a thread with
-        // its own connection (this one is the recording's).
+    if matches!(target, Target::Window(..)) || ui {
+        // A window is recorded from its own pixmap, where the launcher never shows; with the
+        // UI in, the launcher is meant to be in the video, and so is the pill. Either way the
+        // recording starts at once, and the launcher fades out meanwhile on a thread with its
+        // own connection (this one is the recording's): with the UI in, from its first frame.
         cap.conn.ungrab_keyboard(CURRENT_TIME)?;
-        fade.go(0.0);
+        RECORDING.store(false, Relaxed);
+        if !ui {
+            fade.go(0.0);
+        }
         let pill = ui::Pill::new(&cap, fonts, scale)?;
         let res = std::thread::scope(|s| {
             let fading = s.spawn(|| -> Result<(), String> {
                 let mut fade_out = || -> Res<()> {
                     let (conn, _) = x11rb::connect(None)?;
+                    let give_up = Instant::now() + Duration::from_secs(3); // the recording failed to start: go anyway
+                    while ui && !RECORDING.load(Relaxed) && !STOP.load(Relaxed) && Instant::now() < give_up {
+                        std::thread::sleep(Duration::from_millis(4));
+                    }
+                    fade.go(0.0);
                     loop {
                         let done = !fade.busy();
                         fade.apply(&conn, &ours)?;
@@ -1014,16 +1049,19 @@ fn settle(cap: &mut Capture, gone: Option<&Sprite>) -> Res<()> {
 
 /// The pill's clicks and drags since the last call: pause or resume
 /// (`paused` since when, `paused_for` in all) or stop, which sets STOP.
-/// Without a pill, events nobody wants are dropped.
+/// Without a pill, events nobody wants are dropped. `ui`: the pill stays in
+/// the frames, so capture.rs isn't told about its new looks.
 #[cfg(target_os = "linux")]
-fn pump_pill(cap: &mut Capture, pill: &mut Option<Pill>, paused: &mut Option<Instant>, paused_for: &mut Duration) -> Res<()> {
+fn pump_pill(cap: &mut Capture, pill: &mut Option<Pill>, paused: &mut Option<Instant>, paused_for: &mut Duration, ui: bool) -> Res<()> {
     for ev in cap.take_events()? {
         let Some(p) = pill.as_mut() else { continue };
         match p.event(&cap.conn, &ev)? {
             PillEvent::TogglePause if paused.is_some() => {
                 *paused_for += paused.take().unwrap().elapsed();
                 p.set_paused(&cap.conn, false)?;
-                cap.set_overlay(p.win.sprite());
+                if !ui {
+                    cap.set_overlay(p.win.sprite());
+                }
                 cap.retrack()?;
                 settle(cap, None)?; // compositor must show this look before we remove it
             }
@@ -1042,7 +1080,7 @@ fn pump_pill(cap: &mut Capture, pill: &mut Option<Pill>, paused: &mut Option<Ins
     if let Some(p) = pill.as_mut() {
         p.animate(&cap.conn)?;
         cap.move_overlay(p.win.x, p.win.y);
-        if p.tick(&cap.conn)? {
+        if p.tick(&cap.conn)? && !ui {
             cap.set_overlay(p.win.sprite()); // the old look stays removable until it's off screen
         }
     }
@@ -1064,7 +1102,7 @@ impl Pill {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn pump_pill(_: &mut Capture, _: &mut Option<Pill>, _: &mut Option<Instant>, _: &mut Duration) -> Res<()> {
+fn pump_pill(_: &mut Capture, _: &mut Option<Pill>, _: &mut Option<Instant>, _: &mut Duration, _: bool) -> Res<()> {
     Ok(())
 }
 
@@ -1173,6 +1211,7 @@ fn record(cap: &mut Capture, path: &Path, opts: &RecOpts, mut pill: Option<Pill>
         unsafe { libc::signal(sig, on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t) };
     }
     desktop::lower_priority();
+    let ui = opts.ui;
 
     let (Target::Area(r) | Target::Window(_, r)) = target;
     let (w, h) = (((r.2 - r.0) & !1) as usize, ((r.3 - r.1) & !1) as usize); // 4:2:0 needs even sizes
@@ -1265,6 +1304,7 @@ fn record(cap: &mut Capture, path: &Path, opts: &RecOpts, mut pill: Option<Pill>
     );
 
     let t0 = Instant::now();
+    RECORDING.store(true, Relaxed);
     let mut last = t0 - tick;
     let (mut paused, mut paused_for) = (None::<Instant>, Duration::ZERO);
     // Audio frame (48 kHz) on the recording's timeline: wall clock minus pauses.
@@ -1273,7 +1313,7 @@ fn record(cap: &mut Capture, path: &Path, opts: &RecOpts, mut pill: Option<Pill>
     };
     let res = (|| -> Res<()> {
         while !STOP.load(Relaxed) {
-            pump_pill(cap, &mut pill, &mut paused, &mut paused_for)?;
+            pump_pill(cap, &mut pill, &mut paused, &mut paused_for, ui)?;
             if let (Some(a), Some(m)) = (sound.as_mut(), mkv.as_mut()) {
                 let until = frame_of(paused.unwrap_or_else(Instant::now), paused_for);
                 for (ts, packet) in a.pump(|at| frame_of(at, paused_for), until, paused.is_some(), false)? {
