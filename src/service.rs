@@ -257,7 +257,9 @@ pub fn download(url: &str, dest: &Path) -> Res<()> {
 /// next to its 16 MB DLL, its macOS tgz a 73 MB dSYM.
 pub fn unpack(archive: &Path, dir: &Path, members: &[&str]) -> Res<()> {
     std::fs::create_dir_all(dir)?;
-    let st = tar().arg("-xf").arg(archive).arg("-C").arg(dir).args(members).stdin(Stdio::null()).status();
+    // Not the archive's owners (uid 1001 for ONNX Runtime's): as root, tar would chown to them,
+    // which fails in a user namespace or rootless container, and is wrong anywhere.
+    let st = tar().arg("-xf").arg(archive).arg("--no-same-owner").arg("-C").arg(dir).args(members).stdin(Stdio::null()).status();
     if st.map_err(|_| tr!("unpacking needs tar", "para descomprimir hace falta tar", "展開には tar が必要です"))?.success() {
         Ok(())
     } else {
