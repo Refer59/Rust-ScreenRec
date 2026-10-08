@@ -110,18 +110,26 @@ done
 wait $pids
 for n in 1 2 3; do poll 120 read_back "$OUT/f$n.txt" && ok "concurrent request $n" || ko "concurrent request $n: no text"; done
 
-# 5. rec --ocr: one line per detection, video time then wall-clock time
+# 5. rec --ocr: one line per detection, video time then wall-clock time. A running clock on
+# screen gives every sample new text, so the reads every 2 s (the default) each make a line.
 if [ "$(uname -s)" = Linux ]; then
+    timeout 60 ffplay -loglevel quiet -noborder -left 0 -top 0 -f lavfi -i "color=white:s=1280x720:r=10,drawtext=fontfile=$(fc-match -f '%{file}' 'DejaVu Sans'):text='Hola %{pts\\:hms}':fontsize=64:x=40:y=360" &
+    CLOCK=$!
+    sleep 2
     "$BIN" rec "$OUT/r.mkv" --ocr --cpu &
     REC=$!
-    sleep 8
+    sleep 9
     kill -INT $REC
     wait $REC || ko "rec --ocr exited with $?"
+    kill $CLOCK 2> /dev/null
     line='^[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3} \([0-9]{2}:[0-9]{2}:[0-9]{2}\) - '
-    rec_read() { [ -s "$OUT/r.txt" ] && grep -qE "${line}.*Hola" "$OUT/r.txt"; }
-    if poll 120 rec_read; then ok "rec --ocr: $(head -3 "$OUT/r.txt" | tr '\n' '|')"; else ko "rec --ocr: r.txt is '$(head -3 "$OUT/r.txt" 2> /dev/null)'"; fi
+    rec_read() { [ -s "$OUT/r.txt" ] && [ "$(grep -cE "${line}Hola" "$OUT/r.txt")" -ge 3 ]; }
+    if poll 120 rec_read; then ok "rec --ocr: $(grep -cE "${line}Hola" "$OUT/r.txt") reads: $(head -4 "$OUT/r.txt" | tr '\n' '|')"; else ko "rec --ocr: r.txt is '$(head -5 "$OUT/r.txt" 2> /dev/null | tr '\n' '|')'"; fi
     bad=$(grep -cvE "$line" "$OUT/r.txt" 2> /dev/null)
     [ "${bad:-1}" = 0 ] && ok "every r.txt line has the format" || ko "$bad lines of r.txt without the format"
+    # the video times climb, about 2 s apart (0.5 s of slack for a busy machine)
+    gaps=$(grep -oE '^[0-9:.]+' "$OUT/r.txt" | awk -F: '{t = $1 * 3600 + $2 * 60 + $3; if (NR > 1) printf "%.1f ", t - p; p = t}')
+    echo "$gaps" | awk '{for (i = 1; i <= NF; i++) if ($i < 1.5) bad = 1} END {exit bad}' && ok "reads every ~2 s: gaps $gaps" || ko "read gaps: $gaps"
 fi
 
 kill "$SHOWN" 2> /dev/null
