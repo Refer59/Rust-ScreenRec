@@ -229,6 +229,15 @@ impl Capture {
         Ok(())
     }
 
+    /// The monitor the launcher shows on: the primary one, else the one with the pointer at
+    /// (x, y), else the whole screen.
+    pub fn home_monitor(&self, (x, y): (i32, i32)) -> Rect {
+        let all = (0, 0, self.sw as i32, self.sh as i32);
+        let Some(r) = self.conn.randr_get_monitors(self.root, true).ok().and_then(|c| c.reply().ok()) else { return all };
+        let rects = || r.monitors.iter().map(|m| (m.primary, (m.x as i32, m.y as i32, m.x as i32 + m.width as i32, m.y as i32 + m.height as i32)));
+        rects().find(|m| m.0).or_else(|| rects().find(|m| crate::select::contains(m.1, x, y))).map_or(all, |m| m.1)
+    }
+
     /// Capture only this part of the screen from now on (clamped to it).
     pub fn set_region(&mut self, x: i32, y: i32, w: i32, h: i32) {
         let (x0, y0) = (x.clamp(0, self.sw as i32 - 1), y.clamp(0, self.sh as i32 - 1));

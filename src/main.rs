@@ -528,14 +528,23 @@ fn gui() -> Res<()> {
     let mut st = ui::PanelState::new(last.mode, last.record, fonts(), scale);
     (st.ocr, st.with_ui) = (last.ocr, last.with_ui);
     let mut window = name_of(&cap, hovered); // the name of the window Window mode would take, for the badge
-    let ((px, py), (mx, my)) = ui::place(sw, sh, scale);
+    // The panel, its caption, the settings and the tooltip sit on one monitor (with two side by
+    // side, the screen's middle is where they meet); the overlay and the captures span them all.
+    let home = cap.home_monitor((pointer.root_x as i32, pointer.root_y as i32));
+    let (hw, hh) = (home.2 - home.0, home.3 - home.1);
+    let at = |(x, y): (i32, i32)| (x + home.0, y + home.1);
+    let (panel_at, settings_at) = ui::place(hw, hh, scale);
+    let ((px, py), (mx, my)) = (at(panel_at), at(settings_at));
     let mask = EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION | EventMask::LEAVE_WINDOW;
     // The size badge sits under the panel in the stack (made first): the selection's size,
     // or the window's name and size; Screen mode has none.
     let gap = (14.0 * scale).round() as i32; // clear of the corner brackets
     let badge_for = |(r, name): &(Rect, Option<String>), with_ui: bool| {
         let c = ui::badge(r.2 - r.0, r.3 - r.1, name.as_deref(), font(), scale);
-        (ui::badge_pos(*r, (c.w as i32, c.h as i32), (sw, sh), gap, ui::panel_rect(sw, sh, scale, with_ui)), c)
+        (ui::badge_pos(*r, (c.w as i32, c.h as i32), (sw, sh), gap, {
+            let r = ui::panel_rect(hw, hh, scale, with_ui);
+            (r.0 + home.0, r.1 + home.1, r.2 + home.0, r.3 + home.1)
+        }), c)
     };
     let badge_want = |last: &Last, w: Option<(Rect, u32)>, name: &Option<String>| match last.mode {
         Mode::Selection => Some((last.sel, None)),
@@ -834,7 +843,7 @@ fn gui() -> Res<()> {
                     None => None,
                 };
                 let app = app.and_then(|id| ewmh.pid(&cap, id));
-                return shutter(cap, &mut ov, (&[&panel, &modal, &badge, &tip, &caption], &mut fade), target, &last, &cursor, app, (fonts(), scale));
+                return shutter(cap, &mut ov, (&[&panel, &modal, &badge, &tip, &caption], &mut fade), target, &last, &cursor, app, (fonts(), scale, home));
             }
         }
         if reshape {
@@ -877,11 +886,11 @@ fn gui() -> Res<()> {
         st.sync();
         // The caption fades with the panel's `ui` tween: drawn while it runs, gone at 0; on a screen
         // so short that the settings reach it, it goes under them (not drawn over their last row).
-        let a = if st.settings_open && ui::settings_cover_caption(sw, sh, scale) { 0.0 } else { st.ui_shown() };
+        let a = if st.settings_open && ui::settings_cover_caption(hw, hh, scale) { 0.0 } else { st.ui_shown() };
         if a != caption_a {
             if a > 0.0 {
                 let c = ui::ui_caption(font(), scale, a);
-                let (x, y) = ui::caption_pos(sw, sh, scale, (c.w as i32, c.h as i32));
+                let (x, y) = at(ui::caption_pos(hw, hh, scale, (c.w as i32, c.h as i32)));
                 caption.reset(&cap.conn, x, y, c)?;
                 if caption_a <= 0.0 {
                     caption.show(&cap.conn)?;
@@ -900,7 +909,7 @@ fn gui() -> Res<()> {
         if want != tip_text {
             if let Some(text) = &want {
                 let c = ui::tooltip(text, font(), scale, 1.0);
-                let (x, y) = ui::tooltip_pos(sw, sh, scale, (c.w as i32, c.h as i32));
+                let (x, y) = at(ui::tooltip_pos(hw, hh, scale, (c.w as i32, c.h as i32)));
                 tip.reset(&cap.conn, x, y, c)?;
                 tip.show(&cap.conn)?;
             } else {
@@ -923,7 +932,7 @@ fn gui() -> Res<()> {
 /// (`app`: the process whose sound "Window" means).
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
-fn shutter(mut cap: Capture, ov: &mut select::Overlay, (windows, fade): (&[&ui::Win], &mut ui::Fade), target: Option<Target>, last: &Last, cursor: &Sprite, app: Option<u32>, (fonts, scale): ((Option<&ab_glyph::FontVec>, Option<&ab_glyph::FontVec>), f32)) -> Res<()> {
+fn shutter(mut cap: Capture, ov: &mut select::Overlay, (windows, fade): (&[&ui::Win], &mut ui::Fade), target: Option<Target>, last: &Last, cursor: &Sprite, app: Option<u32>, (fonts, scale, home): ((Option<&ab_glyph::FontVec>, Option<&ab_glyph::FontVec>), f32, Rect)) -> Res<()> {
     let ours: Vec<u32> = std::iter::once(ov.win).chain(windows.iter().map(|w| w.id)).collect();
     let Some(target) = target else { return fade_out(&cap.conn, fade, &ours) }; // Window mode with no window picked
     let (Target::Area(r) | Target::Window(_, r)) = target;
@@ -976,7 +985,7 @@ fn shutter(mut cap: Capture, ov: &mut select::Overlay, (windows, fade): (&[&ui::
         if !ui {
             fade.go(0.0);
         }
-        let pill = ui::Pill::new(&cap, fonts, scale)?;
+        let pill = ui::Pill::new(&cap, fonts, scale, home)?;
         let res = std::thread::scope(|s| {
             let fading = s.spawn(|| -> Result<(), String> {
                 let mut fade_out = || -> Res<()> {
@@ -1024,7 +1033,7 @@ fn shutter(mut cap: Capture, ov: &mut select::Overlay, (windows, fade): (&[&ui::
         for w in windows {
             cap.conn.unmap_window(w.id)?;
         }
-        let pill = ui::Pill::new(&cap, fonts, scale)?;
+        let pill = ui::Pill::new(&cap, fonts, scale, home)?;
         cap.overlay = Some(pill.win.sprite());
         record(&mut cap, &path, &opts, Some(pill), Some(windows[0].sprite()), target)?;
     }

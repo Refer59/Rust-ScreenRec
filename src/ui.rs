@@ -1688,12 +1688,13 @@ pub struct Pill<'a> {
 }
 
 impl<'a> Pill<'a> {
-    /// `fonts`: regular and medium, as for the panel.
-    pub fn new(cap: &Capture, fonts: (Option<&'a FontVec>, Option<&'a FontVec>), scale: f32) -> Res<Self> {
+    /// `fonts`: regular and medium, as for the panel; it starts in `home`'s bottom-right corner
+    /// (the launcher's monitor), and can be dragged anywhere on the screen.
+    pub fn new(cap: &Capture, fonts: (Option<&'a FontVec>, Option<&'a FontVec>), scale: f32, home: Rect) -> Res<Self> {
         let c = pill(false, 0, fonts, scale);
         let (sw, sh) = (cap.sw as i32, cap.sh as i32);
         let edge = (EDGE as f32 * scale).round() as i32;
-        let (x, y) = (sw - c.w as i32 - edge, sh - c.h as i32 - edge);
+        let (x, y) = (home.2 - c.w as i32 - edge, home.3 - c.h as i32 - edge);
         let mask = EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::BUTTON1_MOTION;
         let win = Win::new(cap, x, y, c, mask)?;
         win.show(&cap.conn)?;
@@ -2433,7 +2434,7 @@ mod live {
         let backdrop = Win::new(&cap, bx, by, back, EventMask::EXPOSURE).unwrap();
         backdrop.show(&cap.conn).unwrap();
         let fonts = (font.as_ref(), bold.as_ref());
-        let mut pill = Pill::new(&cap, fonts, scale).unwrap();
+        let mut pill = Pill::new(&cap, fonts, scale, (0, 0, sw, sh)).unwrap(); // over the backdrop
         cap.overlay = Some(pill.win.sprite());
         cap.draw_pointer = false;
         cap.track_changes().unwrap();
