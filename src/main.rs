@@ -875,8 +875,9 @@ fn gui() -> Res<()> {
         let f = ring.then_some(sfocus);
         (restyle, set.focus) = (restyle || f != set.focus, f);
         st.sync();
-        // The caption fades with the panel's `ui` tween: drawn while it runs, gone at 0.
-        let a = st.ui_shown();
+        // The caption fades with the panel's `ui` tween: drawn while it runs, gone at 0; on a screen
+        // so short that the settings reach it, it goes under them (not drawn over their last row).
+        let a = if st.settings_open && ui::settings_cover_caption(sw, sh, scale) { 0.0 } else { st.ui_shown() };
         if a != caption_a {
             if a > 0.0 {
                 let c = ui::ui_caption(font(), scale, a);

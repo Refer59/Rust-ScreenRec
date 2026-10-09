@@ -626,6 +626,13 @@ pub fn caption_pos(sw: i32, sh: i32, scale: f32, (cw, _): (i32, i32)) -> (i32, i
     (px + ((M + BODY.0 / 2.0) * scale).round() as i32 - cw / 2, py + ((M + BODY.1 + CAPTION_GAP) * scale).round() as i32)
 }
 
+/// Whether the open settings popover reaches the caption: on screens under ~564 logical px tall
+/// (1080p at 200 %), where it already covers the panel.
+pub fn settings_cover_caption(sw: i32, sh: i32, scale: f32) -> bool {
+    let ((_, py), (_, my)) = place(sw, sh, scale);
+    my + ((M + SBODY.1) * scale).round() as i32 > py + ((M + BODY.1 + CAPTION_GAP) * scale).round() as i32
+}
+
 /// A round close button: `h` is how hovered it is.
 fn close_button(c: &mut Canvas, g: Geo, h: f32) {
     let Geo::Disc(x, y, r) = g else { unreachable!() };
@@ -2363,6 +2370,10 @@ mod preview {
                 let (tx, ty) = tooltip_pos(sw, sh, scale, (c.w as i32, c.h as i32));
                 assert!(ty + c.h as i32 <= body.1 && body.1 < y, "{sw}x{sh}@{scale}: tooltip {tx},{ty}");
             }
+        }
+        // The settings reach the caption only on screens under ~564 logical px tall: it hides under them there.
+        for (sw, sh, scale, covers) in [(1280, 720, 1.0, false), (1920, 1080, 1.5, false), (1920, 1080, 2.0, true), (1366, 768, 1.5, true)] {
+            assert_eq!(settings_cover_caption(sw, sh, scale), covers, "{sw}x{sh}@{scale}");
         }
     }
 
