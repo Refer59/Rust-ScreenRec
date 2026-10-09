@@ -665,12 +665,15 @@ fn gui() -> Res<()> {
     grab_keyboard(&cap, ov.win)?;
 
     let mut grip: Option<(select::Grip, Rect)> = None; // dragging, and the selection before it
-    let (mut moving, mut moving_set) = (true, false); // animating: the next frame is due
+    let (mut moving, mut moving_set, mut fading) = (true, false, true); // animating: the next frame is due
     let (mut pfocus, mut sfocus, mut ring) = (Hit::Shutter, ui::SETTINGS_ORDER[0], false); // keyboard focus; the ring shows once a key moves it
     let (pid, mid, bid, cid) = (panel.id, modal.id, badge.id, caption.id);
     let mut thru = false; // a press began in a transparent margin: the drag belongs to the overlay
     loop {
-        cap.wait((moving || moving_set || fade.busy()).then_some(Duration::from_millis(8)))?; // the next animation frame, else sleep until an event
+        cap.wait((moving || moving_set || fading).then_some(Duration::from_millis(8)))?; // the next animation frame, else sleep until an event
+        // Each animation reads whether it's running before its frame: one that ends while
+        // the frame is made still gets its last frame, at its end value.
+        fading = fade.busy();
         fade.apply(&cap.conn, &ours)?;
         if STOP.load(Relaxed) {
             return fade_out(&cap.conn, &mut fade, &ours);
@@ -965,6 +968,7 @@ fn gui() -> Res<()> {
         let f = ring.then_some(sfocus);
         (restyle, set.focus) = (restyle || f != set.focus, f);
         st.sync();
+        let busy = st.busy();
         // The caption fades with the panel's `ui` tween: drawn while it runs, gone at 0; on a screen
         // so short that the settings reach it, it goes under them (not drawn over their last row).
         let a = if st.settings_open && ui::settings_cover_caption(hw, hh, scale) { 0.0 } else { st.ui_shown() };
@@ -981,10 +985,10 @@ fn gui() -> Res<()> {
             }
             caption_a = a;
         }
-        if redraw || moving || st.busy() {
+        if redraw || moving || busy {
             panel.redraw(&cap.conn, ui::panel(&st))?;
         }
-        moving = st.busy();
+        moving = busy;
         // Área's switch explains itself while it's hovered or focused.
         let want = (st.mode == Mode::Selection && (st.hover == Some(Hit::Ocr) || st.focus == Some(Hit::Ocr))).then(|| ui::ocr_tip(st.ocr, st.record, set.clip, st.with_ui));
         if want != tip_text {
@@ -998,13 +1002,15 @@ fn gui() -> Res<()> {
             }
             tip_text = want;
         }
+        let mut set_busy = false;
         if st.settings_open {
             set.sync();
-            if restyle || moving_set || set.busy() {
+            set_busy = set.busy();
+            if restyle || moving_set || set_busy {
                 modal.redraw(&cap.conn, ui::settings(&set))?;
             }
         }
-        moving_set = st.settings_open && set.busy();
+        moving_set = set_busy;
     }
 }
 
