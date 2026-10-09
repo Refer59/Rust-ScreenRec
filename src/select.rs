@@ -294,6 +294,7 @@ impl Drop for Overlay {
 /// EWMH queries about other clients' windows, with the atoms looked up once.
 pub struct Ewmh {
     stacking: u32,
+    active: u32,
     current: u32,
     desktop: u32,
     state: u32,
@@ -312,6 +313,7 @@ impl Ewmh {
         let atom = |n: &str| cap.conn.intern_atom(false, n.as_bytes()).ok().and_then(|r| r.reply().ok()).map_or(0, |r| r.atom);
         Ewmh {
             stacking: atom("_NET_CLIENT_LIST_STACKING"),
+            active: atom("_NET_ACTIVE_WINDOW"),
             current: atom("_NET_CURRENT_DESKTOP"),
             desktop: atom("_NET_WM_DESKTOP"),
             state: atom("_NET_WM_STATE"),
@@ -346,6 +348,12 @@ impl Ewmh {
         }
         let r = (r.0.max(0), r.1.max(0), r.2.min(cap.sw as i32), r.3.min(cap.sh as i32));
         (r.0 < r.2 && r.1 < r.3).then_some(r)
+    }
+
+    /// Where the focused window shows, if one is.
+    pub fn active(&self, cap: &Capture) -> Option<Rect> {
+        let w = *Self::prop(cap, cap.root, self.active).first()?;
+        (w != 0).then(|| self.visible(cap, w)).flatten()
     }
 
     /// Visible windows of the current workspace, topmost first, with their ids.

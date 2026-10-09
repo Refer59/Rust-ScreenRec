@@ -1,10 +1,24 @@
-//! Our GNOME custom keyboard shortcut (gsettings, media-keys plugin).
+//! Our GNOME custom keyboard shortcuts (gsettings, media-keys plugin).
 
 use crate::Res;
 use std::process::Command;
 
 const SCHEMA: &str = "org.gnome.settings-daemon.plugins.media-keys";
-const PATH: &str = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/screenrec/";
+const DIR: &str = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/";
+/// The launcher's shortcut's id ("screenrec", no arguments).
+const LAUNCHER: &str = "screenrec";
+/// The instant screenshots' shortcuts: id, arguments, the key they get unless picked already.
+pub const SNAPS: [(&str, &str, &str); 2] = [("screenrec-snap", "snap", "<Shift>Print"), ("screenrec-snap-window", "snap --window", "<Alt>Print")];
+/// GNOME's own screenshot tool's keys: Shell 42 and later, then settings-daemon before it.
+const SCREENSHOT_KEYS: [(&str, &str); 7] = [
+    ("org.gnome.shell.keybindings", "show-screenshot-ui"),
+    ("org.gnome.shell.keybindings", "screenshot"),
+    ("org.gnome.shell.keybindings", "screenshot-window"),
+    ("org.gnome.shell.keybindings", "show-screen-recording-ui"),
+    (SCHEMA, "screenshot"),
+    (SCHEMA, "window-screenshot"),
+    (SCHEMA, "area-screenshot"),
+];
 
 fn gsettings(args: &[&str]) -> Res<String> {
     let out = Command::new("gsettings").args(args).output()?;
@@ -14,32 +28,63 @@ fn gsettings(args: &[&str]) -> Res<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
-fn ours() -> String {
-    format!("{SCHEMA}.custom-keybinding:{PATH}")
+fn path(id: &str) -> String {
+    format!("{DIR}{id}/")
 }
 
-/// Our binding as a GNOME accelerator ("minus", "<Control><Alt>s"), if we have one.
+fn ours(id: &str) -> String {
+    format!("{SCHEMA}.custom-keybinding:{}", path(id))
+}
+
+/// The launcher's binding as a GNOME accelerator ("minus", "<Control><Alt>s"), if it has one.
 pub fn get() -> Option<String> {
-    gsettings(&["get", SCHEMA, "custom-keybindings"]).ok().filter(|l| l.contains(PATH))?;
-    Some(gsettings(&["get", &ours(), "binding"]).ok()?.trim_matches('\'').to_owned())
+    get_of(LAUNCHER)
 }
 
-/// Bind `accel` to launch this executable, adding our entry to the custom
-/// shortcuts list without touching the others.
+/// Shortcut `id`'s binding, if we made it.
+pub fn get_of(id: &str) -> Option<String> {
+    gsettings(&["get", SCHEMA, "custom-keybindings"]).ok().filter(|l| l.contains(&path(id)))?;
+    Some(gsettings(&["get", &ours(id), "binding"]).ok()?.trim_matches('\'').to_owned())
+}
+
+/// Bind `accel` to the launcher.
 pub fn set(accel: &str) -> Res<()> {
+    bind(LAUNCHER, "", accel)
+}
+
+/// Bind `accel` to run this executable with `args`, as our shortcut `id`, adding it to
+/// the custom shortcuts list without touching the others. If GNOME's screenshot tool
+/// has `accel` (Print), it loses it: ours overrides it.
+pub fn bind(id: &str, args: &str, accel: &str) -> Res<()> {
     let list = gsettings(&["get", SCHEMA, "custom-keybindings"])?;
-    if !list.contains(PATH) {
-        let inner = list.trim_start_matches("@as").trim().trim_start_matches('[').trim_end_matches(']');
-        let mut items: Vec<&str> = inner.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
-        let me = format!("'{PATH}'");
+    if !list.contains(&path(id)) {
+        let me = format!("'{}'", path(id));
+        let mut items = items(&list);
         items.push(&me);
         gsettings(&["set", SCHEMA, "custom-keybindings", &format!("[{}]", items.join(", "))])?;
     }
+    // GNOME's screenshot tool lets go of the key (Print, say), or it keeps it and ours never fires.
+    let me = format!("'{accel}'");
+    for (schema, key) in SCREENSHOT_KEYS {
+        let Ok(list) = gsettings(&["get", schema, key]) else { continue }; // not a key of this GNOME
+        let keys = items(&list);
+        if list.contains('[') && keys.contains(&me.as_str()) {
+            let left: Vec<&str> = keys.into_iter().filter(|k| *k != me).collect();
+            gsettings(&["set", schema, key, &format!("[{}]", left.join(", "))])?;
+        }
+    }
     let exe = std::env::current_exe()?;
-    gsettings(&["set", &ours(), "name", "'screenrec'"])?;
-    gsettings(&["set", &ours(), "command", &format!("'{}'", exe.display())])?;
-    gsettings(&["set", &ours(), "binding", &format!("'{accel}'")])?;
+    let run = format!("{} {args}", exe.display());
+    gsettings(&["set", &ours(id), "name", &format!("'screenrec {args}'").replace(" '", "'")])?;
+    gsettings(&["set", &ours(id), "command", &format!("'{}'", run.trim_end())])?;
+    gsettings(&["set", &ours(id), "binding", &format!("'{accel}'")])?;
     Ok(())
+}
+
+/// The items of a gsettings string list ("@as []", "['a', 'b']"), quotes kept.
+fn items(list: &str) -> Vec<&str> {
+    let inner = list.trim_start_matches("@as").trim().trim_start_matches('[').trim_end_matches(']');
+    inner.split(',').map(str::trim).filter(|s| !s.is_empty()).collect()
 }
 
 /// Whether GNOME's "Reduce animation" is on (no gsettings or schema: no).
@@ -89,5 +134,7 @@ mod tests {
         assert_eq!(pretty("<Control><Alt>s"), "Ctrl+Alt+S");
         assert_eq!(pretty("minus"), "-");
         assert_eq!(pretty("<Super>Print"), "Super+Print");
+        assert_eq!(items("@as []"), Vec::<&str>::new());
+        assert_eq!(items("['Print', '<Shift>Print']"), ["'Print'", "'<Shift>Print'"]);
     }
 }

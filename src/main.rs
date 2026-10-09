@@ -60,6 +60,8 @@ fn usage() -> String {
     tr!(
         "usage:
   screenrec                             launcher: screenshot or recording (selection, screen or window)
+  screenrec snap [--window]             what Shift+Print (Alt+Print: --window) runs: the screen (the focused window) at once,
+                                        saved and copied as the launcher's settings say, with a notification
   screenrec shot [file.png|.jpg] [--ocr] [--clip]
                                         full-screen screenshot; --ocr: its text to <file>.txt, or with --clip to the
                                         clipboard; --clip alone: the image to the clipboard
@@ -67,9 +69,11 @@ fn usage() -> String {
                                         record the screen (or a window) until Ctrl+C / SIGTERM
                                         (max FPS: 60 on the GPU, 30 without it; --cpu: no GPU even if there is one;
                                         --ocr: the text seen, with its times, to <file>.txt, read every S seconds: 0.5-5, 2 by default)
-  screenrec install                     keyboard shortcut for the launcher ('-' if it has none yet) and the text recognition files",
+  screenrec install                     keyboard shortcuts (the launcher: '-' if it has none yet; Shift/Alt+Print: snap) and the text recognition files",
         "uso:
   screenrec                             interfaz: captura o grabación (selección, pantalla o ventana)
+  screenrec snap [--window]             lo que hace Shift+Print (Alt+Print: --window): la pantalla (la ventana activa) al instante,
+                                        guardada y copiada según los ajustes de la interfaz, con una notificación
   screenrec shot [archivo.png|.jpg] [--ocr] [--clip]
                                         captura de pantalla completa; --ocr: su texto a <archivo>.txt, o con --clip al
                                         portapapeles; --clip solo: la imagen al portapapeles
@@ -77,9 +81,11 @@ fn usage() -> String {
                                         graba la pantalla (o una ventana) hasta Ctrl+C / SIGTERM
                                         (máx. FPS: 60 con GPU, 30 sin ella; --cpu: sin GPU aunque haya;
                                         --ocr: el texto visto, con sus tiempos, a <archivo>.txt, leído cada S segundos: 0.5-5, 2 por defecto)
-  screenrec install                     atajo de teclado para la interfaz ('-' si aún no tiene) y los archivos del reconocimiento de texto",
+  screenrec install                     atajos de teclado (la interfaz: '-' si aún no tiene; Shift/Alt+Print: snap) y los archivos del reconocimiento de texto",
         "使い方:
   screenrec                             ランチャー: スクリーンショットまたは録画 (選択範囲、画面、ウィンドウ)
+  screenrec snap [--window]             Shift+Print (Alt+Print: --window) の動作: 画面 (アクティブなウィンドウ) をすぐに撮り、
+                                        ランチャーの設定どおり保存・コピーして通知します
   screenrec shot [ファイル.png|.jpg] [--ocr] [--clip]
                                         画面全体のスクリーンショット。--ocr: そのテキストを <ファイル>.txt に、--clip も付ければ
                                         クリップボードに。--clip のみ: 画像をクリップボードに
@@ -87,7 +93,7 @@ fn usage() -> String {
                                         Ctrl+C / SIGTERM まで画面 (またはウィンドウ) を録画
                                         (最大 FPS: GPU で 60、なしで 30。--cpu: GPU があっても使わない。
                                         --ocr: 映ったテキストを時刻付きで <ファイル>.txt に、S 秒ごとに読み取る: 0.5-5、既定 2)
-  screenrec install                     ランチャーのキーボードショートカット (未設定なら '-') とテキスト認識のファイル"
+  screenrec install                     キーボードショートカット (ランチャー: 未設定なら '-'、Shift/Alt+Print: snap) とテキスト認識のファイル"
     )
 }
 
@@ -111,6 +117,8 @@ fn main() {
     let res = match args.first().map(String::as_str) {
         None => gui(),
         Some("shot") => shot(&args[1..]),
+        #[cfg(target_os = "linux")]
+        Some("snap") => snap(&args[1..]),
         Some("rec") => rec(&args[1..]),
         Some("install") => install(),
         Some("ocrd") => ocrd::serve(), // the text recognition service, started by its first client
@@ -123,7 +131,7 @@ fn main() {
     };
     if let Err(e) = res {
         eprintln!("error: {e}");
-        if args.is_empty() {
+        if args.is_empty() || args[0] == "snap" {
             notify(&tr!("screenrec ran into a problem", "screenrec tuvo un problema", "screenrec で問題が発生しました"), &e.to_string(), None); // the GUI has no terminal
         }
         std::process::exit(1);
@@ -131,13 +139,22 @@ fn main() {
 }
 
 /// Point our GNOME shortcut at this executable ('-' unless one was already picked), and
-/// install the text recognition files. Without GNOME (a server, CI) the shortcut is skipped.
+/// Shift/Alt+Print at `snap`, and install the text recognition files. Without GNOME (a
+/// server, CI) the shortcuts are skipped.
 #[cfg(target_os = "linux")]
 fn install() -> Res<()> {
     let accel = shortcut::get().unwrap_or_else(|| "minus".into());
     match shortcut::set(&accel) {
         Ok(()) => println!("{}", tr!("launcher shortcut: {}", "atajo de la interfaz: {}", "ランチャーのショートカット: {}", shortcut::pretty(&accel))),
         Err(e) => println!("{}", tr!("launcher shortcut: not set, this isn't GNOME ({})", "atajo de la interfaz: sin configurar, esto no es GNOME ({})", "ランチャーのショートカット: 未設定、GNOME ではありません ({})", e)),
+    }
+    // The instant screenshots take Shift+Print and Alt+Print from GNOME's own tool, like it had them.
+    let snaps = shortcut::SNAPS.map(|(id, args, default)| {
+        let accel = shortcut::get_of(id).unwrap_or_else(|| default.into());
+        shortcut::bind(id, args, &accel).map(|()| shortcut::pretty(&accel))
+    });
+    if let [Ok(screen), Ok(window)] = &snaps {
+        println!("{}", tr!("instant screenshot: {} (screen), {} (window)", "captura inmediata: {} (pantalla), {} (ventana)", "即時スクリーンショット: {} (画面)、{} (ウィンドウ)", screen, window));
     }
     ocr_files::install(&mut std::io::stdout())
 }
@@ -166,6 +183,36 @@ fn shot(args: &[String]) -> Res<()> {
         ocrd::shot(&img, w, h, w * 4, &path, clip, false)?;
     } else if clip {
         desktop::copy_image(&img, w, h, w * 4)?;
+    }
+    Ok(())
+}
+
+/// What the Print-key shortcuts run: the screen, or with `--window` the focused window,
+/// at once and without the launcher. Saved like the launcher's photos, with its settings
+/// (format, pointer, clipboard), and told in a notification: there's no terminal.
+#[cfg(target_os = "linux")]
+fn snap(args: &[String]) -> Res<()> {
+    let window = match args {
+        [] => false,
+        [w] if w == "--window" => true,
+        [p, ..] => return Err(tr!("unknown option {}", "opción desconocida {}", "不明なオプション {}", p).into()),
+    };
+    let mut cap = Capture::new()?;
+    let (sw, sh) = (cap.sw as i32, cap.sh as i32);
+    let last = Last::load(sw, sh);
+    let cursor = freeze(&mut cap)?;
+    let r = window.then(|| select::Ewmh::new(&cap).active(&cap)).flatten().unwrap_or((0, 0, sw, sh)); // no focused window: the screen
+    let path = default_path("PICTURES", &shot_prefix(), if last.jpg { "jpg" } else { "png" });
+    let (w, h) = ((r.2 - r.0) as usize, (r.3 - r.1) as usize);
+    let img = save_image(cap.frame(), cap.sw, r, last.pointer.then_some(&cursor), &path)?;
+    let copy_failed = last.clip.then(|| desktop::copy_image(&img, w, h, w * 4).err()).flatten();
+    let title = match last.clip && copy_failed.is_none() {
+        true => tr!("Screenshot saved and copied", "Captura guardada y copiada", "スクリーンショットを保存してコピーしました"),
+        false => tr!("Screenshot saved", "Captura guardada", "スクリーンショットを保存しました"),
+    };
+    notify(&title, &tilde(&path), Some(&path));
+    if let Some(e) = copy_failed {
+        notify(&tr!("Couldn't copy the screenshot", "No se pudo copiar la captura", "スクリーンショットをコピーできませんでした"), &e.to_string(), None);
     }
     Ok(())
 }
