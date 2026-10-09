@@ -590,6 +590,17 @@ pub fn ocr_tip(on: bool, record: bool, clip: bool, with_ui: bool) -> String {
     }
 }
 
+/// The tooltip of Pantalla's and Ventana's words: their instant capture's key (shortcut.rs's
+/// screenshot and recording keys), on photo or video like the panel.
+pub fn snap_tip(m: Mode, record: bool, key: &str) -> String {
+    match (m == Mode::Window, record) {
+        (false, false) => tr!("Instant screenshot · {}", "Captura inmediata · {}", "画面をすぐキャプチャ · {}", key),
+        (true, false) => tr!("Instant window screenshot · {}", "Captura inmediata de la ventana · {}", "ウィンドウをすぐキャプチャ · {}", key),
+        (false, true) => tr!("Instant recording · {}", "Grabación inmediata · {}", "画面をすぐ録画 · {}", key),
+        (true, true) => tr!("Instant window recording · {}", "Grabación inmediata de la ventana · {}", "ウィンドウをすぐ録画 · {}", key),
+    }
+}
+
 /// A tooltip: one line in a dark capsule, the badge's look a little larger; `a` fades it.
 pub fn tooltip(text: &str, font: Option<&FontVec>, scale: f32, a: f32) -> Canvas {
     let w = (font.map_or(120.0, |f| Canvas::width(f, text, 13.0)) + 24.0).ceil();
@@ -603,11 +614,16 @@ pub fn tooltip(text: &str, font: Option<&FontVec>, scale: f32, a: f32) -> Canvas
     c
 }
 
-/// Where the `t`-sized tooltip of Área's switch goes: centred over it, 8 px above the panel, on screen.
-pub fn tooltip_pos(sw: i32, sh: i32, scale: f32, (tw, th): (i32, i32)) -> (i32, i32) {
+/// Where the `t`-sized tooltip of control `h` (Área's switch, a mode word) goes: centred over it, on
+/// screen, 8 px above the panel; a word's also clears the close button (Ventana's always reaches it),
+/// so the words' tooltips share one height.
+pub fn tooltip_pos(sw: i32, sh: i32, scale: f32, h: Hit, (tw, th): (i32, i32)) -> (i32, i32) {
     let (px, py) = place(sw, sh, scale).0;
-    let x = px + ((M + cell_mid(0.0)) * scale).round() as i32 - tw / 2;
-    let y = py + ((M - 8.0) * scale).round() as i32 - th;
+    let Geo::Rect(x0, _, x1, ..) = shape_of(h) else { unreachable!() };
+    let Geo::Disc(_, cy, cr) = shape_of(Hit::Close) else { unreachable!() };
+    let top = if h == Hit::Ocr { 0.0 } else { cy - cr };
+    let x = px + ((M + (x0 + x1) / 2.0) * scale).round() as i32 - tw / 2;
+    let y = py + ((M + top - 8.0) * scale).round() as i32 - th;
     (x.clamp(0, (sw - tw).max(0)), y.max(0))
 }
 
@@ -1997,7 +2013,7 @@ mod preview {
                 s.settle();
                 over(&mut full, sw, &panel(&s), px as usize, py as usize);
                 let t = tooltip(&ocr_tip(on, record, clip, false), font, SCALE, 1.0);
-                let (tx, ty) = tooltip_pos(sw as i32, sh as i32, SCALE, (t.w as i32, t.h as i32));
+                let (tx, ty) = tooltip_pos(sw as i32, sh as i32, SCALE, Hit::Ocr, (t.w as i32, t.h as i32));
                 over(&mut full, sw, &t, tx as usize, ty as usize);
                 let (x0, y0, cw) = (560, 740, 800);
                 let crop: Vec<u32> = full.chunks_exact(sw).skip(y0).flat_map(|r| r[x0..x0 + cw].to_vec()).collect();
@@ -2086,11 +2102,36 @@ mod preview {
             save(&dir, &format!("launcher-ui-window-{tag}"), sw, sh, &full, bg);
             let mut full = ui_launcher(sel, true, None, &ui_panel(Mode::Selection, false, true, Some(Hit::Ocr), false), false);
             let t = tooltip(&ocr_tip(true, false, false, true), font, SCALE, 1.0);
-            let (tx, ty) = tooltip_pos(swi, shi, SCALE, (t.w as i32, t.h as i32));
+            let (tx, ty) = tooltip_pos(swi, shi, SCALE, Hit::Ocr, (t.w as i32, t.h as i32));
             over(&mut full, sw, &t, tx as usize, ty as usize);
             let (x0, y0, cw) = (560, 740, 800);
             let crop: Vec<u32> = full.chunks_exact(sw).skip(y0).flat_map(|r| r[x0..x0 + cw].to_vec()).collect();
             save(&dir, &format!("launcher-ui-tip-{tag}"), cw, sh - y0, &crop, bg);
+            // Pantalla's and Ventana's instant keys (shortcut.rs's defaults, as Settings' shortcut row writes
+            // keys), on photo and video, from Área: hovered, focused (the ring), and hovered with the UI in.
+            for (record, kind) in [(false, "photo"), (true, "video")] {
+                for (m, name) in [(Mode::Screen, "screen"), (Mode::Window, "window")] {
+                    let key = crate::shortcut::pretty(crate::shortcut::SNAPS[crate::snap_ix(m, record)].2);
+                    let t = tooltip(&snap_tip(m, record, &key), font, SCALE, 1.0);
+                    let (tx, ty) = tooltip_pos(swi, shi, SCALE, Hit::Mode(m), (t.w as i32, t.h as i32));
+                    let h = Some(Hit::Mode(m));
+                    let plain = |s: &PanelState| {
+                        let mut full = overlay(&frozen, (sw, sh), sel, true);
+                        with_badge(&mut full, sel, None);
+                        over(&mut full, sw, &panel(s), px as usize, py as usize);
+                        full
+                    };
+                    for (how, mut full) in [
+                        ("hover", plain(&panel_state(Mode::Selection, record, h, false, None))),
+                        ("focus", plain(&panel_state(Mode::Selection, record, None, false, h))),
+                        ("ui", ui_launcher(sel, true, None, &ui_panel(Mode::Selection, record, false, h, false), false)),
+                    ] {
+                        over(&mut full, sw, &t, tx as usize, ty as usize);
+                        let crop: Vec<u32> = full.chunks_exact(sw).skip(y0).flat_map(|r| r[x0..x0 + cw].to_vec()).collect();
+                        save(&dir, &format!("launcher-snap-{kind}-{name}-{how}-{tag}"), cw, sh - y0, &crop, bg);
+                    }
+                }
+            }
             // A selection ending just above the panel's bottom: its badge would sit on the caption, so it moves inside.
             let low = (900, 500, 1500, 1010);
             let full = ui_launcher(low, true, None, &ui_panel(Mode::Selection, false, false, None, false), false);
@@ -2368,13 +2409,30 @@ mod preview {
                 assert!(x >= 0 && y >= body.3 + 9 && x + c.w as i32 <= sw && y + c.h as i32 <= sh, "{sw}x{sh}@{scale} {text}: {x},{y} {}x{}", c.w, c.h);
                 assert!(y + c.h as i32 <= full.3, "the badge's avoid rect covers the caption");
                 // The tooltip (28 tall, like the caption) is above the panel, so the two never meet.
-                let (tx, ty) = tooltip_pos(sw, sh, scale, (c.w as i32, c.h as i32));
+                let (tx, ty) = tooltip_pos(sw, sh, scale, Hit::Ocr, (c.w as i32, c.h as i32));
                 assert!(ty + c.h as i32 <= body.1 && body.1 < y, "{sw}x{sh}@{scale}: tooltip {tx},{ty}");
             }
         }
         // The settings reach the caption only on screens under ~564 logical px tall: it hides under them there.
         for (sw, sh, scale, covers) in [(1280, 720, 1.0, false), (1920, 1080, 1.5, false), (1920, 1080, 2.0, true), (1366, 768, 1.5, true)] {
             assert_eq!(settings_cover_caption(sw, sh, scale), covers, "{sw}x{sh}@{scale}");
+        }
+    }
+
+    #[test]
+    fn snap_tips_sit_over_their_word() {
+        let f = load_font(false);
+        for (sw, sh, scale) in [(1280, 720, 1.0), (1366, 768, 1.0), (1920, 1080, 1.25), (1920, 1080, 2.0)] {
+            let body = panel_rect(sw, sh, scale, false);
+            // The longest, Spanish video on Ventana: centred over its word, above the panel, on screen.
+            let c = tooltip("Grabación inmediata de la ventana · Ctrl+Alt+Print", f.as_ref(), scale, 1.0);
+            for (i, m) in [(1.0, Mode::Screen), (2.0, Mode::Window)] {
+                let (x, y) = tooltip_pos(sw, sh, scale, Hit::Mode(m), (c.w as i32, c.h as i32));
+                let mid = body.0 + (cell_mid(i) * scale).round() as i32;
+                assert!((x + c.w as i32 / 2 - mid).abs() <= 1, "{sw}x{sh}@{scale} {m:?}: centre {} vs {mid}", x + c.w as i32 / 2);
+                // Clear of the close button, which overhangs the panel's top by 13 px.
+                assert!(x >= 0 && x + c.w as i32 <= sw && y >= 0 && y + c.h as i32 <= body.1 - (21.0 * scale) as i32, "{sw}x{sh}@{scale} {m:?}: {x},{y}");
+            }
         }
     }
 

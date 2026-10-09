@@ -566,6 +566,20 @@ fn grab_keyboard(cap: &Capture, win: u32) -> Res<()> {
     Ok(())
 }
 
+/// Which of `shortcut::SNAPS` is mode `m`'s instant capture (Pantalla's or Ventana's), on photo or video.
+#[cfg(target_os = "linux")]
+fn snap_ix(m: Mode, record: bool) -> usize {
+    2 * record as usize + (m == Mode::Window) as usize
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn snap_keys_follow_the_panel() {
+    for (m, record, args) in [(Mode::Screen, false, "snap"), (Mode::Window, false, "snap --window"), (Mode::Screen, true, "snap --rec"), (Mode::Window, true, "snap --rec --window")] {
+        assert_eq!(shortcut::SNAPS[snap_ix(m, record)].1, args);
+    }
+}
+
 /// The launcher, like GNOME's: the screen freezes, pick Selection / Screen /
 /// Window and screenshot or screencast, then the shutter (or Enter). The gear
 /// opens the settings: sound, pointer, shortcut.
@@ -644,9 +658,9 @@ fn gui() -> Res<()> {
     (set.mp4, set.jpg, set.gpu, set.clip, set.ocr_every) = (last.mp4, last.jpg, last.gpu, last.clip, last.ocr_every);
     set.with_ui = last.with_ui;
     let mut modal = ui::Win::new(&cap, mx, my, ui::Canvas::new(ui::SW, ui::SH, scale), mask)?; // drawn and mapped by the gear
-    // The tooltip of Área's switch, shown while it's hovered or focused.
+    // The tooltip of Área's switch, or of Pantalla's or Ventana's word, shown while it's hovered or focused.
     let mut tip = ui::Win::new(&cap, 0, 0, ui::Canvas::new(1, 1, scale), EventMask::NO_EVENT)?;
-    let mut tip_text: Option<String> = None;
+    let mut tip_at: Option<(Hit, String)> = None;
     // The caption under the panel while the capture includes the UI: click-through like the badge.
     let mut caption = ui::Win::new(&cap, 0, 0, ui::Canvas::new(1, 1, scale), EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION)?;
     let mut caption_a = 0.0f32; // the opacity it was drawn at (-1: redraw it)
@@ -663,6 +677,11 @@ fn gui() -> Res<()> {
     panel.show(&cap.conn)?;
     let keys = Keymap::new(&cap)?;
     grab_keyboard(&cap, ov.win)?;
+    // The instant captures' keys, for Pantalla's and Ventana's tooltips: eight gsettings runs,
+    // started once the panel shows, waited for at the first tooltip that needs them.
+    let snaps_job = std::cell::Cell::new(Some(std::thread::spawn(|| shortcut::SNAPS.map(|(id, ..)| shortcut::get_of(id).filter(|a| !a.is_empty()).map(|a| shortcut::pretty(&a))))));
+    let snaps = std::cell::OnceCell::new();
+    let snap_key = |i: usize| snaps.get_or_init(|| snaps_job.take().and_then(|j| j.join().ok()).unwrap_or_default())[i].clone();
 
     let mut grip: Option<(select::Grip, Rect)> = None; // dragging, and the selection before it
     let (mut moving, mut moving_set, mut fading) = (true, false, true); // animating: the next frame is due
@@ -989,18 +1008,24 @@ fn gui() -> Res<()> {
             panel.redraw(&cap.conn, ui::panel(&st))?;
         }
         moving = busy;
-        // Área's switch explains itself while it's hovered or focused.
-        let want = (st.mode == Mode::Selection && (st.hover == Some(Hit::Ocr) || st.focus == Some(Hit::Ocr))).then(|| ui::ocr_tip(st.ocr, st.record, set.clip, st.with_ui));
-        if want != tip_text {
-            if let Some(text) = &want {
+        // Área's switch explains itself while it's hovered or focused; Pantalla's and Ventana's
+        // words name their instant capture's key (none bound: no tooltip). The focus goes first.
+        let tip_of = |h: Hit| match h {
+            Hit::Ocr if st.mode == Mode::Selection => Some(ui::ocr_tip(st.ocr, st.record, set.clip, st.with_ui)),
+            Hit::Mode(m) if m != Mode::Selection => snap_key(snap_ix(m, st.record)).map(|k| ui::snap_tip(m, st.record, &k)),
+            _ => None,
+        };
+        let want = [st.focus, st.hover].into_iter().flatten().find_map(|h| Some((h, tip_of(h)?)));
+        if want != tip_at {
+            if let Some((h, text)) = &want {
                 let c = ui::tooltip(text, font(), scale, 1.0);
-                let (x, y) = at(ui::tooltip_pos(hw, hh, scale, (c.w as i32, c.h as i32)));
+                let (x, y) = at(ui::tooltip_pos(hw, hh, scale, *h, (c.w as i32, c.h as i32)));
                 tip.reset(&cap.conn, x, y, c)?;
                 tip.show(&cap.conn)?;
             } else {
                 cap.conn.unmap_window(tip.id)?;
             }
-            tip_text = want;
+            tip_at = want;
         }
         let mut set_busy = false;
         if st.settings_open {
