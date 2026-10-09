@@ -350,10 +350,10 @@ impl Ewmh {
         (r.0 < r.2 && r.1 < r.3).then_some(r)
     }
 
-    /// Where the focused window shows, if one is.
-    pub fn active(&self, cap: &Capture) -> Option<Rect> {
+    /// The focused window, if one is: where it shows, and its id.
+    pub fn active(&self, cap: &Capture) -> Option<(Rect, u32)> {
         let w = *Self::prop(cap, cap.root, self.active).first()?;
-        (w != 0).then(|| self.visible(cap, w)).flatten()
+        (w != 0).then(|| self.visible(cap, w)).flatten().map(|r| (r, w))
     }
 
     /// Visible windows of the current workspace, topmost first, with their ids.

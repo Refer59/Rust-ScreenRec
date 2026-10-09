@@ -60,8 +60,9 @@ fn usage() -> String {
     tr!(
         "usage:
   screenrec                             launcher: screenshot or recording (selection, screen or window)
-  screenrec snap [--window]             what Shift+Print (Alt+Print: --window) runs: the screen (the focused window) at once,
-                                        saved and copied as the launcher's settings say, with a notification
+  screenrec snap [--window] [--rec]     what Shift+Print (Alt+Print: --window) runs: the screen (the focused window) at once,
+                                        saved and copied as the launcher's settings say, with a notification; --rec: record it
+                                        until the same key again (Ctrl+Shift+Print, Ctrl+Alt+Print)
   screenrec shot [file.png|.jpg] [--ocr] [--clip]
                                         full-screen screenshot; --ocr: its text to <file>.txt, or with --clip to the
                                         clipboard; --clip alone: the image to the clipboard
@@ -69,11 +70,12 @@ fn usage() -> String {
                                         record the screen (or a window) until Ctrl+C / SIGTERM
                                         (max FPS: 60 on the GPU, 30 without it; --cpu: no GPU even if there is one;
                                         --ocr: the text seen, with its times, to <file>.txt, read every S seconds: 0.5-5, 2 by default)
-  screenrec install                     keyboard shortcuts (the launcher: '-' if it has none yet; Shift/Alt+Print: snap) and the text recognition files",
+  screenrec install                     keyboard shortcuts (the launcher: '-' if it has none yet; the Print keys: snap) and the text recognition files",
         "uso:
   screenrec                             interfaz: captura o grabación (selección, pantalla o ventana)
-  screenrec snap [--window]             lo que hace Shift+Print (Alt+Print: --window): la pantalla (la ventana activa) al instante,
-                                        guardada y copiada según los ajustes de la interfaz, con una notificación
+  screenrec snap [--window] [--rec]     lo que hace Shift+Print (Alt+Print: --window): la pantalla (la ventana activa) al instante,
+                                        guardada y copiada según los ajustes de la interfaz, con una notificación; --rec: la graba
+                                        hasta la misma tecla otra vez (Ctrl+Shift+Print, Ctrl+Alt+Print)
   screenrec shot [archivo.png|.jpg] [--ocr] [--clip]
                                         captura de pantalla completa; --ocr: su texto a <archivo>.txt, o con --clip al
                                         portapapeles; --clip solo: la imagen al portapapeles
@@ -81,11 +83,12 @@ fn usage() -> String {
                                         graba la pantalla (o una ventana) hasta Ctrl+C / SIGTERM
                                         (máx. FPS: 60 con GPU, 30 sin ella; --cpu: sin GPU aunque haya;
                                         --ocr: el texto visto, con sus tiempos, a <archivo>.txt, leído cada S segundos: 0.5-5, 2 por defecto)
-  screenrec install                     atajos de teclado (la interfaz: '-' si aún no tiene; Shift/Alt+Print: snap) y los archivos del reconocimiento de texto",
+  screenrec install                     atajos de teclado (la interfaz: '-' si aún no tiene; las teclas Print: snap) y los archivos del reconocimiento de texto",
         "使い方:
   screenrec                             ランチャー: スクリーンショットまたは録画 (選択範囲、画面、ウィンドウ)
-  screenrec snap [--window]             Shift+Print (Alt+Print: --window) の動作: 画面 (アクティブなウィンドウ) をすぐに撮り、
-                                        ランチャーの設定どおり保存・コピーして通知します
+  screenrec snap [--window] [--rec]     Shift+Print (Alt+Print: --window) の動作: 画面 (アクティブなウィンドウ) をすぐに撮り、
+                                        ランチャーの設定どおり保存・コピーして通知します。--rec: 同じキーをもう一度押すまで録画
+                                        (Ctrl+Shift+Print、Ctrl+Alt+Print)
   screenrec shot [ファイル.png|.jpg] [--ocr] [--clip]
                                         画面全体のスクリーンショット。--ocr: そのテキストを <ファイル>.txt に、--clip も付ければ
                                         クリップボードに。--clip のみ: 画像をクリップボードに
@@ -93,7 +96,7 @@ fn usage() -> String {
                                         Ctrl+C / SIGTERM まで画面 (またはウィンドウ) を録画
                                         (最大 FPS: GPU で 60、なしで 30。--cpu: GPU があっても使わない。
                                         --ocr: 映ったテキストを時刻付きで <ファイル>.txt に、S 秒ごとに読み取る: 0.5-5、既定 2)
-  screenrec install                     キーボードショートカット (ランチャー: 未設定なら '-'、Shift/Alt+Print: snap) とテキスト認識のファイル"
+  screenrec install                     キーボードショートカット (ランチャー: 未設定なら '-'、Print キー: snap) とテキスト認識のファイル"
     )
 }
 
@@ -139,7 +142,7 @@ fn main() {
 }
 
 /// Point our GNOME shortcut at this executable ('-' unless one was already picked), and
-/// Shift/Alt+Print at `snap`, and install the text recognition files. Without GNOME (a
+/// the Print keys at `snap`, and install the text recognition files. Without GNOME (a
 /// server, CI) the shortcuts are skipped.
 #[cfg(target_os = "linux")]
 fn install() -> Res<()> {
@@ -148,13 +151,14 @@ fn install() -> Res<()> {
         Ok(()) => println!("{}", tr!("launcher shortcut: {}", "atajo de la interfaz: {}", "ランチャーのショートカット: {}", shortcut::pretty(&accel))),
         Err(e) => println!("{}", tr!("launcher shortcut: not set, this isn't GNOME ({})", "atajo de la interfaz: sin configurar, esto no es GNOME ({})", "ランチャーのショートカット: 未設定、GNOME ではありません ({})", e)),
     }
-    // The instant screenshots take Shift+Print and Alt+Print from GNOME's own tool, like it had them.
+    // The instant captures; Shift+Print and Alt+Print are taken from GNOME's own tool, like it had them.
     let snaps = shortcut::SNAPS.map(|(id, args, default)| {
         let accel = shortcut::get_of(id).unwrap_or_else(|| default.into());
         shortcut::bind(id, args, &accel).map(|()| shortcut::pretty(&accel))
     });
-    if let [Ok(screen), Ok(window)] = &snaps {
-        println!("{}", tr!("instant screenshot: {} (screen), {} (window)", "captura inmediata: {} (pantalla), {} (ventana)", "即時スクリーンショット: {} (画面)、{} (ウィンドウ)", screen, window));
+    if let [Ok(shot), Ok(shot_win), Ok(rec), Ok(rec_win)] = &snaps {
+        println!("{}", tr!("instant screenshot: {} (screen), {} (window)", "captura inmediata: {} (pantalla), {} (ventana)", "即時スクリーンショット: {} (画面)、{} (ウィンドウ)", shot, shot_win));
+        println!("{}", tr!("instant recording: {} (screen), {} (window); the same key stops it", "grabación inmediata: {} (pantalla), {} (ventana); la misma tecla la detiene", "即時録画: {} (画面)、{} (ウィンドウ)。同じキーで停止", rec, rec_win));
     }
     ocr_files::install(&mut std::io::stdout())
 }
@@ -190,18 +194,48 @@ fn shot(args: &[String]) -> Res<()> {
 /// What the Print-key shortcuts run: the screen, or with `--window` the focused window,
 /// at once and without the launcher. Saved like the launcher's photos, with its settings
 /// (format, pointer, clipboard), and told in a notification: there's no terminal.
+/// `--rec` records it instead, with the launcher's recording settings and its pill,
+/// until the same key again (or the pill's stop).
 #[cfg(target_os = "linux")]
 fn snap(args: &[String]) -> Res<()> {
-    let window = match args {
-        [] => false,
-        [w] if w == "--window" => true,
-        [p, ..] => return Err(tr!("unknown option {}", "opción desconocida {}", "不明なオプション {}", p).into()),
-    };
+    let (mut window, mut rec) = (false, false);
+    for a in args {
+        match a.as_str() {
+            "--window" => window = true,
+            "--rec" => rec = true,
+            p => return Err(tr!("unknown option {}", "opción desconocida {}", "不明なオプション {}", p).into()),
+        }
+    }
+    // One recording at a time: the key again stops it (or closes the launcher), like the launcher's shortcut.
+    let lock = if rec { single_instance()? } else { None };
+    if rec && lock.is_none() {
+        return Ok(());
+    }
     let mut cap = Capture::new()?;
     let (sw, sh) = (cap.sw as i32, cap.sh as i32);
     let last = Last::load(sw, sh);
+    let ewmh = select::Ewmh::new(&cap);
+    let focused = window.then(|| ewmh.active(&cap)).flatten(); // no focused window: the screen
+    if rec {
+        cap.screen_readable()?;
+        let target = focused.map_or(Target::Area((0, 0, sw, sh)), |(r, id)| Target::Window(id, r));
+        let app = focused.and_then(|(_, id)| ewmh.pid(&cap, id)); // whose sound "Application" records
+        let path = default_path("VIDEOS", &rec_prefix(), "mkv");
+        let opts = RecOpts { fps: None, gpu: last.gpu, sound: Some((last.output, last.mic, app)), ocr: None, ui: false };
+        cap.draw_pointer = last.pointer;
+        let ja = i18n::lang() == i18n::Lang::Ja;
+        let (font, bold) = (ui::load_font(ja), if ja { None } else { ui::load_bold() });
+        let pointer = cap.conn.query_pointer(cap.root)?.reply()?;
+        let home = cap.home_monitor((pointer.root_x as i32, pointer.root_y as i32));
+        let pill = ui::Pill::new(&cap, (font.as_ref(), bold.as_ref().or(font.as_ref())), ui_scale(&cap), home)?;
+        if let Target::Area(_) = target {
+            cap.overlay = Some(pill.win.sprite()); // the pill stays out of the video
+        }
+        record(&mut cap, &path, &opts, Some(pill), None, target)?;
+        return recorded(path, last.mp4);
+    }
     let cursor = freeze(&mut cap)?;
-    let r = window.then(|| select::Ewmh::new(&cap).active(&cap)).flatten().unwrap_or((0, 0, sw, sh)); // no focused window: the screen
+    let r = focused.map_or((0, 0, sw, sh), |(r, _)| r);
     let path = default_path("PICTURES", &shot_prefix(), if last.jpg { "jpg" } else { "png" });
     let (w, h) = ((r.2 - r.0) as usize, (r.3 - r.1) as usize);
     let img = save_image(cap.frame(), cap.sw, r, last.pointer.then_some(&cursor), &path)?;
@@ -1084,10 +1118,16 @@ fn shutter(mut cap: Capture, ov: &mut select::Overlay, (windows, fade): (&[&ui::
         cap.overlay = Some(pill.win.sprite());
         record(&mut cap, &path, &opts, Some(pill), Some(windows[0].sprite()), target)?;
     }
+    recorded(path, last.mp4)
+}
+
+/// A recording from the launcher or a Print key is done: to MP4 if asked, and say where it is.
+#[cfg(target_os = "linux")]
+fn recorded(path: PathBuf, mp4: bool) -> Res<()> {
     if !path.exists() {
         return Ok(()); // stopped before the first frame
     }
-    let path = match last.mp4 {
+    let path = match mp4 {
         true => to_mp4(&path, &path.with_extension("mp4")).unwrap_or_else(|e| {
             notify(&tr!("Saved as MKV instead", "Se guardó como MKV", "MKV のまま保存しました"), &e.to_string(), None);
             path

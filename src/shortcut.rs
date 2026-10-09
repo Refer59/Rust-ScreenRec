@@ -7,8 +7,14 @@ const SCHEMA: &str = "org.gnome.settings-daemon.plugins.media-keys";
 const DIR: &str = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/";
 /// The launcher's shortcut's id ("screenrec", no arguments).
 const LAUNCHER: &str = "screenrec";
-/// The instant screenshots' shortcuts: id, arguments, the key they get unless picked already.
-pub const SNAPS: [(&str, &str, &str); 2] = [("screenrec-snap", "snap", "<Shift>Print"), ("screenrec-snap-window", "snap --window", "<Alt>Print")];
+/// The instant captures' shortcuts: id, arguments, the key they get unless picked already.
+/// Screenshot of the screen, of the focused window, then their recordings.
+pub const SNAPS: [(&str, &str, &str); 4] = [
+    ("screenrec-snap", "snap", "<Shift>Print"),
+    ("screenrec-snap-window", "snap --window", "<Alt>Print"),
+    ("screenrec-rec", "snap --rec", "<Control><Shift>Print"),
+    ("screenrec-rec-window", "snap --rec --window", "<Control><Alt>Print"),
+];
 /// GNOME's own screenshot tool's keys: Shell 42 and later, then settings-daemon before it.
 const SCREENSHOT_KEYS: [(&str, &str); 7] = [
     ("org.gnome.shell.keybindings", "show-screenshot-ui"),
